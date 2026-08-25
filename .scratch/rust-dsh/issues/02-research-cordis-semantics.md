@@ -1,7 +1,7 @@
 # 02 — Codify Cordis semantics the Rust runtime must match
 
 Type: research
-Status: open
+Status: resolved
 
 ## Question
 
@@ -18,4 +18,11 @@ Output a reference doc (`docs/cordis-semantics.md` at repo root) that a Rust des
 
 ## Answer
 
-(blank until resolved)
+Semantics reference delivered in [`docs/research/cordis-semantics.md`](../../../docs/research/cordis-semantics.md). Key points the Rust runtime must match:
+
+- **Five** dispatch modes (the primer's table omits `bail`; the source has it): `emit` (sync fire-and-forget), `parallel` (Promise.allSettled), `serial` (in order until one bails), `bail` (stop on first sync bail), `waterfall` (around-middleware with `next()`; not calling `next()` vetoes).
+- Plugin = object implementing Service: function/object form `{ inject?, apply(ctx) }`, or a `Service` subclass. `inject` names required services; the registry waits for them before activating (service-requirement load order, not manual boot).
+- Context = repository of services found by stable `ctx.<key>`; `ctx.reflect.provide(name, instance, check)`; auto-removal on fiber unload; scoped via `extend()`/`isolate()`/`intercept()`; `resolveConfig` merges ancestor intercept config.
+- Reversible effects/disposers via `ctx.effect()`/`ctx.on()`; fiber lifecycle states (PENDING/LOADING legal, UNLOADING rejects new effect creation); dsh's vendored hardening closes reentrant-disposal gaps.
+- Loader/config: profiles → bundles → `cordis.patch.yml` → home → `--patch` overlay, applied to an empty entry list; a patch targets a row by id and replaces its whole config; `--dump-config` prints the tree. Loader reconciliation is transactional (dispose-before-apply, restore on failure).
+- Five invariants to preserve in Rust listed at the top of the reference doc (service-by-key, reversible effects, inject ordering, five modes + waterfall veto, model-visible==logged).

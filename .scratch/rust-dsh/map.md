@@ -15,16 +15,17 @@ A written architecture/design spec handed off to a separate planning-and-executi
 
 ## Decisions so far
 
-<!-- one line per closed ticket; gist + link. Populated on resolution. -->
+- [Map dsh's seam inventory & triage core scope](issues/01-research-seam-inventory.md): the definitive seam triage — core set (tools+MCP, llm, fs, subprocess/shell/sandbox, sessions/persistence, credentials/authorization, settings, storage/storageDomain) plus a required core spine (systemPrompt, agents, agentLoop, approval, scope, invariants) and a Rust `ctx.mcp` seam that must exist because dsh's MCP is only a bridge onto `ctx.tools`. Full table: `docs/research/seam-inventory.md`.
+- [Codify Cordis semantics the Rust runtime must match](issues/02-research-cordis-semantics.md): pinned the semantics — **five** dispatch modes (emit/parallel/serial/bail/waterfall with the waterfall `next()` veto contract), service-by-key contexts with `inject`-driven load, reversible effects/disposers with fiber lifecycle, and profile/bundle/patch transactional config loading. Reference: `docs/research/cordis-semantics.md`.
 
 ## Not yet specified
 
-Fog: suspected questions, sharper than before but not yet ticketed.
+Fog: suspected questions, sharper than before but not yet ticketed (config/boot composition now lives in ticket 06, the session-log persistence backend in 04, and the MCP protocol surface in 07; the deferred-seam list is now decided in research 01).
 
-- **Config & boot composition**: how profiles/bundles/config-patching (`cordis.patch.yml` analog) and a `--dump-config`-style tree work in Rust. Hangs on the service-context runtime design.
-- **Session persistence backend**: append-only log is decided, but storage behind it (rolling file / sqlite / in-memory + durability) and replay/fork mechanics are open. Hangs on the session-log + agent-loop grilling.
-- **Deferred seam interfaces**: which interfaces from `dsh`'s capability graph are deferred (out of core spec but still "later"): skill provider registry, web UI / web-access providers, workflow engine, lsp, agent-team, compaction, spill, subagents. Some may be genuinely out of scope (see Out-of-scope); others are in-scope-but-not-core.
-- **The MCP client bridge depth**: which MCP spec version(s), transports (stdio/HTTP), JSON-RPC framing, tool-schema mapping onto `ctx.tools` schemas. Breadth is decided (client, consume external) but the protocol surface is not.
+- **Rust crate/workspace layout**: how the clone is split into crates (core runtime crate, seam crates, WASM plugin host, integration), and how the Cordis-equivalent runtime exposes itself to downstream crates. Still fuzzy — depends on the runtime grilling (03).
+- **CLI / execution surface**: the Rust analog of `dsh web` / `dsh --profile web --dump-config` / the `headless` one-shot runner. Headless style is in-scope; the browser web app is out-of-scope, but the CLI verbs are not yet pinned.
+- **First-release cut line**: which deferred seams (research 01) must be in the spec's first release vs held for a second pass. Depends on how the core seams (05) and runtime (03) land.
+- **"Everything is a plugin" parity target**: how faithful the Rust clone's config-driven plugin swap must be against dsh's (users swap providers via config). May resolve into a stated config-format commitment once 06 lands.
 
 ## Out of scope
 
