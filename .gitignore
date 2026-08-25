@@ -1,0 +1,3 @@
+target/
+*.log
+.scratch/**/research-notes/
