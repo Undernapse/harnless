@@ -1,7 +1,7 @@
 # 05 — Define the core seam service interfaces
 
 Type: grilling
-Status: open
+Status: resolved
 Blocked by: 01, 03
 
 ## Question
@@ -14,4 +14,13 @@ Consume `01-seam-inventory` research for the exact list and `03-rust-runtime` fo
 
 ## Answer
 
-(blank until resolved)
+Resolved by grilling (1 round, all recommendations accepted) with the dev. The core seam service interfaces the spec must document. Tools (07) and sessions (04) already resolved the pipeline/log seams; this ticket covers the remaining in-scope set. Consumed research 01 (seam list) and 03 (runtime patterns) plus dsh refs (`docs/subsystems/llm-streaming.md`, `docs/subsystems/filesystem.md`).
+
+- **Q1 — Interface porting depth: faithful.** The fs and llm seams are ported **faithfully** as Rust traits in `dsh-seams`, preserving their swap-safety contracts. `FileSystem`: `FsTarget`(opaque `targetKey`+`displayPath`), `FsVersion` freshness tokens, `FsInfo`/`FsDirEntry`, guarded write/edit intents (`createIfAbsent` / `replaceIfVersion`), the `FsErrorCode` taxonomy (FS_NOT_FOUND/NOT_DIRECTORY/NOT_TEXT/NOT_REGULAR_FILE/TOO_LARGE/PERMISSION_DENIED/SANDBOX_DENIED/IO_ERROR/STALE_VERSION/NOT_OBSERVED/AMBIGUOUS_EDIT/EDIT_NOT_FOUND/ABORTED), and the `fs/*` single-slot decision waterfall (`fs/write-intent`, `fs/edit-intent`) + `fs/observed` emit gate for the observation-policy plugin. `LlmAdapter`: `Message`/`ContentBlock` union (text/reasoning/image/tool-call/tool-result), the `StreamChunk` protocol (`block-start`/`text-delta`/`reasoning-delta`/`tool-call-delta`/`block-end`/`usage`/`finish`), the adapter contract (usage before finish and nothing after; tool-call `arguments` stay raw JSON strings end-to-end; two sanctioned error paths → one `LlmFailure`: throw OR in-band `finish {error|aborted}`; one adapter call = one provider attempt; bounded stream idle timeout; canonical `CONTEXT_WINDOW_EXCEEDED`; empty completion → retryable `EMPTY_RESPONSE`; mandatory attribution), plus a shared `BlockAssembler` (fold raw chunks → blocks, dropping tool calls on `max-tokens` finish) and `TokenUsage` (disjoint counts) — all matching dsh.
+- **Q2 — The seam-trait pattern.** Each seam is a Rust `trait` (e.g. `trait FileSystem`, `trait LlmAdapter`) registered on `ctx` via the runtime's type-token map (03 Q1); consumers fetch it through a typed accessor (`ctx.fs()`, `ctx.llm()`). Async methods return `Send + Sync` futures (satisfying the tokio spine, 03 Q5/Q9). The trait is the service definition; an implementing provider is the swap.
+- **Q3 — Crate placement.** All seam **trait definitions** live in `dsh-seams`. Concrete **providers** are swappable crates/features: `fs-local`, `llm-openai`, `llm-replay`, `credentials-local`, `settings-file`, `storage-jsonl` (+ later `storage-sqlite`), `bash-local`, `subprocess-local`, `sandbox-local`. **Consumer tools** (`tool-fs`, `tool-bash`) live in tool crates / `dsh-agent`. "Swap a provider = swap a crate/feature."
+- **Q4 — Spec depth: fs + llm at full depth; the rest lighter.** `FileSystem` and `LlmAdapter` get full contract prose in the spec (the two contract-heaviest, most-swappable seams, driving the model-facing tools and the agent loop). `Credentials`, `Settings`, `Storage`, `Subprocess`, `Shell`, `Sandbox` are recorded at a lighter level: definition + one local provider + one consumer, no deep contract prose.
+- **Q5 — Named consumers per seam.** `tool-fs` (read/write/edit) consumes `ctx.fs`; the **agent loop** consumes `ctx.llm` (not a model-facing tool); `tool-bash` consumes `ctx.shell`; the **llm providers and boot configuration** consume `ctx.credentials`/`ctx.settings`/`ctx.storage` (not model-facing); the **agent loop** consumes `ctx.sessions` (resolved in 04). Naming each proves it is a live seam, not a dead abstraction.
+- **Q6 — Settings & credentials semantics locked.** `Settings` seam: namespace schemas + a layered resolver (composition base over user layer) + a file provider; plugins register namespace schemas, providers store the raw document. `Credentials` seam: configuration carries references to secrets; providers own the values; consumers resolve per operation so a rotated credential reaches the very next request. Both as `dsh-seams` traits with a local provider. Preserving the layered and per-operation semantics keeps providers config-driven and swappable.
+
+**Spec locks:** Q1–Q6. **Deferred:** `Storage` breadth (deferred backends beyond jsonl), web/attachment/media seams (out of core), sandbox providers beyond local, image-block projection depth (depends on attachments). Sources: `docs/subsystems/llm-streaming.md`, `docs/subsystems/filesystem.md`, research 01, runtime design 03.
