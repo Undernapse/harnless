@@ -12,6 +12,7 @@ A written architecture/design spec handed off to a separate planning-and-executi
 - **Reference docs to consult** (in `/tmp/dsh/docs/`): `architecture.md`, `capability-seams.md`, `tool-execution-pipeline.md`, `cordis-primer.md`, `agent-lifecycle.md`, `event-producer-consumer.md`, `module-graph.md`, `config-catalog.md`, plus per-package READMEs (`packages/**/README.md`).
 - **User decisions already locked** (from charting): foundation = hand-rolled Rust Cordis-equivalent; dynamism = hybrid (core seams compile-time traits, dynamic WASM extension for MCP/tool plugins); core = event-sourced session log + agent loop; seam scope = core seam architecture, not every provider; MCP = client bridge consuming external servers into `ctx.tools`; llm = OpenAI-compatible streaming + replay adapter.
 - Representative directory is `/tmp/dsh` — may not persist across sessions; re-clone from upstream if needed.
+- **Status: map fully resolved** (all 7 tickets closed, 2026-08-28). The way to the destination is clear — the remaining work is assembling the one written architecture/design spec (the `to-spec` deliverable) from the Decisions-so-far + the two research references. The last frontier was the WASM extension surface (06).
 
 ## Decisions so far
 
