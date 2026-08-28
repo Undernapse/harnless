@@ -4,6 +4,8 @@
 
 A written architecture/design spec handed off to a separate planning-and-execution effort, for a **standalone greenfield Rust reimplementation of the DeepSeek Harness (`dsh`)** that preserves `dsh`'s plugability: the Cordis-style "everything is a plugin" architecture — a service-context runtime with typed events and reversible effects, an event-sourced session log driving an agent loop, and a core set of swappable capability seams (tools/MCP, llm, fs, subprocess/shell/sandbox, sessions, credentials, settings, storage). The spec's job is to pin down enough decisions that executing it needs no further design.
 
+> **Destination reached.** The spec is published at [spec.md](spec.md), labelled `ready-for-agent` — 118 user stories, implementation decisions sourced from all seven tickets, two test seams. Nothing here is left to decide before execution.
+
 ## Notes
 
 - **Domain**: Rust reimplementation of an existing TypeScript agent-harness architecture. The reference codebase is `deepseek-ai/deepseek-harness` (cloned at `/tmp/dsh` for this session; the canonical repo is on GitHub).
@@ -12,7 +14,6 @@ A written architecture/design spec handed off to a separate planning-and-executi
 - **Reference docs to consult** (in `/tmp/dsh/docs/`): `architecture.md`, `capability-seams.md`, `tool-execution-pipeline.md`, `cordis-primer.md`, `agent-lifecycle.md`, `event-producer-consumer.md`, `module-graph.md`, `config-catalog.md`, plus per-package READMEs (`packages/**/README.md`).
 - **User decisions already locked** (from charting): foundation = hand-rolled Rust Cordis-equivalent; dynamism = hybrid (core seams compile-time traits, dynamic WASM extension for MCP/tool plugins); core = event-sourced session log + agent loop; seam scope = core seam architecture, not every provider; MCP = client bridge consuming external servers into `ctx.tools`; llm = OpenAI-compatible streaming + replay adapter.
 - Representative directory is `/tmp/dsh` — may not persist across sessions; re-clone from upstream if needed.
-- **Status: map fully resolved** (all 7 tickets closed, 2026-08-28). The way to the destination is clear — the remaining work is assembling the one written architecture/design spec (the `to-spec` deliverable) from the Decisions-so-far + the two research references. The last frontier was the WASM extension surface (06).
 
 ## Decisions so far
 
@@ -26,10 +27,9 @@ A written architecture/design spec handed off to a separate planning-and-executi
 
 ## Not yet specified
 
-Fog: the frontier is now empty — all seven tickets are resolved. The way to the destination (the spec) is clear. What remains is thin and belongs to the spec-writing effort, not new decision tickets:
+Empty. All seven tickets are resolved and the spec is published, so nothing remains to decide before execution.
 
-- **CLI / execution surface**: the Rust analog of `dsh web` / `dsh --profile <name> --dump-config` / the `headless` one-shot runner. Headless is in-scope; the browser web app is out-of-scope. The config-boot model is decided (06) but the exact CLI verbs and the shipped `web`/`headless` profile templates are spec content.
-- **Spec assembly**: fusing the seven resolved decisions (runtime 03, session log 04, seam interfaces 05, WASM extension 06, tools+MCP 07, plus research 01/02) into the single written architecture/design spec — the destination. This is the hand-off deliverable, not a decision.
+One item was carried forward as an explicit execution-time choice rather than a map ticket: the **CLI / execution surface** (the analog of `dsh --profile <name> --dump-config` and the `headless` one-shot runner). The config-boot model is decided (06) and the browser app is out of scope; the exact verb set is left to the planning effort and is noted in the spec's Further Notes.
 
 ## Out of scope
 
