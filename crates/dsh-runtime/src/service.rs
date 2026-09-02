@@ -10,7 +10,7 @@
 //! typed boundary, so a downcast failure is unreachable at typed call sites.
 
 use std::any::{type_name, Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -83,6 +83,10 @@ impl ServiceMap {
 
     pub(crate) fn get_boxed(&self, id: ServiceId) -> Option<BoxedService> {
         self.inner.read().get(&id).cloned()
+    }
+
+    pub(crate) fn ids(&self) -> HashSet<ServiceId> {
+        self.inner.read().keys().copied().collect()
     }
 }
 

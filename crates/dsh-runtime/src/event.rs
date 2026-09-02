@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::future::join_all;
+use futures::FutureExt;
 use parking_lot::Mutex;
 
 use crate::error::{Result, RuntimeError};
@@ -38,6 +39,13 @@ impl<T: ?Sized> Clone for Slot<T> {
 /// A registration that is removed when dropped.
 pub struct Subscription {
     active: Arc<AtomicBool>,
+}
+
+/// Where a listener is inserted in its dispatch chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerOrder {
+    Append,
+    Prepend,
 }
 
 impl Subscription {
@@ -86,27 +94,33 @@ where
         Self::default()
     }
 
-    /// Register a synchronous observer. `prepend` places it before ordinary listeners.
-    pub fn on_emit<F>(&self, prepend: bool, listener: F) -> Subscription
+    /// Register a synchronous observer at the requested position.
+    pub fn on_emit<F>(&self, order: ListenerOrder, listener: F) -> Subscription
     where
         F: Fn(&E) -> Result<()> + Send + Sync + 'static,
     {
-        insert(&self.emit, prepend, Arc::new(listener))
+        insert(&self.emit, order, Arc::new(listener))
     }
 
     /// Observe synchronously in registration order; isolate and return failures.
     pub fn emit(&self, event: &E) -> Vec<RuntimeError> {
-        snapshot(&self.emit)
+        let errors: Vec<_> = snapshot(&self.emit)
             .into_iter()
-            .filter_map(|listener| listener(event).err())
-            .collect()
+            .filter_map(|listener| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(event)))
+                    .unwrap_or_else(|_| Err(RuntimeError::listener_panicked()))
+                    .err()
+            })
+            .collect();
+        log_failures(&errors);
+        errors
     }
 
-    pub fn on_bail<F>(&self, prepend: bool, listener: F) -> Subscription
+    pub fn on_bail<F>(&self, order: ListenerOrder, listener: F) -> Subscription
     where
         F: Fn(&E) -> Result<Option<R>> + Send + Sync + 'static,
     {
-        insert(&self.bail, prepend, Arc::new(listener))
+        insert(&self.bail, order, Arc::new(listener))
     }
 
     /// Run synchronous listeners until one returns a value.
@@ -119,21 +133,30 @@ where
         Ok(None)
     }
 
-    pub fn on_async<F>(&self, prepend: bool, listener: F) -> Subscription
+    pub fn on_async<F>(&self, order: ListenerOrder, listener: F) -> Subscription
     where
         F: for<'a> Fn(&'a E) -> BoxFuture<'a, Result<Option<R>>> + Send + Sync + 'static,
     {
-        insert(&self.asynchronous, prepend, Arc::new(listener))
+        insert(&self.asynchronous, order, Arc::new(listener))
     }
 
     /// Await every listener concurrently and contain each outcome.
     pub async fn parallel(&self, event: &E) -> Vec<Result<Option<R>>> {
-        join_all(
-            snapshot(&self.asynchronous)
-                .into_iter()
-                .map(|listener| listener(event)),
-        )
-        .await
+        let outcomes = join_all(snapshot(&self.asynchronous).into_iter().map(
+            |listener| async move {
+                std::panic::AssertUnwindSafe(listener(event))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| Err(RuntimeError::listener_panicked()))
+            },
+        ))
+        .await;
+        let errors: Vec<_> = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().err().cloned())
+            .collect();
+        log_failures(&errors);
+        outcomes
     }
 
     /// Await listeners in registration order until one returns a value.
@@ -146,14 +169,14 @@ where
         Ok(None)
     }
 
-    pub fn on_waterfall<F>(&self, prepend: bool, listener: F) -> Subscription
+    pub fn on_waterfall<F>(&self, order: ListenerOrder, listener: F) -> Subscription
     where
         F: for<'a> Fn(&'a mut E, Next<'a, E, R>) -> BoxFuture<'a, Result<Option<R>>>
             + Send
             + Sync
             + 'static,
     {
-        insert(&self.waterfall, prepend, Arc::new(listener))
+        insert(&self.waterfall, order, Arc::new(listener))
     }
 
     /// Dispatch an around-middleware chain. A listener vetoes by not calling `next`.
@@ -207,19 +230,33 @@ where
     }
 }
 
-fn insert<T: ?Sized>(slots: &Mutex<Vec<Slot<T>>>, prepend: bool, listener: Arc<T>) -> Subscription {
+fn insert<T: ?Sized>(
+    slots: &Mutex<Vec<Slot<T>>>,
+    order: ListenerOrder,
+    listener: Arc<T>,
+) -> Subscription {
     let active = Arc::new(AtomicBool::new(true));
     let slot = Slot {
         active: active.clone(),
         listener,
     };
     let mut slots = slots.lock();
-    if prepend {
+    if order == ListenerOrder::Prepend {
         slots.insert(0, slot);
     } else {
         slots.push(slot);
     }
     Subscription { active }
+}
+
+fn log_failures(errors: &[RuntimeError]) {
+    for error in errors {
+        tracing::error!(
+            code = error.code,
+            message = error.message,
+            "event listener failed"
+        );
+    }
 }
 
 fn snapshot<T: ?Sized>(slots: &Mutex<Vec<Slot<T>>>) -> Vec<Arc<T>> {
@@ -238,12 +275,12 @@ mod tests {
         let registry = EventRegistry::<(), ()>::new();
         let order = Arc::new(StdMutex::new(Vec::new()));
         let a = order.clone();
-        let _a = registry.on_emit(false, move |_| {
+        let _a = registry.on_emit(ListenerOrder::Append, move |_| {
             a.lock().unwrap().push("ordinary");
             Err(RuntimeError::new("OBSERVER", "failed"))
         });
         let b = order.clone();
-        let _b = registry.on_emit(true, move |_| {
+        let _b = registry.on_emit(ListenerOrder::Prepend, move |_| {
             b.lock().unwrap().push("prepended");
             Ok(())
         });
@@ -253,19 +290,35 @@ mod tests {
     }
 
     #[test]
+    fn emit_contains_panics_and_continues_to_siblings() {
+        let registry = EventRegistry::<(), ()>::new();
+        let _panic = registry.on_emit(ListenerOrder::Append, |_| panic!("observer panic"));
+        let reached = Arc::new(AtomicBool::new(false));
+        let marker = reached.clone();
+        let _sibling = registry.on_emit(ListenerOrder::Append, move |_| {
+            marker.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let errors = registry.emit(&());
+        assert_eq!(errors[0].code, "LISTENER_PANICKED");
+        assert!(reached.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn bail_stops_on_first_synchronous_value() {
         let registry = EventRegistry::<(), u8>::new();
-        let _a = registry.on_bail(false, |_| Ok(None));
-        let _b = registry.on_bail(false, |_| Ok(Some(2)));
-        let _c = registry.on_bail(false, |_| Ok(Some(3)));
+        let _a = registry.on_bail(ListenerOrder::Append, |_| Ok(None));
+        let _b = registry.on_bail(ListenerOrder::Append, |_| Ok(Some(2)));
+        let _c = registry.on_bail(ListenerOrder::Append, |_| Ok(Some(3)));
         assert_eq!(registry.bail(&()).unwrap(), Some(2));
     }
 
     #[tokio::test]
     async fn parallel_waits_for_all_and_contains_failures() {
         let registry = EventRegistry::<(), u8>::new();
-        let _a = registry.on_async(false, |_| Box::pin(async { Ok(Some(1)) }));
-        let _b = registry.on_async(false, |_| {
+        let _a = registry.on_async(ListenerOrder::Append, |_| Box::pin(async { Ok(Some(1)) }));
+        let _b = registry.on_async(ListenerOrder::Append, |_| {
             Box::pin(async { Err(RuntimeError::new("LISTENER", "failed")) })
         });
         let outcomes = registry.parallel(&()).await;
@@ -275,18 +328,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_contains_a_panicking_future() {
+        let registry = EventRegistry::<(), ()>::new();
+        let _panic = registry.on_async(ListenerOrder::Append, |_| {
+            Box::pin(async { panic!("async observer panic") })
+        });
+        let _sibling = registry.on_async(ListenerOrder::Append, |_| Box::pin(async { Ok(None) }));
+
+        let outcomes = registry.parallel(&()).await;
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].as_ref().unwrap_err().code, "LISTENER_PANICKED");
+        assert!(outcomes[1].is_ok());
+    }
+
+    #[tokio::test]
     async fn serial_stops_on_first_async_value() {
         let registry = EventRegistry::<(), u8>::new();
-        let _a = registry.on_async(false, |_| Box::pin(async { Ok(None) }));
-        let _b = registry.on_async(false, |_| Box::pin(async { Ok(Some(2)) }));
-        let _c = registry.on_async(false, |_| Box::pin(async { Ok(Some(3)) }));
+        let _a = registry.on_async(ListenerOrder::Append, |_| Box::pin(async { Ok(None) }));
+        let _b = registry.on_async(ListenerOrder::Append, |_| Box::pin(async { Ok(Some(2)) }));
+        let _c = registry.on_async(ListenerOrder::Append, |_| Box::pin(async { Ok(Some(3)) }));
         assert_eq!(registry.serial(&()).await.unwrap(), Some(2));
     }
 
     #[tokio::test]
     async fn waterfall_wraps_terminal_and_can_veto() {
         let registry = EventRegistry::<Vec<&'static str>, usize>::new();
-        let _outer = registry.on_waterfall(false, |event, next| {
+        let _outer = registry.on_waterfall(ListenerOrder::Append, |event, next| {
             Box::pin(async move {
                 event.push("before");
                 let result = next.run(event).await?;
@@ -308,7 +375,7 @@ mod tests {
         assert_eq!(result, Some(2));
 
         let vetoes = EventRegistry::<(), usize>::new();
-        let _veto = vetoes.on_waterfall(false, |_, _| Box::pin(async { Ok(None) }));
+        let _veto = vetoes.on_waterfall(ListenerOrder::Append, |_, _| Box::pin(async { Ok(None) }));
         let called = Arc::new(AtomicBool::new(false));
         let marker = called.clone();
         assert_eq!(

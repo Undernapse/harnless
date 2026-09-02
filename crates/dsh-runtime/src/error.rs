@@ -41,6 +41,16 @@ impl RuntimeError {
             "service key already has a provider in this scope",
         )
     }
+
+    /// A listener panicked while being dispatched in a contained mode.
+    pub const fn listener_panicked() -> Self {
+        Self::new("LISTENER_PANICKED", "event listener panicked")
+    }
+
+    /// Two queued or mounted plugins claimed the same operational identity.
+    pub const fn duplicate_plugin() -> Self {
+        Self::new("DUPLICATE_PLUGIN", "plugin identity is already in use")
+    }
 }
 
 impl fmt::Display for RuntimeError {

@@ -1,6 +1,7 @@
 //! Scoped service contexts.
 
 use std::any::{Any, TypeId};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -63,6 +64,10 @@ impl Context {
 
     pub(crate) fn contains_id(&self, id: TypeId) -> bool {
         self.get_boxed(id).is_some()
+    }
+
+    pub(crate) fn local_service_ids(&self) -> HashSet<TypeId> {
+        self.0.services.ids()
     }
 
     /// Resolve a service locally, then through ancestor scopes.

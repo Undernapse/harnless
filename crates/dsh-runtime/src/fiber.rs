@@ -140,11 +140,7 @@ impl Fiber {
     /// Return `Ok` while the fiber may register new effects, or the stable
     /// error otherwise.
     pub fn assert_active(&self) -> Result<()> {
-        match self.state() {
-            FiberState::Disposed => Err(RuntimeError::inactive_fiber()),
-            FiberState::Unloading => Err(RuntimeError::inactive_effect()),
-            _ => Ok(()),
-        }
+        registration_error(self.state()).map_or(Ok(()), Err)
     }
 
     /// Register a reversible effect.
@@ -162,10 +158,8 @@ impl Fiber {
         // find this effect even while its setup is in flight.
         let idx = {
             let mut guard = self.inner.lock();
-            match guard.state {
-                FiberState::Disposed => return Err(RuntimeError::inactive_fiber()),
-                FiberState::Unloading => return Err(RuntimeError::inactive_effect()),
-                _ => {}
+            if let Some(error) = registration_error(guard.state) {
+                return Err(error);
             }
             guard.effects.push(None);
             guard.effects.len() - 1
@@ -243,6 +237,14 @@ impl Fiber {
 
         self.set_state(FiberState::Disposed);
         prev
+    }
+}
+
+fn registration_error(state: FiberState) -> Option<RuntimeError> {
+    match state {
+        FiberState::Disposed => Some(RuntimeError::inactive_fiber()),
+        FiberState::Unloading => Some(RuntimeError::inactive_effect()),
+        _ => None,
     }
 }
 
