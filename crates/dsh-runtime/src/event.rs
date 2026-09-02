@@ -144,7 +144,13 @@ where
     pub async fn parallel(&self, event: &E) -> Vec<Result<Option<R>>> {
         let outcomes = join_all(snapshot(&self.asynchronous).into_iter().map(
             |listener| async move {
-                std::panic::AssertUnwindSafe(listener(event))
+                let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    listener(event)
+                })) {
+                    Ok(future) => future,
+                    Err(_) => return Err(RuntimeError::listener_panicked()),
+                };
+                std::panic::AssertUnwindSafe(future)
                     .catch_unwind()
                     .await
                     .unwrap_or_else(|_| Err(RuntimeError::listener_panicked()))
@@ -333,6 +339,22 @@ mod tests {
         let _panic = registry.on_async(ListenerOrder::Append, |_| {
             Box::pin(async { panic!("async observer panic") })
         });
+        let _sibling = registry.on_async(ListenerOrder::Append, |_| Box::pin(async { Ok(None) }));
+
+        let outcomes = registry.parallel(&()).await;
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].as_ref().unwrap_err().code, "LISTENER_PANICKED");
+        assert!(outcomes[1].is_ok());
+    }
+
+    #[tokio::test]
+    async fn parallel_contains_a_panic_while_constructing_a_future() {
+        fn panics_before_future(_: &()) -> BoxFuture<'_, Result<Option<()>>> {
+            panic!("listener construction panic")
+        }
+
+        let registry = EventRegistry::<(), ()>::new();
+        let _panic = registry.on_async(ListenerOrder::Append, panics_before_future);
         let _sibling = registry.on_async(ListenerOrder::Append, |_| Box::pin(async { Ok(None) }));
 
         let outcomes = registry.parallel(&()).await;
