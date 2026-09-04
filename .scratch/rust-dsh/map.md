@@ -31,6 +31,26 @@ Empty. All seven tickets are resolved and the spec is published, so nothing rema
 
 One item was carried forward as an explicit execution-time choice rather than a map ticket: the **CLI / execution surface** (the analog of `dsh --profile <name> --dump-config` and the `headless` one-shot runner). The config-boot model is decided (06) and the browser app is out of scope; the exact verb set is left to the planning effort and is noted in the spec's Further Notes.
 
+## Implementation tasks
+
+The design is settled and the spec is published as `ready-for-agent`. The build is tracked as `wayfinder:task` sub-issues under this map (GitHub #1). Core runtime, seams, and the agent crate are already started in-repo (`crates/`); the tickets below decompose the remaining work.
+
+- **Providers**
+  - [Provider: llm-openai (OpenAI-compatible adapter)](https://github.com/Undernapse/harnless/issues/9) — OpenAI-compatible streaming adapter (DeepSeek/vLLM), disjoint usage, watchdog, two failure paths, replay-state ownership.
+  - [Provider: llm-replay (deterministic replay adapter)](https://github.com/Undernapse/harnless/issues/11) — deterministic replay provider for tests/demos; drives the primary seam test.
+  - [Provider: fs-local (local filesystem)](https://github.com/Undernapse/harnless/issues/12) — opaque targets, version guards, atomic edit, error taxonomy, `fs/*` policy gate.
+  - [Provider: execution world (subprocess/bash/sandbox-local + PolicyHome)](https://github.com/Undernapse/harnless/issues/13) — shared confinement policy home so fs and subprocess never disagree.
+  - [Providers: settings-file / credentials-local / storage-jsonl](https://github.com/Undernapse/harnless/issues/14) — layered settings, per-operation credential resolution, named storage backends.
+- **Integration**
+  - [Implement dsh-mcp crate: MCP seam + client bridge](https://github.com/Undernapse/harnless/issues/10) — tools-only client bridge, namespaced naming, generation replacement, outage/backoff.
+  - [Config/boot composition: layered profiles, bundles, patch, --dump-config](https://github.com/Undernapse/harnless/issues/17) — YAML layered boot, id-targeted whole-config patch, dump-equals-mount.
+  - [Dynamic WASM plugin surface (wasmtime, component model, per-plugin fiber)](https://github.com/Undernapse/harnless/issues/15) — largest risk; first milestone = one tool plugin end-to-end.
+  - [CLI / execution surface (verb set + default profile)](https://github.com/Undernapse/harnless/issues/16) — the deliberately-carried-forward item: profile/dump-config/one-shot runner.
+- **Test seams**
+  - [Durability/replay tests](https://github.com/Undernapse/harnless/issues/18) — round-trip exact log, fork boundary refusal, crash-recovery interrupted, no-grow-on-reopen.
+  - [Primary seam test: agent loop via session log (replay adapter)](https://github.com/Undernapse/harnless/issues/19) — the single highest seam; the log is the observable behavior.
+  - [Plugability conformance kit](https://github.com/Undernapse/harnless/issues/20) — one parameterized contract suite run unchanged against every provider.
+
 ## Out of scope
 
 - **Web UI / web client** (dsh's `apps/web`, `packages/web` browser client, `ConversationNodeDefinition`): the destination is the harness engine + seams, not the browser product.
