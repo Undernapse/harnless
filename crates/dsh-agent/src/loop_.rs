@@ -52,14 +52,14 @@ pub enum DriverOutcome {
 /// points. Driving a turn appends a full event sequence and returns the
 /// derived history the model saw.
 pub struct AgentLoop {
-    log: SessionLog,
+    log: Arc<SessionLog>,
     events: EventRegistry,
     fiber: Arc<Fiber>,
 }
 
 impl AgentLoop {
     /// Create a loop bound to `log` and `fiber` (which owns its effects).
-    pub fn new(log: SessionLog, events: EventRegistry, fiber: Arc<Fiber>) -> Self {
+    pub fn new(log: Arc<SessionLog>, events: EventRegistry, fiber: Arc<Fiber>) -> Self {
         Self {
             log,
             events,
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn run_turn_appends_full_sequence_and_derives_history() {
         let fiber = Fiber::active();
-        let log = SessionLog::new(dsh_seams::SessionId(1));
+        let log = Arc::new(SessionLog::new(dsh_seams::SessionId(1)));
         let events = EventRegistry::new();
         let loop_ = AgentLoop::new(log, events, fiber);
         let text = "hello".to_string();
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn on_stream_listener_can_transform_the_committed_message() {
         let fiber = Fiber::active();
-        let log = SessionLog::new(dsh_seams::SessionId(2));
+        let log = Arc::new(SessionLog::new(dsh_seams::SessionId(2)));
         let events = EventRegistry::new();
         let loop_ = AgentLoop::new(log, events, fiber);
         let _guard = loop_
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn stop_reason_propagates_to_turn_close() {
         let fiber = Fiber::active();
-        let log = SessionLog::new(dsh_seams::SessionId(3));
+        let log = Arc::new(SessionLog::new(dsh_seams::SessionId(3)));
         let events = EventRegistry::new();
         let loop_ = AgentLoop::new(log, events, fiber);
         let turn = loop_.run_turn(Box::new(|| {
