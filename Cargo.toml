@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/dsh-runtime",
+    "crates/dsh-seams",
+    "crates/dsh-agent",
 ]
 
 [workspace.package]
