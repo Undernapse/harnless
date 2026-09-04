@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/dsh-runtime",
-    "crates/dsh-seams",
-    "crates/dsh-agent",
+    "crates/harnless-runtime",
+    "crates/harnless-seams",
+    "crates/harnless-agent",
 ]
 
 [workspace.package]

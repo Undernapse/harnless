@@ -15,39 +15,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "dsh-agent"
-version = "0.1.0"
-dependencies = [
- "dsh-runtime",
- "dsh-seams",
- "parking_lot",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "dsh-runtime"
-version = "0.1.0"
-dependencies = [
- "parking_lot",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "dsh-seams"
-version = "0.1.0"
-dependencies = [
- "dsh-runtime",
- "futures-lite",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -76,6 +43,39 @@ dependencies = [
  "futures-io",
  "parking",
  "pin-project-lite",
+]
+
+[[package]]
+name = "harnless-agent"
+version = "0.1.0"
+dependencies = [
+ "harnless-runtime",
+ "harnless-seams",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "harnless-runtime"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "harnless-seams"
+version = "0.1.0"
+dependencies = [
+ "futures-lite",
+ "harnless-runtime",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

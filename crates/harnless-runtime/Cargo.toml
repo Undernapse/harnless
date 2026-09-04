@@ -1,6 +1,6 @@
 [package]
-name = "dsh-runtime"
-description = "The Cordis-equivalent service-context runtime for the deepseek-harness clone: type-token service map, typed events with five dispatch modes, fiber-owned reversible effects, and plugin lifecycle."
+name = "harnless-runtime"
+description = "The harnless service-context runtime: type-token service map, typed events with five dispatch modes, fiber-owned reversible effects, and plugin lifecycle."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

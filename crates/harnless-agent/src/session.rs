@@ -17,7 +17,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dsh_seams::SessionId;
+use harnless_seams::SessionId;
 
 use crate::events::{CommittedRecord, Position, SessionEvent};
 
@@ -132,7 +132,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::events::{MessageRecord, TurnEndReason};
-    use dsh_seams::MessageId;
+    use harnless_seams::MessageId;
 
     #[test]
     fn append_assigns_contiguous_positions() {

@@ -1,7 +1,7 @@
-# Spec: Rust reimplementation of the DeepSeek Harness
+# Spec: harnless — a Rust agent harness inspired by the DeepSeek Harness
 
 Status: ready-for-agent
-Effort: [rust-dsh map](map.md) — all 7 decision tickets resolved
+Effort: [harnless map](https://github.com/Undernapse/harnless/issues/1) — all 7 decision tickets resolved
 Date: 2026-08-28
 
 ## Problem Statement
@@ -14,7 +14,7 @@ There is no Rust harness that offers the same guarantee — that any part of the
 
 ## Solution
 
-A standalone, greenfield Rust reimplementation of `dsh`'s harness: the same "everything is a plugin" architecture, rebuilt on a Rust-native service-context runtime.
+`harnless` is a standalone, greenfield Rust agent harness whose "everything is a plugin" architecture is inspired by the DeepSeek Harness (`dsh`) but is its own product. It rebuilds that architecture on a Rust-native service-context runtime.
 
 A running system is a **context** holding services that consumers find by stable key rather than by importing an implementation. Each swappable capability is a **seam** with three roles — a service definition (a Rust trait), one or more providers (implementations, independently distributed), and consumers (usually model-facing tools). Capabilities communicate through **typed events** with five dispatch modes, including a waterfall mode that lets a listener wrap or veto an action. Every registration is a **reversible effect** owned by the plugin that made it, so unloading a plugin unwinds exactly its own tools, listeners, and prompt sections.
 
@@ -186,8 +186,8 @@ Decisions below are the resolved outcome of the seven map tickets; each notes it
 
 ### Crate topology
 
-- **Workspace split** (03): `dsh-runtime` (the Cordis-equivalent: context, events, effects, plugin lifecycle, fibers), `dsh-seams` (seam *trait definitions* only — the service definitions), `dsh-agent` (session log, agent loop, system-prompt assembly, core spine services), `dsh-mcp` (the MCP seam and client bridge). Concrete providers are separate crates or features: `fs-local`, `llm-openai`, `llm-replay`, `credentials-local`, `settings-file`, `storage-jsonl`, `bash-local`, `subprocess-local`, `sandbox-local`, `tool-fs`, `tool-bash`.
-- **Rule**: swapping a provider means swapping a crate or a feature, never editing `dsh-runtime` or a consumer. `dsh-seams` depends on nothing but the runtime's type vocabulary, so a third-party provider can compile against interfaces alone.
+- **Workspace split** (03): `harnless-runtime` (the Cordis-equivalent: context, events, effects, plugin lifecycle, fibers), `harnless-seams` (seam *trait definitions* only — the service definitions), `harnless-agent` (session log, agent loop, system-prompt assembly, core spine services), `harnless-mcp` (the MCP seam and client bridge). Concrete providers are separate crates or features: `fs-local`, `llm-openai`, `llm-replay`, `credentials-local`, `settings-file`, `storage-jsonl`, `bash-local`, `subprocess-local`, `sandbox-local`, `tool-fs`, `tool-bash`.
+- **Rule**: swapping a provider means swapping a crate or a feature, never editing `harnless-runtime` or a consumer. `harnless-seams` depends on nothing but the runtime's type vocabulary, so a third-party provider can compile against interfaces alone.
 - **No privileged core**: the agent loop is one registered service, not an entry point. Extensions depend on `agent/*` and `tools/*` events, never on the loop implementation crate — matching how dsh's extension packages avoid depending on the concrete loop.
 
 ### Service context runtime
@@ -291,7 +291,7 @@ Decisions below are the resolved outcome of the seven map tickets; each notes it
 
 ### Core seam contracts
 
-Each seam is a trait in `dsh-seams`; a provider is an implementation registered onto the context; a consumer is the party that calls it. The three-role discipline is what makes a seam a seam — a lone interface with no provider and no consumer is not plugability.
+Each seam is a trait in `harnless-seams`; a provider is an implementation registered onto the context; a consumer is the party that calls it. The three-role discipline is what makes a seam a seam — a lone interface with no provider and no consumer is not plugability.
 
 **Filesystem** — ported faithfully, because its swap-safety contract is the reason providers are interchangeable (05).
 - Targets are opaque: a path resolves to a stable identity with a display form, and consumers must never parse the identity key or assume it is a local path. Cross-capability coordinates (a path a subprocess can open, a file URI, containment tests) come from the provider, not from string manipulation.
@@ -356,7 +356,7 @@ Each seam is a trait in `dsh-seams`; a provider is an implementation registered 
   # or inserts new rows. A patch naming an absent id is a warning, not an error.
   ```
 - **Patch semantics: whole-config replacement, not deep merge** (06): an override restates the fields it keeps. Chosen to match dsh — deep merge across layers produces compositions nobody can read.
-- **Config is YAML; expressions are declared, not ambient** (06): where dsh interpolates JavaScript expressions, the Rust clone needs a deliberately small, non-Turing-complete substitution surface (environment and home paths). This is the one place the port cannot be faithful, and the escape hatch's shape is a first-class design decision rather than an accident.
+- **Config is YAML; expressions are declared, not ambient** (06): where dsh interpolates JavaScript expressions, harnless needs a deliberately small, non-Turing-complete substitution surface (environment and home paths). This is the one place the port cannot be faithful, and the escape hatch's shape is a first-class design decision rather than an accident.
 - **Dump equals mount** (06): composing base and overlays offline must yield exactly what boot mounts, using the same parser and patch algorithm, so a dumped config is reloadable and diffable.
 
 ### Cross-cutting contracts
@@ -401,10 +401,10 @@ Ruled out by the map's destination; these return only if the destination is redr
 
 - **Where the port cannot be faithful.** Four gaps are deliberate, not oversights: (1) plugin-extensible events — declaration merging has no Rust equivalent, hence core enum plus extension registry; (2) config expressions — a small substitution surface replaces arbitrary code in config; (3) hot reload — Rust cannot hot-load crates, hence the narrow WASM surface and rebuild-instead for providers; (4) presentation — hooks exist without a consumer. Each is recorded so a future reader sees a decision rather than a hole.
 - **Two dispatch modes beyond the documentation.** The harness's own primer lists four event modes; the framework has five. The spec locks all five — a gap found while reading framework source rather than docs.
-- **MCP was never a seam upstream.** Externally bridged tools ride on the tool registry, so a first-class seam had to be created for them (ticket 01). This is the one place the clone's architecture is deliberately *better* differentiated than the original's.
+- **MCP was never a seam upstream.** Externally bridged tools ride on the tool registry, so a first-class seam had to be created for them (ticket 01). This is the one place harnless's architecture is deliberately *better* differentiated than the original's.
 - **Reference material.** Two research documents back the interface tables and should be read alongside the spec: `docs/research/seam-inventory.md` (every seam with its triage) and `docs/research/cordis-semantics.md` (the semantics the runtime must match, including dispatch-mode mechanics).
 - **Upstream is in developer preview with breaking changes** — the reference implementation may move under this spec. Re-clone at execution time rather than trusting cached paths.
 - **Sizing.** The runtime, the event-sourced log, the loop, and the guarded pipeline are the load-bearing core; every one of them is specified to behavioral depth. The WASM surface is the largest single risk in the build, and the first implementation milestone should be a tool plugin crossing that boundary end to end rather than breadth across seams.
-- **The CLI / execution surface is deliberately unspecified.** The config-boot model is decided (layered profiles, bundles, id-targeted patches, dump-equals-mount), and the browser-facing surface is out of scope — but the exact verb set the binary exposes (`--profile <name>`, `--dump-config`, a one-shot headless runner, an interactive entry point) and the composition shipped as its default profile are left to the planning effort. They are presentation of decisions already made, not new ones.
+**The CLI / execution surface is deliberately unspecified.** The config-boot model is decided (layered profiles, bundles, id-targeted patches, dump-equals-mount), and the browser-facing surface is out of scope — but the exact verb set the binary exposes (`--profile <name>`, `--dump-config`, a one-shot headless runner, an interactive entry point) and the composition shipped as its default profile are left to the planning effort. They are presentation of decisions already made, not new ones. The project is named **harnless**; its executable binary is named **`hrls`**.
 
 

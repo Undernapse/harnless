@@ -1,7 +1,7 @@
-//! # dsh-runtime
+//! # harnless-runtime
 //!
-//! The Cordis-equivalent service-context runtime for the deepseek-harness
-//! clone ("everything is a plugin"). This crate provides:
+//! The Cordis-equivalent service-context runtime for harnless, whose "everything
+//! is a plugin" architecture is inspired by the DeepSeek Harness. This crate provides:
 //!
 //! * [`context::Context`] — the repository of services, keyed by type.
 //! * [`events::EventRegistry`] — typed events with the five dispatch modes

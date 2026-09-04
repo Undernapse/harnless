@@ -1,4 +1,4 @@
-//! Error types for the dsh runtime.
+//! Error types for the harnless runtime.
 //!
 //! Error codes are stable machine-readable identifiers consumers route on;
 //! messages are for humans only.

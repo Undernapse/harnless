@@ -10,7 +10,7 @@
 
 use std::future::Future;
 
-use dsh_seams::SessionId;
+use harnless_seams::SessionId;
 
 use crate::events::SessionEvent;
 
@@ -47,7 +47,7 @@ pub trait SessionPersistence: Send + Sync + 'static {
 mod tests {
     use super::*;
     use crate::events::{MessageRecord, TurnEndReason};
-    use dsh_seams::MessageId;
+    use harnless_seams::MessageId;
 
     /// In-memory backend recording the exact batch it was given.
     #[derive(Default)]

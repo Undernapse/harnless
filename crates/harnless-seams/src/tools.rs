@@ -91,7 +91,7 @@ pub struct FrozenResult {
 }
 
 /// The tools seam — the service definition role only. The concrete registry
-/// (the spine) lives in `dsh-agent`; providers implement [`ToolBody`] and
+/// (the spine) lives in `harnless-agent`; providers implement [`ToolBody`] and
 /// register on the registry.
 pub trait Tools: Send + Sync + 'static {
     /// Register a tool definition and its body under `name`.

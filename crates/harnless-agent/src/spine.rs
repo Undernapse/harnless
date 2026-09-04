@@ -9,13 +9,13 @@
 //! Mounting the spine within its own fiber means unloading it unwinds the
 //! loop and its registrations together.
 
-use dsh_runtime::context::Context;
-use dsh_runtime::events::EventRegistry;
-use dsh_runtime::fiber::Fiber;
-use dsh_runtime::plugin::Plugin;
-use dsh_runtime::Result;
+use harnless_runtime::context::Context;
+use harnless_runtime::events::EventRegistry;
+use harnless_runtime::fiber::Fiber;
+use harnless_runtime::plugin::Plugin;
+use harnless_runtime::Result;
 
-use dsh_seams::SessionId;
+use harnless_seams::SessionId;
 
 use crate::loop_::AgentLoop;
 use crate::session::SessionLog;
@@ -71,8 +71,8 @@ impl Plugin for Spine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsh_runtime::context::Context;
-    use dsh_runtime::plugin::Registry;
+    use harnless_runtime::context::Context;
+    use harnless_runtime::plugin::Registry;
     use std::sync::Arc;
 
     #[test]
@@ -104,7 +104,7 @@ mod tests {
         let text = "hi".to_string();
         let _ = loop_.run_turn(Box::new(move || {
             crate::loop_::DriverOutcome::Message(crate::events::MessageRecord {
-                id: dsh_seams::MessageId(1),
+                id: harnless_seams::MessageId(1),
                 blocks: vec![crate::events::ContentBlock::Text { text: text.clone() }],
                 provider: Some("replay".into()),
                 model: Some("test".into()),

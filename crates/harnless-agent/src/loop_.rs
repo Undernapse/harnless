@@ -16,9 +16,9 @@
 
 use std::sync::Arc;
 
-use dsh_runtime::events::{EventOptions, EventRegistry, Next};
-use dsh_runtime::fiber::Fiber;
-use dsh_runtime::{Disposer, Result as RtResult};
+use harnless_runtime::events::{EventOptions, EventRegistry, Next};
+use harnless_runtime::fiber::Fiber;
+use harnless_runtime::{Disposer, Result as RtResult};
 
 use crate::events::{
     MessageRecord, SessionEvent, ToolCallRecord, ToolResultRecord,
@@ -163,9 +163,9 @@ pub struct DerivedTurn {
 mod tests {
     use super::*;
     use crate::events::{ContentBlock, MessageRecord, SessionEvent, TurnEndReason};
-    use dsh_runtime::events::EventRegistry;
-    use dsh_runtime::fiber::Fiber;
-    use dsh_seams::MessageId;
+    use harnless_runtime::events::EventRegistry;
+    use harnless_runtime::fiber::Fiber;
+    use harnless_seams::MessageId;
 
     fn message(text: &str) -> MessageRecord {
         MessageRecord {
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn run_turn_appends_full_sequence_and_derives_history() {
         let fiber = Fiber::active();
-        let log = Arc::new(SessionLog::new(dsh_seams::SessionId(1)));
+        let log = Arc::new(SessionLog::new(harnless_seams::SessionId(1)));
         let events = EventRegistry::new();
         let loop_ = AgentLoop::new(log, events, fiber);
         let text = "hello".to_string();
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn on_stream_listener_can_transform_the_committed_message() {
         let fiber = Fiber::active();
-        let log = Arc::new(SessionLog::new(dsh_seams::SessionId(2)));
+        let log = Arc::new(SessionLog::new(harnless_seams::SessionId(2)));
         let events = EventRegistry::new();
         let loop_ = AgentLoop::new(log, events, fiber);
         let _guard = loop_
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn stop_reason_propagates_to_turn_close() {
         let fiber = Fiber::active();
-        let log = Arc::new(SessionLog::new(dsh_seams::SessionId(3)));
+        let log = Arc::new(SessionLog::new(harnless_seams::SessionId(3)));
         let events = EventRegistry::new();
         let loop_ = AgentLoop::new(log, events, fiber);
         let turn = loop_.run_turn(Box::new(|| {
