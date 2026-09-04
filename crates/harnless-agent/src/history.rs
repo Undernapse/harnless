@@ -15,7 +15,7 @@
 //! Projection is cached per surface node and rebuilt when a replacement
 //! lands — deriving costs new nodes, never the whole log.
 
-use dsh_seams::MessageId;
+use harnless_seams::MessageId;
 
 use crate::events::{ContentBlock, SessionEvent};
 
@@ -124,7 +124,7 @@ impl History {
 mod tests {
     use super::*;
     use crate::events::{MessageRecord, ToolResultRecord};
-    use dsh_seams::{CallId, MessageId};
+    use harnless_seams::{CallId, MessageId};
 
     fn msg(id: u64) -> MessageRecord {
         MessageRecord {

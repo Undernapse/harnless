@@ -1,5 +1,5 @@
 [package]
-name = "dsh-agent"
+name = "harnless-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,9 +7,9 @@ rust-version.workspace = true
 description = "Session log, agent loop, system-prompt assembly, and core spine services"
 
 [dependencies]
-dsh-runtime = { path = "../dsh-runtime" }
+harnless-runtime = { path = "../harnless-runtime" }
 parking_lot = "0.12"
-dsh-seams = { path = "../dsh-seams" }
+harnless-seams = { path = "../harnless-seams" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

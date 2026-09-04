@@ -1,6 +1,6 @@
 //! The tool registry and its guarded execution pipeline.
 //!
-//! This is the concrete implementation of the `dsh-seams::Tools` seam and the
+//! This is the concrete implementation of the `harnless-seams::Tools` seam and the
 //! locked-order pipeline (decision 07):
 //!
 //! pre-execute waterfall (reorderable allow/deny/ask) → registered monotonic
@@ -16,17 +16,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use dsh_runtime::error::Result;
-use dsh_runtime::events::{EventOptions, EventRegistry, Next};
-use dsh_runtime::fiber::Fiber;
-use dsh_runtime::Disposer;
+use harnless_runtime::error::Result;
+use harnless_runtime::events::{EventOptions, EventRegistry, Next};
+use harnless_runtime::fiber::Fiber;
+use harnless_runtime::Disposer;
 use serde_json::Value;
 
-use dsh_seams::tools::{
+use harnless_seams::tools::{
     FrozenResult, GuardVerdict, PipelineStage, PostDecision, PreDecision, ToolBody,
     ToolDefinition,
 };
-use dsh_seams::{CallId, ErrorCode, SeamError};
+use harnless_seams::{CallId, ErrorCode, SeamError};
 
 /// The payload/result of the pre-execute waterfall.
 pub type PreExecute = (String, Vec<u8>);
@@ -100,7 +100,7 @@ impl ToolRegistry {
     ///
     /// Permission is denied when nobody answers the pre-execute waterfall
     /// (failing closed). Returns the frozen result.
-    pub fn execute(&self, call_id: CallId, name: &str, args: &[u8]) -> dsh_seams::Result<FrozenResult> {
+    pub fn execute(&self, call_id: CallId, name: &str, args: &[u8]) -> harnless_seams::Result<FrozenResult> {
         let (_def, body) = {
             let tools = self.tools.read();
             tools
@@ -170,8 +170,8 @@ impl ToolRegistry {
     }
 }
 
-impl dsh_seams::Tools for ToolRegistry {
-    fn register(&self, def: ToolDefinition, body: Arc<dyn ToolBody>) -> dsh_seams::Result<()> {
+impl harnless_seams::Tools for ToolRegistry {
+    fn register(&self, def: ToolDefinition, body: Arc<dyn ToolBody>) -> harnless_seams::Result<()> {
         self.tools
             .write()
             .insert(def.name.clone(), (def, body));
@@ -190,13 +190,13 @@ impl dsh_seams::Tools for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsh_runtime::events::EventRegistry;
-    use dsh_runtime::fiber::Fiber;
-    use dsh_seams::tools::{ToolBody, Tools as _};
+    use harnless_runtime::events::EventRegistry;
+    use harnless_runtime::fiber::Fiber;
+    use harnless_seams::tools::{ToolBody, Tools as _};
 
     struct EchoBody;
     impl ToolBody for EchoBody {
-        fn run(&self, _call_id: CallId, args: &[u8]) -> dsh_seams::Result<Value> {
+        fn run(&self, _call_id: CallId, args: &[u8]) -> harnless_seams::Result<Value> {
             Ok(serde_json::json!({ "echo": args }))
         }
     }

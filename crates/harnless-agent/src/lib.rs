@@ -1,7 +1,7 @@
-//! # dsh-agent
+//! # harnless-agent
 //!
 //! The session log, derived-history projection, agent loop, tool pipeline,
-//! core spine services, and system-prompt assembly for the dsh harness clone.
+//! core spine services, and system-prompt assembly for harnless.
 //!
 //! The session log is event-sourced: it is the single source of truth for
 //! what the model sees, and message history is derived from it. The agent

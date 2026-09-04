@@ -1,6 +1,6 @@
-//! # dsh-seams
+//! # harnless-seams
 //!
-//! The seam *trait definitions* for the dsh harness clone. This crate carries
+//! The seam *trait definitions* for harnless. This crate carries
 //! only service definitions — the three-role discipline's "definition" role —
 //! never providers and never consumers. A third-party provider can compile
 //! against these interfaces alone: this crate depends on nothing but the
@@ -21,7 +21,7 @@
 //! * [`Tools`] — the tool registry and its guarded pipeline stages.
 //!
 //! The approval and session seams complete the core set but belong to
-//! `dsh-agent` (approval is a waterfall decision; sessions drive the log).
+//! `harnless-agent` (approval is a waterfall decision; sessions drive the log).
 
 pub mod credentials;
 pub mod error;

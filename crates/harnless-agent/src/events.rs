@@ -3,7 +3,7 @@
 //! The event-sourced session log is the single source of truth for what the
 //! model sees. This is the **closed** core vocabulary (decision 04): a tagged
 //! serde enum. Plugins contribute log-only event types by name through the
-//! extension registry (a separate `dsh-seams` concern), but the core set is
+//! extension registry (a separate `harnless-seams` concern), but the core set is
 //! closed and lossless-JSON.
 //!
 //! Every record carries a writer-assigned position (the log length, for
@@ -17,7 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use dsh_seams::{CallId, MessageId};
+use harnless_seams::{CallId, MessageId};
 
 /// The position of a record in the log. Contiguity is a contract: position
 /// equals the log length at append time (a fresh session starts at 0).

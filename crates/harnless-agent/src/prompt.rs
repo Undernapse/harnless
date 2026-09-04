@@ -79,7 +79,7 @@ pub fn in_prompt(event: &SessionEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsh_seams::{MessageId, SessionId};
+    use harnless_seams::{MessageId, SessionId};
 
     fn log_with_message_and_structure() -> SessionLog {
         let log = SessionLog::new(SessionId(1));
