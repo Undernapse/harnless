@@ -7,10 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-futures = "0.3"
 parking_lot = "0.12"
-tokio = { version = "1", features = ["rt-multi-thread"] }
-tracing = "0.1"
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

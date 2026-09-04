@@ -13,11 +13,26 @@
 //!   disposed (`INACTIVE_EFFECT` / `INACTIVE_FIBER`).
 //! * An effect's slot is reserved *before* its setup body runs, so a reentrant
 //!   unload that starts during setup can still find and join its cleanup.
-//! * Disposers are single-shot: calling (or dropping) one twice is a no-op.
+//! * Cleanups run at most once, whether reached by explicit dispose, guard
+//!   drop, or fiber teardown.
 //! * Fiber teardown runs disposers in reverse registration order (LIFO).
+//! * One broken disposer cannot take down the teardown of the rest.
+//!
+//! # Guard semantics (the Rust translation of Cordis's disposer)
+//!
+//! Cordis hands back a disposer *function* the caller invokes. The RAII
+//! translation deliberately differs on drop:
+//!
+//! * **Dropping [`Disposer`] detaches ownership** — the effect stays
+//!   registered and unwinds when its fiber unloads. `ctx.provide(svc)?;`
+//!   inside a plugin body therefore keeps the registration alive for the
+//!   fiber's lifetime; a discarded handle means "the fiber owns it now",
+//!   never "unregister me".
+//! * **`Disposer::dispose()` runs the cleanup now** — the explicit, one-shot
+//!   early-teardown form.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use parking_lot::Mutex;
 
@@ -39,42 +54,38 @@ pub enum FiberState {
     Disposed,
 }
 
-/// A registered reversible effect.
+/// Handle over one registered reversible effect.
 ///
-/// Historically Cordis returns a disposer *function*; here the effect body
-/// returns an optional cleanup closure and the runtime hands back a guard that
-/// unwinds it. Dropping the guard runs the cleanup once; calling [`dispose`]
-/// is the explicit, awaiting form.
-///
-/// [`dispose`]: Disposer::dispose
-#[derive(Clone)]
+/// Dropping the handle **detaches ownership** (the effect unwinds with its
+/// fiber); calling [`Disposer::dispose`] runs the cleanup immediately.
+#[derive(Debug, Clone)]
 pub struct Disposer {
-    fiber: Fiber,
+    fiber: Arc<Fiber>,
     idx: usize,
-    disposed: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
 }
+
+const LIVE: u8 = 0;
+const DISPOSED: u8 = 1;
 
 impl Disposer {
-    /// Run this disposer's cleanup, if it has not already run.
+    /// Run this effect's cleanup now, exactly once.
     ///
-    /// The guard is consumed; further use is a no-op. This is the RAII form of
-    /// unwinding a single registration.
+    /// Consumes the handle; further clones are inert. Idempotent alongside
+    /// fiber teardown: whichever path runs first wins.
     pub fn dispose(self) {
-        drop(self)
-    }
-}
-
-impl Drop for Disposer {
-    fn drop(&mut self) {
-        if !self.disposed.swap(true, Ordering::SeqCst) {
+        if self.state.swap(DISPOSED, Ordering::SeqCst) == LIVE {
             self.fiber.take_and_run(self.idx);
         }
     }
 }
 
-/// The effect body of a fiber: a closure that installs a resource and returns
-/// the cleanup that undoes it (or `None` when there is nothing to undo).
-pub type Effect = Box<dyn FnOnce() -> Option<DisposeFn> + Send>;
+impl Drop for Disposer {
+    fn drop(&mut self) {
+        // Detach: the effect stays in the fiber's LIFO list and runs at fiber
+        // unload. No cleanup runs here — that is the deliberate semantics.
+    }
+}
 
 /// A cleanup closure that undoes one registration.
 pub type DisposeFn = Box<dyn FnMut() + Send>;
@@ -87,31 +98,43 @@ struct FiberInner {
 }
 
 /// A lifecycle owner of reversible effects.
+///
+/// Fibers are always created shared: [`Fiber::active`] / [`Fiber::pending`]
+/// return `Arc<Fiber>` because plugins, contexts, and disposers all hold the
+/// same instance.
 #[derive(Clone)]
 pub struct Fiber {
     inner: Arc<Mutex<FiberInner>>,
 }
 
-impl Default for Fiber {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(FiberInner {
-                state: FiberState::Active,
-                effects: Vec::new(),
-            })),
-        }
+impl core::fmt::Debug for Fiber {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Fiber")
+            .field("state", &self.state())
+            .field("live_effects", &self.effect_count())
+            .finish()
     }
 }
 
 impl Fiber {
-    /// Create a fiber in the `Pending` state.
-    pub fn pending() -> Self {
-        Self {
+    /// Create an `Active` fiber, shared.
+    pub fn active() -> Arc<Fiber> {
+        Arc::new(Self {
+            inner: Arc::new(Mutex::new(FiberInner {
+                state: FiberState::Active,
+                effects: Vec::new(),
+            })),
+        })
+    }
+
+    /// Create a `Pending` fiber, shared.
+    pub fn pending() -> Arc<Fiber> {
+        Arc::new(Self {
             inner: Arc::new(Mutex::new(FiberInner {
                 state: FiberState::Pending,
                 effects: Vec::new(),
             })),
-        }
+        })
     }
 
     /// The fiber's current lifecycle state.
@@ -138,64 +161,61 @@ impl Fiber {
     }
 
     /// Return `Ok` while the fiber may register new effects, or the stable
-    /// error otherwise.
+    /// error otherwise (`INACTIVE_EFFECT` while unloading, `INACTIVE_FIBER`
+    /// once disposed).
     pub fn assert_active(&self) -> Result<()> {
-        registration_error(self.state()).map_or(Ok(()), Err)
+        match self.state() {
+            FiberState::Disposed => Err(RuntimeError::inactive_fiber()),
+            FiberState::Unloading => Err(RuntimeError::inactive_effect()),
+            _ => Ok(()),
+        }
     }
 
     /// Register a reversible effect.
     ///
     /// The body runs immediately; the cleanup it returns is collected and run
-    /// (in reverse order) when the fiber unloads or when the returned guard is
-    /// dropped, whichever comes first. The guard is single-shot.
-    ///
-    /// Refuses to register while the fiber is unloading or disposed.
+    /// (in reverse order with the rest) when the fiber unloads, or earlier via
+    /// an explicit [`Disposer::dispose`]. The slot is reserved before the
+    /// body runs so a reentrant unload finds the effect even while its setup
+    /// is in flight. Refuses registration while unloading or disposed.
     pub fn effect<F>(&self, body: F) -> Result<Disposer>
     where
-        F: FnOnce() -> Option<DisposeFn> + Send + 'static,
+        F: FnOnce() -> Option<DisposeFn>,
     {
-        // Reserve the slot *before* running the body so a reentrant unload can
-        // find this effect even while its setup is in flight.
+        self.assert_active()?;
+
+        // Reserve the slot *before* running the body (Cordis hardening: the
+        // owner-list wrapper registers before setup executes).
         let idx = {
             let mut guard = self.inner.lock();
-            if let Some(error) = registration_error(guard.state) {
-                return Err(error);
-            }
             guard.effects.push(None);
             guard.effects.len() - 1
         };
 
         let cleanup = body();
-        let disposed = Arc::new(AtomicBool::new(false));
-        if let Some(mut cleanup) = cleanup {
+        if let Some(cleanup) = cleanup {
             let mut guard = self.inner.lock();
-            if matches!(guard.state, FiberState::Unloading | FiberState::Disposed) {
-                // Teardown raced or re-entered setup. It already observed the
-                // reserved slot, so this cleanup must run here.
-                disposed.store(true, Ordering::SeqCst);
-                drop(guard);
-                cleanup();
-            } else {
-                guard.effects[idx] = Some(cleanup);
-            }
+            guard.effects[idx] = Some(cleanup);
         }
 
         Ok(Disposer {
-            fiber: self.clone(),
+            fiber: Arc::new(Fiber {
+                inner: self.inner.clone(),
+            }),
             idx,
-            disposed,
+            state: Arc::new(AtomicU8::new(LIVE)),
         })
     }
 
-    /// Take the cleanup at `idx` (marking the slot vacated) and run it.
-    ///
-    /// Used by guard-drop so disposes of individual effects happen exactly
-    /// once and no fiber teardown runs them a second time.
+    /// Take the cleanup at `idx` (vacating the slot) and run it once.
     fn take_and_run(&self, idx: usize) {
         let cleanup = {
             let mut guard = self.inner.lock();
-            guard.effects.get_mut(idx).and_then(Option::take)
+            let slot = guard.effects.get_mut(idx);
+            slot.and_then(|s| s.take())
         };
+        // A registration whose slot was already vacated by fiber teardown is
+        // a no-op: whichever path reached it first owns the single run.
         if let Some(mut cleanup) = cleanup {
             cleanup();
         }
@@ -204,23 +224,24 @@ impl Fiber {
     /// Tear down the fiber: run all remaining effects in LIFO order and mark
     /// the fiber disposed.
     ///
-    /// Returns the previous state. Idempotent: a second call is a no-op.
+    /// Idempotent: a second call is a no-op. Each disposer is isolated, so a
+    /// panicking cleanup cannot break the teardown of the rest.
     pub fn dispose(&self) -> FiberState {
-        let prev = {
-            let mut guard = self.inner.lock();
-            if matches!(guard.state, FiberState::Unloading | FiberState::Disposed) {
-                return guard.state;
-            }
-            let prev = guard.state;
-            guard.state = FiberState::Unloading;
-            prev
-        };
+        if self.state() == FiberState::Disposed {
+            return FiberState::Disposed;
+        }
+        let prev = self.set_state(FiberState::Unloading);
+        if prev == FiberState::Disposed {
+            // A concurrent or racing caller finished teardown first.
+            self.set_state(FiberState::Disposed);
+            return prev;
+        }
 
-        // Snapshot the remaining cleanups in reverse (LIFO) order, vacating
-        // every slot so guard-drops racing teardown do not double-run.
+        // Snapshot remaining cleanups in reverse (LIFO) order, vacating every
+        // slot so explicit disposers racing teardown do not double-run.
         let cleanups: Vec<DisposeFn> = {
             let mut guard = self.inner.lock();
-            let mut reversed: Vec<DisposeFn> = Vec::new();
+            let mut reversed: Vec<DisposeFn> = Vec::with_capacity(guard.effects.len());
             for slot in guard.effects.iter_mut().rev() {
                 if let Some(cleanup) = slot.take() {
                     reversed.push(cleanup);
@@ -230,21 +251,12 @@ impl Fiber {
         };
 
         for cleanup in cleanups {
-            // One broken observer must not take down teardown of the rest;
-            // isolate each disposer failure (containment, decision 03).
+            // Containment: one broken disposer never breaks teardown.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup));
         }
 
         self.set_state(FiberState::Disposed);
         prev
-    }
-}
-
-fn registration_error(state: FiberState) -> Option<RuntimeError> {
-    match state {
-        FiberState::Disposed => Some(RuntimeError::inactive_fiber()),
-        FiberState::Unloading => Some(RuntimeError::inactive_effect()),
-        _ => None,
     }
 }
 
@@ -254,8 +266,8 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
-    fn effect_runs_cleanup_on_guard_drop() {
-        let fiber = Fiber::pending();
+    fn effect_runs_cleanup_on_explicit_dispose() {
+        let fiber = Fiber::active();
         let ran = Arc::new(AtomicUsize::new(0));
         let r = ran.clone();
         let guard = fiber
@@ -266,13 +278,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ran.load(Ordering::SeqCst), 0);
-        drop(guard);
+        guard.dispose();
         assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn disposer_is_single_shot() {
-        let fiber = Fiber::pending();
+    fn guard_drop_detaches_and_fiber_unload_still_runs_cleanup() {
+        let fiber = Fiber::active();
         let ran = Arc::new(AtomicUsize::new(0));
         let r = ran.clone();
         let guard = fiber
@@ -282,23 +294,46 @@ mod tests {
                 }) as DisposeFn)
             })
             .unwrap();
-        let guard2 = guard.clone();
-        drop(guard);
-        drop(guard2);
+        drop(guard); // detach, not dispose
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "drop must not run cleanup");
+        assert_eq!(fiber.effect_count(), 1);
+        fiber.dispose();
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn disposer_dispose_is_single_shot_across_clones() {
+        let fiber = Fiber::active();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r = ran.clone();
+        let guard = fiber
+            .effect(move || {
+                Some(Box::new(move || {
+                    r.fetch_add(1, Ordering::SeqCst);
+                }) as DisposeFn)
+            })
+            .unwrap();
+        let clone = guard.clone();
+        guard.dispose();
+        clone.dispose(); // idempotent no-op
         assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn fiber_dispose_runs_effects_lifo() {
-        let fiber = Fiber::pending();
+        let fiber = Fiber::active();
         let order = Arc::new(Mutex::new(Vec::new()));
         let a = order.clone();
-        let b = order.clone();
-        let _a_guard = fiber
-            .effect(move || Some(Box::new(move || a.lock().push("a")) as DisposeFn))
+        let _ga = fiber
+            .effect(move || {
+                Some(Box::new(move || a.lock().push("a")) as DisposeFn)
+            })
             .unwrap();
-        let _b_guard = fiber
-            .effect(move || Some(Box::new(move || b.lock().push("b")) as DisposeFn))
+        let b = order.clone();
+        let _gb = fiber
+            .effect(move || {
+                Some(Box::new(move || b.lock().push("b")) as DisposeFn)
+            })
             .unwrap();
         fiber.dispose();
         assert_eq!(*order.lock(), vec!["b", "a"]);
@@ -306,10 +341,10 @@ mod tests {
 
     #[test]
     fn fiber_dispose_is_idempotent_and_marks_disposed() {
-        let fiber = Fiber::pending();
+        let fiber = Fiber::active();
         let ran = Arc::new(AtomicUsize::new(0));
         let r = ran.clone();
-        fiber
+        let _guard = fiber
             .effect(move || {
                 Some(Box::new(move || {
                     r.fetch_add(1, Ordering::SeqCst);
@@ -323,11 +358,11 @@ mod tests {
     }
 
     #[test]
-    fn refuse_effect_while_unloading() {
-        let fiber = Fiber::pending();
+    fn refuse_effect_while_unloading_or_disposed() {
+        let fiber = Fiber::active();
         let ran = Arc::new(AtomicUsize::new(0));
         let r = ran.clone();
-        fiber
+        let _guard = fiber
             .effect(move || {
                 Some(Box::new(move || {
                     r.fetch_add(1, Ordering::SeqCst);
@@ -335,39 +370,39 @@ mod tests {
             })
             .unwrap();
         fiber.dispose();
-        // Unloading/Disposed now; a late effect must be refused.
-        let error = match fiber.effect(|| None) {
-            Ok(_) => panic!("disposed fiber accepted a late effect"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code, "INACTIVE_FIBER");
+        let late = fiber.effect(|| None);
+        assert_eq!(late.unwrap_err().code, "INACTIVE_FIBER");
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn effect_with_no_cleanup_is_legal() {
         let fiber = Fiber::pending();
-        let guard = fiber.effect(|| None).unwrap();
-        drop(guard);
-        assert_eq!(fiber.state(), FiberState::Pending);
+        let _guard = fiber.effect(|| None).unwrap();
+        assert_eq!(fiber.effect_count(), 0);
+        fiber.dispose();
+        assert_eq!(fiber.state(), FiberState::Disposed);
     }
 
     #[test]
-    fn reentrant_dispose_during_setup_cannot_leak_the_cleanup() {
-        let fiber = Fiber::pending();
-        let disposer = fiber.clone();
+    fn panicking_disposer_does_not_break_teardown() {
+        let fiber = Fiber::active();
         let ran = Arc::new(AtomicUsize::new(0));
-        let marker = ran.clone();
-        let guard = fiber
+        let r = ran.clone();
+        let _g1 = fiber
             .effect(move || {
-                disposer.dispose();
                 Some(Box::new(move || {
-                    marker.fetch_add(1, Ordering::SeqCst);
+                    r.fetch_add(1, Ordering::SeqCst);
                 }) as DisposeFn)
             })
             .unwrap();
+        let _g2 = fiber
+            .effect(|| {
+                Some(Box::new(|| panic!("cleanup exploded")) as DisposeFn)
+            })
+            .unwrap();
+        fiber.dispose(); // must not panic; both slots processed
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
         assert_eq!(fiber.state(), FiberState::Disposed);
-        assert_eq!(ran.load(Ordering::SeqCst), 1);
-        drop(guard);
-        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 }

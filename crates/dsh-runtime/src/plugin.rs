@@ -1,285 +1,235 @@
-//! Plugin lifecycle and dependency-ordered activation.
+//! Plugin definition and inject-driven activation.
+//!
+//! Mirroring the reference registry semantics (research 02): a plugin
+//! declares the services it requires via [`Plugin::inject`]; the loader
+//! activates it only once every required service exists, so load order is
+//! expressed as service requirements and never a hand-maintained boot
+//! sequence.
+//!
+//! One fiber per mounted plugin (decision 03-Q8): unloading a plugin unwinds
+//! exactly its own tools, listeners, schemas, and prompt sections.
 
-use std::collections::HashSet;
+use std::any::TypeId;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::context::Context;
-use crate::error::{Result, RuntimeError};
+use crate::error::Result;
 use crate::fiber::{Fiber, FiberState};
-use crate::service::ServiceId;
 
-/// Stable operational identity for a plugin instance.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PluginId(String);
+/// A plugin: an installable unit contributing services, listeners, and
+/// registrations to a context.
+pub trait Plugin: Send + Sync + 'static {
+    /// Display name used for fiber diagnostics and logger names.
+    fn name(&self) -> &str;
 
-impl PluginId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    /// The services this plugin requires, as stable type keys.
+    ///
+    /// The loader stalls activation until every required service is present
+    /// on the context (inject-driven load order, decision 03-Q4).
+    fn inject(&self) -> &'static [TypeId] {
+        &[]
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+    /// Apply the plugin: install services, listeners, and effects on `ctx`.
+    ///
+    /// Every registration made inside `apply` attaches to the plugin's fiber
+    /// and unwinds when the plugin is unloaded. Config travels as a JSON
+    /// value at this layer; typed validation belongs to the caller.
+    fn apply(&self, ctx: &Context) -> Result<()>;
 }
 
-/// A mountable unit of behavior.
-pub trait Plugin: Send {
-    fn id(&self) -> PluginId;
-
-    /// Services that must exist before [`apply`](Plugin::apply) runs.
-    fn inject(&self) -> Vec<ServiceId> {
-        Vec::new()
-    }
-
-    /// Install this plugin's registrations into its fiber-owned context.
-    fn apply(&mut self, context: &Context) -> Result<()>;
+/// The plugin registry: activates plugins when their injected services
+/// become available and owns their fibers.
+#[derive(Default)]
+pub struct Registry {
+    plugins: Mutex<Vec<Mounted>>,
 }
 
-/// An active plugin and the fiber owning its reversible effects.
-pub struct MountedPlugin {
-    id: PluginId,
-    inject: Vec<ServiceId>,
-    provides: Vec<ServiceId>,
-    fiber: Fiber,
-    _plugin: Box<dyn Plugin>,
+struct Mounted {
+    #[allow(dead_code)] // retained for identity-based unmount bookkeeping
+    plugin: Arc<dyn Plugin>,
+    fiber: Arc<Fiber>,
 }
 
-impl MountedPlugin {
-    pub fn id(&self) -> &PluginId {
-        &self.id
+impl Registry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn state(&self) -> FiberState {
-        self.fiber.state()
-    }
-
-    pub fn dispose(&self) {
-        self.fiber.dispose();
-    }
-}
-
-impl Drop for MountedPlugin {
-    fn drop(&mut self) {
-        self.fiber.dispose();
-    }
-}
-
-/// Activates plugins as soon as every declared service dependency exists.
-pub struct PluginLoader {
-    context: Context,
-    pending: Vec<Box<dyn Plugin>>,
-    mounted: Vec<MountedPlugin>,
-}
-
-impl PluginLoader {
-    pub fn new(context: Context) -> Self {
-        Self {
-            context,
-            pending: Vec::new(),
-            mounted: Vec::new(),
+    /// Try to mount `plugin` on `ctx`.
+    ///
+    /// Fails with code `MISSING_SERVICE` when any injected service is absent
+    /// — the caller retries once the dependency mounts (service-requirement
+    /// activation, decision 03-Q4). On success the plugin body has run inside
+    /// a fresh fiber; return the fiber so the caller can unload it, or null
+    /// the plug by dropping the registry handle.
+    pub fn mount(&self, ctx: &Context, plugin: Arc<dyn Plugin>) -> Result<Arc<Fiber>> {
+        for key in plugin.inject() {
+            if !ctx.contains_id(*key) {
+                return Err(crate::error::RuntimeError::new(
+                    "MISSING_SERVICE",
+                    "plugin activation gated on missing service",
+                ));
+            }
         }
-    }
 
-    pub fn context(&self) -> &Context {
-        &self.context
-    }
+        let fiber = Fiber::pending();
+        // The plugin context extends the parent (shares services); the fiber
+        // scope is owned by this mount.
+        let plugin_ctx = ctx.extend();
+        plugin_ctx.set_fiber(fiber.clone());
 
-    pub fn pending_len(&self) -> usize {
-        self.pending.len()
-    }
-
-    pub fn mounted(&self) -> &[MountedPlugin] {
-        &self.mounted
-    }
-
-    /// Queue a plugin and activate every plugin whose injections are satisfied.
-    pub fn mount(&mut self, plugin: Box<dyn Plugin>) -> Result<()> {
-        let id = plugin.id();
-        if self.pending.iter().any(|pending| pending.id() == id)
-            || self.mounted.iter().any(|mounted| mounted.id == id)
-        {
-            return Err(RuntimeError::duplicate_plugin());
-        }
-        self.pending.push(plugin);
-        self.activate_ready()
-    }
-
-    fn activate_ready(&mut self) -> Result<()> {
-        loop {
-            let Some(index) = self.pending.iter().position(|plugin| {
-                plugin
-                    .inject()
-                    .into_iter()
-                    .all(|id| self.context.contains_id(id))
-            }) else {
-                return Ok(());
-            };
-
-            let mut plugin = self.pending.remove(index);
-            let id = plugin.id();
-            let inject = plugin.inject();
-            let services_before = self.context.local_service_ids();
-            let fiber = Fiber::pending();
-            fiber.set_state(FiberState::Loading);
-            let plugin_context = self.context.owned_by(fiber.clone());
-            if let Err(error) = plugin.apply(&plugin_context) {
+        fiber.set_state(FiberState::Loading);
+        let applied = plugin.apply(&plugin_ctx);
+        match applied {
+            Ok(()) => {
+                fiber.set_state(FiberState::Active);
+            }
+            Err(err) => {
+                // Roll back partial registrations, then surface the failure.
                 fiber.set_state(FiberState::Failed);
                 fiber.dispose();
-                return Err(error);
+                return Err(err);
             }
-            fiber.set_state(FiberState::Active);
-            let provides = self
-                .context
-                .local_service_ids()
-                .difference(&services_before)
-                .copied()
-                .collect();
-            self.mounted.push(MountedPlugin {
-                id,
-                inject,
-                provides,
-                fiber,
-                _plugin: plugin,
-            });
         }
+
+        self.plugins.lock().push(Mounted {
+            plugin,
+            fiber: fiber.clone(),
+        });
+        Ok(fiber)
     }
 
-    /// Unload a plugin and all consumers of services that disappear with it.
-    pub fn unload(&mut self, id: &PluginId) -> bool {
-        let Some(target) = self.mounted.iter().position(|plugin| &plugin.id == id) else {
-            return false;
-        };
-
-        let mut remove = HashSet::from([self.mounted[target].id.clone()]);
-        let mut disappearing: HashSet<ServiceId> =
-            self.mounted[target].provides.iter().copied().collect();
-        loop {
-            let mut changed = false;
-            for plugin in &self.mounted {
-                if !remove.contains(&plugin.id)
-                    && plugin
-                        .inject
-                        .iter()
-                        .any(|service| disappearing.contains(service))
-                {
-                    remove.insert(plugin.id.clone());
-                    disappearing.extend(plugin.provides.iter().copied());
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
+    /// Unmount a plugin previously mounted here, unwinding exactly its fiber.
+    pub fn unmount(&self, fiber: &Arc<Fiber>) {
+        let mut plugins = self.plugins.lock();
+        if let Some(pos) = plugins
+            .iter()
+            .position(|m| Arc::ptr_eq(&m.fiber, fiber))
+        {
+            plugins.remove(pos);
         }
-
-        // Reverse activation order keeps dependencies alive while consumers unwind.
-        for index in (0..self.mounted.len()).rev() {
-            if remove.contains(&self.mounted[index].id) {
-                let plugin = self.mounted.remove(index);
-                plugin.dispose();
-            }
-        }
-        true
+        fiber.dispose();
     }
-}
 
-impl Drop for PluginLoader {
-    fn drop(&mut self) {
-        while let Some(plugin) = self.mounted.pop() {
-            plugin.dispose();
-        }
+    /// Number of mounted plugins.
+    pub fn len(&self) -> usize {
+        self.plugins.lock().len()
+    }
+
+    /// Whether no plugin is mounted.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Names of mounted plugins, in mount order.
+    pub fn names(&self) -> Vec<String> {
+        self.plugins
+            .lock()
+            .iter()
+            .map(|m| m.plugin.name().to_owned())
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use crate::error::RuntimeError;
 
-    use crate::{service_id, Disposer};
+    struct ProbeService;
 
-    struct Provider(Option<Disposer>);
-
-    impl Plugin for Provider {
-        fn id(&self) -> PluginId {
-            PluginId::new("provider")
+    struct ProvidesProbe;
+    impl Plugin for ProvidesProbe {
+        fn name(&self) -> &str {
+            "provides-probe"
         }
-
-        fn apply(&mut self, context: &Context) -> Result<()> {
-            self.0 = Some(context.provide(42_u32)?);
+        fn apply(&self, ctx: &Context) -> Result<()> {
+            ctx.provide(ProbeService)?;
             Ok(())
         }
     }
 
-    struct Consumer {
-        applied: Arc<AtomicBool>,
-        disposed: Arc<AtomicBool>,
-        effect: Option<Disposer>,
-    }
+    static PROBE_SERVICE_INJECT: [TypeId; 1] = [TypeId::of::<ProbeService>()];
 
-    impl Plugin for Consumer {
-        fn id(&self) -> PluginId {
-            PluginId::new("consumer")
+    struct NeedsProbe;
+    impl Plugin for NeedsProbe {
+        fn name(&self) -> &str {
+            "needs-probe"
         }
-
-        fn inject(&self) -> Vec<ServiceId> {
-            vec![service_id::<u32>()]
+        fn inject(&self) -> &'static [TypeId] {
+            &PROBE_SERVICE_INJECT
         }
-
-        fn apply(&mut self, context: &Context) -> Result<()> {
-            assert_eq!(context.get::<u32>().as_deref(), Some(&42));
-            self.applied.store(true, Ordering::SeqCst);
-            let disposed = self.disposed.clone();
-            self.effect = Some(context.effect(move || {
-                Some(Box::new(move || {
-                    disposed.store(true, Ordering::SeqCst);
-                }))
-            })?);
+        fn apply(&self, _ctx: &Context) -> Result<()> {
             Ok(())
         }
     }
 
-    fn consumer(applied: Arc<AtomicBool>, disposed: Arc<AtomicBool>) -> Consumer {
-        Consumer {
-            applied,
-            disposed,
-            effect: None,
+
+    #[test]
+    fn mount_gates_on_missing_service() {
+        let registry = Registry::new();
+        let ctx = Context::root();
+        let err = registry.mount(&ctx, Arc::new(NeedsProbe)).unwrap_err();
+        assert_eq!(err.code, "MISSING_SERVICE");
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn mount_runs_apply_and_tracks_fiber() {
+        let registry = Registry::new();
+        let ctx = Context::root();
+        let fiber = registry.mount(&ctx, Arc::new(ProvidesProbe)).unwrap();
+        assert!(ctx.has::<ProbeService>());
+        assert_eq!(fiber.state(), FiberState::Active);
+        assert_eq!(registry.names(), vec!["provides-probe"]);
+    }
+
+    #[test]
+    fn inject_gate_satisfied_by_earlier_plugin() {
+        let registry = Registry::new();
+        let ctx = Context::root();
+        registry.mount(&ctx, Arc::new(ProvidesProbe)).unwrap();
+        let fiber = registry.mount(&ctx, Arc::new(NeedsProbe)).unwrap();
+        assert_eq!(fiber.state(), FiberState::Active);
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn failed_apply_rolls_back_registrations() {
+        struct ExplodeThenProvide;
+        impl Plugin for ExplodeThenProvide {
+            fn name(&self) -> &str {
+                "explode"
+            }
+            fn apply(&self, ctx: &Context) -> Result<()> {
+                ctx.provide(ProbeService)?;
+                Err(RuntimeError::new("BOOM", "apply exploded"))
+            }
         }
+        let registry = Registry::new();
+        let ctx = Context::root();
+        let err = registry
+            .mount(&ctx, Arc::new(ExplodeThenProvide))
+            .unwrap_err();
+        assert_eq!(err.code, "BOOM");
+        // The partial registration was unwound with the failed fiber.
+        assert!(!ctx.has::<ProbeService>());
+        assert!(registry.is_empty());
     }
 
     #[test]
-    fn consumer_waits_until_its_injected_service_exists() {
-        let applied = Arc::new(AtomicBool::new(false));
-        let mut loader = PluginLoader::new(Context::new());
-        loader
-            .mount(Box::new(consumer(
-                applied.clone(),
-                Arc::new(AtomicBool::new(false)),
-            )))
-            .unwrap();
-        assert_eq!(loader.pending_len(), 1);
-
-        loader.mount(Box::new(Provider(None))).unwrap();
-        assert!(applied.load(Ordering::SeqCst));
-        assert_eq!(loader.mounted()[0].id().as_str(), "provider");
-        assert_eq!(loader.mounted()[1].id().as_str(), "consumer");
-    }
-
-    #[test]
-    fn unloading_a_provider_unloads_consumers_first() {
-        let disposed = Arc::new(AtomicBool::new(false));
-        let mut loader = PluginLoader::new(Context::new());
-        loader.mount(Box::new(Provider(None))).unwrap();
-        loader
-            .mount(Box::new(consumer(
-                Arc::new(AtomicBool::new(false)),
-                disposed.clone(),
-            )))
-            .unwrap();
-
-        assert!(loader.unload(&PluginId::new("provider")));
-        assert!(disposed.load(Ordering::SeqCst));
-        assert!(loader.context().get::<u32>().is_none());
-        assert!(loader.mounted().is_empty());
+    fn unmount_disposes_fiber_and_removes_services() {
+        let registry = Registry::new();
+        let ctx = Context::root();
+        let fiber = registry.mount(&ctx, Arc::new(ProvidesProbe)).unwrap();
+        assert!(ctx.has::<ProbeService>());
+        registry.unmount(&fiber);
+        assert!(!ctx.has::<ProbeService>());
+        assert_eq!(fiber.state(), FiberState::Disposed);
+        assert!(registry.is_empty());
     }
 }
