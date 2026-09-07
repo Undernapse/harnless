@@ -52,6 +52,47 @@ pub enum Role {
     Tool,
 }
 
+/// The model-facing slice of a tool definition: the allowlisted projection
+/// an adapter is permitted to send to a provider.
+///
+/// Internal tool metadata — output contract, execution body, concurrency
+/// classification, presentation hooks — never reaches this type; a tool's
+/// public schema is name, description, and parameters and nothing else.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolSchema {
+    /// The tool's name, namespaced under its provider.
+    pub name: String,
+    /// A natural-language description of what the tool does.
+    pub description: String,
+    /// The JSON Schema for the tool's arguments object.
+    pub parameters: Value,
+    /// Whether the provider should constrain calls to the declared properties
+    /// (e.g. OpenAI `strict` mode). Defaults to `false`.
+    pub strict: bool,
+}
+
+impl ToolSchema {
+    /// Build a tool schema from the required fields; `strict` defaults off.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+            strict: false,
+        }
+    }
+
+    /// Mark whether the provider should enforce the declared property set.
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
+    }
+}
+
 /// One message in the conversation.
 ///
 /// Messages are identified and immutable. An assistant message names the
@@ -166,6 +207,106 @@ pub struct ReplayState {
     pub blocks: Vec<Value>,
 }
 
+/// A shared assembler that folds a stream of [`StreamFrame`]s into assembled
+/// content blocks, with one keep-or-drop decision covering content and
+/// metadata together: a truncated finish drops tool calls, because a partial
+/// call is unsafe to execute.
+///
+/// The assembler tracks blocks by their correlating index. A block that ends
+/// with a [`StreamFrame::BlockEnd`] is complete; one still open when
+/// [`StreamFrame::Finish`] arrives marks the stream truncated. Callers align
+/// provider replay state in lockstep via [`BlockAssembler::align_replay`] so
+/// stored metadata always describes stored content.
+#[derive(Debug, Default)]
+pub struct BlockAssembler {
+    /// Completely assembled blocks in index order.
+    completed: Vec<(usize, ContentBlock)>,
+    /// Blocks started but not yet ended, keyed by index.
+    open: Vec<usize>,
+    /// Accumulated usage, if the provider reported it.
+    usage: Option<Usage>,
+    /// Whether an open block remained when `Finish` arrived.
+    truncated: bool,
+}
+
+impl BlockAssembler {
+    /// Create an empty assembler.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one stream frame into the assembler state.
+    pub fn push(&mut self, frame: &StreamFrame) {
+        match frame {
+            StreamFrame::BlockStart { index, .. } => self.open.push(*index),
+            StreamFrame::BlockEnd { index, assembled } => {
+                // A block that had already ended is not reopened.
+                if let Some(pos) = self.open.iter().position(|i| i == index) {
+                    self.open.remove(pos);
+                }
+                self.completed.push((*index, assembled.clone()));
+            }
+            StreamFrame::Usage(usage) => self.usage = Some(*usage),
+            StreamFrame::Finish => self.truncated = !self.open.is_empty(),
+            // Deltas are presentation data; the assembled block on `BlockEnd`
+            // is authoritative for the final message.
+            StreamFrame::TextDelta { .. }
+            | StreamFrame::ReasoningDelta { .. }
+            | StreamFrame::ToolCallDelta { .. } => {}
+        }
+    }
+
+    /// The completed content blocks, in index order, with keep-or-drop
+    /// applied: on a truncated finish, tool-call blocks are dropped.
+    pub fn blocks(&self) -> Vec<ContentBlock> {
+        // Sort by index to keep interleaved blocks deterministic.
+        let mut completed = self.completed.clone();
+        completed.sort_by_key(|(index, _)| *index);
+        completed
+            .into_iter()
+            .map(|(_, block)| block)
+            .filter(|block| {
+                !(self.truncated && block.kind == BlockKind::ToolCall)
+            })
+            .collect()
+    }
+
+    /// Whether the stream was truncated (a block was open at `Finish`).
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// The accumulated usage, if reported.
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage
+    }
+
+    /// emitted blocks in index order. Dropped blocks (from a truncated
+    /// finish) have their entries pruned so stored metadata always describes
+    /// stored content.
+    pub fn align_replay(&self, replay: ReplayState) -> ReplayState {
+        // All emitted blocks in index order; the drop filter decides which
+        // survive. `replay.blocks[i]` aligns to emitted block `i`.
+        let mut emitted = self.completed.clone();
+        emitted.sort_by_key(|(index, _)| *index);
+
+        let mut blocks = Vec::with_capacity(emitted.len());
+        for (i, (_, block)) in emitted.iter().enumerate() {
+            let kept = !(self.truncated && block.kind == BlockKind::ToolCall);
+            if kept {
+                if let Some(entry) = replay.blocks.get(i) {
+                    blocks.push(entry.clone());
+                }
+            }
+        }
+
+        ReplayState {
+            response: replay.response,
+            blocks,
+        }
+    }
+}
+
 /// A boxed, `Send` stream of events.
 pub type BoxStream = Pin<Box<dyn Stream<Item = StreamEvent> + Send>>;
 
@@ -184,13 +325,16 @@ pub trait ModelAdapter: Send + Sync + 'static {
 
     /// Stream a completion for `messages`. `call_id` correlates the call.
     ///
-    /// Throwing from this entry is the first sanctioned failure path; the
-    /// caller normalizes it. In-band terminal errors arrive as a
-    /// [`StreamEvent::Failed`]. An empty completion is a retryable failure.
+    /// `tools` lists the request-time schema set the model may call; the
+    /// adapter declares it to the provider on the wire. Throwing from this
+    /// entry is the first sanctioned failure path; the caller normalizes it.
+    /// In-band terminal errors arrive as a [`StreamEvent::Failed`]. An empty
+    /// completion is a retryable failure.
     fn stream(
         &self,
         call_id: CallId,
         messages: &[Message],
+        tools: &[ToolSchema],
         replay: Option<ReplayState>,
     ) -> Result<BoxStream>;
 }
@@ -218,6 +362,97 @@ mod tests {
     fn context_overflow_is_one_canonical_code() {
         let f = ProviderFailure::context_overflow();
         assert_eq!(f.code, ErrorCode::ContextOverflow);
+    }
+
+    fn text_block(index: usize, text: &str) -> StreamFrame {
+        StreamFrame::BlockEnd {
+            index,
+            assembled: ContentBlock {
+                kind: BlockKind::Text,
+                text: text.into(),
+            },
+        }
+    }
+
+    fn tool_block(index: usize, call_id: u64) -> StreamFrame {
+        StreamFrame::BlockEnd {
+            index,
+            assembled: ContentBlock {
+                kind: BlockKind::ToolCall,
+                text: format!(r#"{{"id":"{}"}}"#, call_id),
+            },
+        }
+    }
+
+    #[test]
+    fn assembler_keeps_completed_blocks_in_index_order() {
+        let mut a = BlockAssembler::new();
+        // Interleaved indexes: text block 0, tool block 1, text block 2.
+        a.push(&StreamFrame::BlockStart { index: 0, kind: BlockKind::Text });
+        a.push(&StreamFrame::BlockStart { index: 1, kind: BlockKind::ToolCall });
+        a.push(&StreamFrame::BlockStart { index: 2, kind: BlockKind::Text });
+        a.push(&text_block(2, "world"));
+        a.push(&tool_block(1, 7));
+        a.push(&text_block(0, "hello"));
+        a.push(&StreamFrame::Finish);
+
+        let blocks = a.blocks();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].text, "hello");
+        assert_eq!(blocks[1].kind, BlockKind::ToolCall);
+        assert_eq!(blocks[2].text, "world");
+        assert!(!a.truncated());
+    }
+
+    #[test]
+    fn truncated_finish_drops_tool_call_blocks() {
+        let mut a = BlockAssembler::new();
+        a.push(&StreamFrame::BlockStart { index: 0, kind: BlockKind::Text });
+        // Tool block completes but a later block is still open at Finish.
+        a.push(&StreamFrame::BlockStart { index: 1, kind: BlockKind::ToolCall });
+        a.push(&StreamFrame::BlockEnd {
+            index: 1,
+            assembled: ContentBlock {
+                kind: BlockKind::ToolCall,
+                text: r#"{"id":"7"}"#.into(),
+            },
+        });
+        a.push(&text_block(0, "hello"));
+        // Block 2 opened but never ended -> truncation.
+        a.push(&StreamFrame::BlockStart { index: 2, kind: BlockKind::Text });
+        a.push(&StreamFrame::Finish);
+
+        assert!(a.truncated());
+        let blocks = a.blocks();
+        // Tool-call block dropped; the open text block never completed.
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "hello");
+    }
+
+    #[test]
+    fn align_replay_prunes_in_lockstep_with_dropped_blocks() {
+        let mut a = BlockAssembler::new();
+        a.push(&StreamFrame::BlockStart { index: 0, kind: BlockKind::Text });
+        a.push(&StreamFrame::BlockStart { index: 1, kind: BlockKind::ToolCall });
+        a.push(&tool_block(1, 7));
+        a.push(&text_block(0, "hello"));
+        a.push(&StreamFrame::BlockStart { index: 2, kind: BlockKind::Text });
+        a.push(&StreamFrame::Finish);
+
+        let replay = ReplayState {
+            response: Some(serde_json::json!({"id": "r1"})),
+            blocks: vec![
+                serde_json::json!({"index": 0}),
+                serde_json::json!({"index": 1}),
+                // Emitted block 2 was opened but never completed and is not
+                // in `completed`; the provider supplied no entry for it.
+            ],
+        };
+        let aligned = a.align_replay(replay);
+        // response metadata survives; only the kept text block's entry remains.
+        assert_eq!(aligned.response, Some(serde_json::json!({"id": "r1"})));
+        assert_eq!(aligned.blocks.len(), 1);
+        assert_eq!(aligned.blocks[0], serde_json::json!({"index": 0}));
     }
 }
 
