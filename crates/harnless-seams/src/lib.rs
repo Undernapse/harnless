@@ -41,8 +41,9 @@ pub use fs::{
 };
 pub use ids::{CallId, MessageId, SessionId, TargetKey, VersionToken};
 pub use llm::{
-    BlockKind, BoxStream, ContentBlock, Message, ModelAdapter, ProviderFailure, ReplayState,
-    Role, StreamEvent, StreamFrame, Usage,
+    BlockAssembler, BlockKind, BoxStream, ContentBlock, Message, ModelAdapter,
+    ProviderFailure, ReplayState, Role, StreamEvent, StreamFrame, ToolSchema,
+    Usage,
 };
 pub use settings::{Namespace, RedactedDescriptor, Settings};
 pub use storage::{BackendName, OpaqueUnit, Storage, StorageDomain};
