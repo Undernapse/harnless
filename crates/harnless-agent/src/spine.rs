@@ -52,9 +52,8 @@ impl Plugin for Spine {
         let events = EventRegistry::new();
         ctx.provide(events.clone())?;
 
-        let fiber: std::sync::Arc<Fiber> = ctx
-            .fiber()
-            .expect("spine must be mounted within a fiber");
+        let fiber: std::sync::Arc<Fiber> =
+            ctx.fiber().expect("spine must be mounted within a fiber");
         let registry = ToolRegistry::new(events.clone(), fiber.clone());
         ctx.provide(registry)?;
 
@@ -98,7 +97,9 @@ mod tests {
     fn spine_loop_drives_a_turn_into_the_shared_log() {
         let registry = Registry::new();
         let ctx = Context::root();
-        let _f = registry.mount(&ctx, Arc::new(Spine::new(SessionId(2)))).unwrap();
+        let _f = registry
+            .mount(&ctx, Arc::new(Spine::new(SessionId(2))))
+            .unwrap();
         let log = ctx.get::<SessionLog>().unwrap();
         let loop_ = ctx.get::<AgentLoop>().unwrap();
         let text = "hi".to_string();

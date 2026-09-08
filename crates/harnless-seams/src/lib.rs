@@ -36,17 +36,15 @@ pub mod tools;
 pub use credentials::{CredentialKind, CredentialRef, Credentials};
 pub use error::{ErrorCode, Result, SeamError};
 pub use exec::{Enforced, PolicyHome, Sandbox, Shell, Spawn, SpawnHandle, Subprocess};
-pub use fs::{
-    Edit, Entry, FileSystem, MutationResult, ReadWindow, Target, WriteGuard,
-};
+pub use fs::{Edit, Entry, FileSystem, MutationResult, ReadWindow, Target, WriteGuard};
 pub use ids::{CallId, MessageId, SessionId, TargetKey, VersionToken};
 pub use llm::{
-    BlockKind, BoxStream, ContentBlock, Message, ModelAdapter, ProviderFailure, ReplayState,
-    Role, StreamEvent, StreamFrame, Usage,
+    BlockAssembler, BlockKind, BoxStream, ContentBlock, Message, ModelAdapter, ProviderFailure,
+    ReplayState, Role, StreamEvent, StreamFrame, ToolSchema, Usage,
 };
 pub use settings::{Namespace, RedactedDescriptor, Settings};
 pub use storage::{BackendName, OpaqueUnit, Storage, StorageDomain};
 pub use tools::{
-    FrozenResult, GuardVerdict, PipelineStage, PostDecision, PreDecision, ToolBody,
-    ToolDefinition, Tools,
+    FrozenResult, GuardVerdict, PipelineStage, PostDecision, PreDecision, ToolBody, ToolDefinition,
+    Tools,
 };

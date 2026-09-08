@@ -170,10 +170,15 @@ mod tests {
         let err = h.replace(0, 1, &[MessageId(1)], vec![]);
         assert!(err.is_err());
         // Correct citations -> succeeds and retires both.
-        let ok = h.replace(0, 1, &[MessageId(1), MessageId(2)], vec![SurfaceNode {
-            message_id: MessageId(9),
-            blocks: vec![],
-        }]);
+        let ok = h.replace(
+            0,
+            1,
+            &[MessageId(1), MessageId(2)],
+            vec![SurfaceNode {
+                message_id: MessageId(9),
+                blocks: vec![],
+            }],
+        );
         assert!(ok.is_ok());
         assert_eq!(h.len(), 1);
         assert_eq!(h.nodes()[0].message_id, MessageId(9));

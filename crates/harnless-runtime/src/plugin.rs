@@ -106,10 +106,7 @@ impl Registry {
     /// Unmount a plugin previously mounted here, unwinding exactly its fiber.
     pub fn unmount(&self, fiber: &Arc<Fiber>) {
         let mut plugins = self.plugins.lock();
-        if let Some(pos) = plugins
-            .iter()
-            .position(|m| Arc::ptr_eq(&m.fiber, fiber))
-        {
+        if let Some(pos) = plugins.iter().position(|m| Arc::ptr_eq(&m.fiber, fiber)) {
             plugins.remove(pos);
         }
         fiber.dispose();
@@ -167,7 +164,6 @@ mod tests {
             Ok(())
         }
     }
-
 
     #[test]
     fn mount_gates_on_missing_service() {

@@ -1,0 +1,20 @@
+[package]
+name = "harnless-llm-openai"
+description = "OpenAI-compatible model adapter for harnless: streaming SSE against any endpoint speaking that interface (DeepSeek, vLLM)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harnless-seams = { path = "../harnless-seams" }
+async-stream = "0.3"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
+tokio = { version = "1", features = ["time", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"

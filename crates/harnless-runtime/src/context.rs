@@ -15,7 +15,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::error::Result;
-use crate::fiber::{Disposer, DisposeFn, Fiber};
+use crate::fiber::{DisposeFn, Disposer, Fiber};
 use crate::service::{Key, ServiceMap};
 
 /// A service key scoped by an isolate label: `(type, label)`. Two contexts
@@ -201,13 +201,9 @@ mod tests {
     fn provide_and_get_roundtrip() {
         let ctx = Context::root();
         let fiber = Fiber::active();
-        let _keep1 = ctx.provide_for(
-            &fiber,
-            Greeter {
-                greeting: "hello",
-            },
-        )
-        .unwrap();
+        let _keep1 = ctx
+            .provide_for(&fiber, Greeter { greeting: "hello" })
+            .unwrap();
         let svc = ctx.get::<Greeter>().unwrap();
         assert_eq!(svc.greeting, "hello");
     }
@@ -215,9 +211,8 @@ mod tests {
     #[test]
     fn provide_requires_owning_fiber() {
         let ctx = Context::root();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ctx.provide(ProbeService)
-        }));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.provide(ProbeService)));
         assert!(result.is_err(), "provide without fiber must panic");
     }
 
@@ -278,12 +273,13 @@ mod tests {
         let _ = Ordering::SeqCst;
     }
 
-
     #[test]
     fn isolate_resolves_scoped_key_within_context() {
         let root = Context::root();
         let fiber = Fiber::active();
-        let _k = root.provide_for(&fiber, Greeter { greeting: "root" }).unwrap();
+        let _k = root
+            .provide_for(&fiber, Greeter { greeting: "root" })
+            .unwrap();
         let isolated = root.isolate::<Greeter>("dev");
         let _k2 = isolated
             .provide_isolated(&fiber, "dev", Greeter { greeting: "dev" })
@@ -292,7 +288,10 @@ mod tests {
         assert_eq!(root.get::<Greeter>().unwrap().greeting, "root");
         // Isolated context resolves the scoped override.
         assert_eq!(isolated.get::<Greeter>().unwrap().greeting, "dev");
-        assert_eq!(isolated.isolation_label::<Greeter>().as_deref(), Some("dev"));
+        assert_eq!(
+            isolated.isolation_label::<Greeter>().as_deref(),
+            Some("dev")
+        );
     }
 
     #[test]
