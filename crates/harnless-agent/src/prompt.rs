@@ -44,11 +44,7 @@ fn render_nodes(history: &History) -> Vec<String> {
         .nodes()
         .iter()
         .map(|node| {
-            let text: Vec<String> = node
-                .blocks
-                .iter()
-                .map(render_block)
-                .collect();
+            let text: Vec<String> = node.blocks.iter().map(render_block).collect();
             text.join("\n")
         })
         .collect()
@@ -108,12 +104,14 @@ mod tests {
 
     #[test]
     fn in_prompt_is_message_producing_only() {
-        assert!(in_prompt(&SessionEvent::UserMessage(crate::events::MessageRecord {
-            id: MessageId(1),
-            blocks: vec![],
-            provider: None,
-            model: None,
-        })));
+        assert!(in_prompt(&SessionEvent::UserMessage(
+            crate::events::MessageRecord {
+                id: MessageId(1),
+                blocks: vec![],
+                provider: None,
+                model: None,
+            }
+        )));
         assert!(!in_prompt(&SessionEvent::TurnOpen));
         assert!(!in_prompt(&SessionEvent::StepOpen));
     }

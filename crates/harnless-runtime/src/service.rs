@@ -78,11 +78,7 @@ impl ServiceMap {
     }
 
     /// Install a service under an explicit (possibly label-scoped) key.
-    pub fn provide_key<T: Any + Send + Sync>(
-        &self,
-        key: Key,
-        service: T,
-    ) -> Option<BoxedService> {
+    pub fn provide_key<T: Any + Send + Sync>(&self, key: Key, service: T) -> Option<BoxedService> {
         self.names.write().insert(key.clone(), type_name::<T>());
         self.inner.write().insert(key, Arc::new(service))
     }

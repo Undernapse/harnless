@@ -20,10 +20,7 @@ use harnless_runtime::events::{EventOptions, EventRegistry, Next};
 use harnless_runtime::fiber::Fiber;
 use harnless_runtime::{Disposer, Result as RtResult};
 
-use crate::events::{
-    MessageRecord, SessionEvent, ToolCallRecord, ToolResultRecord,
-    TurnEndReason,
-};
+use crate::events::{MessageRecord, SessionEvent, ToolCallRecord, ToolResultRecord, TurnEndReason};
 use crate::history::History;
 use crate::session::SessionLog;
 
@@ -60,11 +57,7 @@ pub struct AgentLoop {
 impl AgentLoop {
     /// Create a loop bound to `log` and `fiber` (which owns its effects).
     pub fn new(log: Arc<SessionLog>, events: EventRegistry, fiber: Arc<Fiber>) -> Self {
-        Self {
-            log,
-            events,
-            fiber,
-        }
+        Self { log, events, fiber }
     }
 
     /// The session log this loop drives.
@@ -110,7 +103,8 @@ impl AgentLoop {
             DriverOutcome::Message(mut msg) => {
                 // Model-streaming waterfall: listeners may transform `msg`.
                 let committed = self.fire_stream(&mut msg);
-                self.log.append(SessionEvent::AssistantMessage(committed.clone()));
+                self.log
+                    .append(SessionEvent::AssistantMessage(committed.clone()));
                 let _ = history.apply(&SessionEvent::AssistantMessage(committed));
                 TurnEndReason::Completed
             }
@@ -145,8 +139,7 @@ impl AgentLoop {
     /// delegates sees the message and may return a transformed copy, which the
     /// loop then commits.
     fn fire_stream(&self, msg: &mut StreamMessage) -> StreamMessage {
-        self.events
-            .waterfall(msg.clone(), |m: StreamMessage| m)
+        self.events.waterfall(msg.clone(), |m: StreamMessage| m)
     }
 }
 
@@ -185,9 +178,7 @@ mod tests {
         let events = EventRegistry::new();
         let loop_ = AgentLoop::new(log, events, fiber);
         let text = "hello".to_string();
-        let turn = loop_.run_turn(Box::new(move || {
-            DriverOutcome::Message(message(&text))
-        }));
+        let turn = loop_.run_turn(Box::new(move || DriverOutcome::Message(message(&text))));
         let snap = loop_.log().snapshot();
         // TurnOpen, StepOpen, AssistantMessage, StepClose, TurnClose.
         assert_eq!(snap.records.len(), 5);
@@ -211,13 +202,15 @@ mod tests {
         let events = EventRegistry::new();
         let loop_ = AgentLoop::new(log, events, fiber);
         let _guard = loop_
-            .on_stream(|msg: &mut StreamMessage, next: &mut Next<'_, StreamMessage, StreamMessage>| {
-                // Transform the first text block before delegating.
-                if let Some(ContentBlock::Text { text }) = msg.blocks.first_mut() {
-                    text.push_str("!!");
-                }
-                next.call(msg.clone())
-            })
+            .on_stream(
+                |msg: &mut StreamMessage, next: &mut Next<'_, StreamMessage, StreamMessage>| {
+                    // Transform the first text block before delegating.
+                    if let Some(ContentBlock::Text { text }) = msg.blocks.first_mut() {
+                        text.push_str("!!");
+                    }
+                    next.call(msg.clone())
+                },
+            )
             .unwrap();
         let text = "hi".to_string();
         let turn = loop_.run_turn(Box::new(move || DriverOutcome::Message(message(&text))));
@@ -240,9 +233,7 @@ mod tests {
         let log = Arc::new(SessionLog::new(harnless_seams::SessionId(3)));
         let events = EventRegistry::new();
         let loop_ = AgentLoop::new(log, events, fiber);
-        let turn = loop_.run_turn(Box::new(|| {
-            DriverOutcome::Stop(TurnEndReason::MaxTokens)
-        }));
+        let turn = loop_.run_turn(Box::new(|| DriverOutcome::Stop(TurnEndReason::MaxTokens)));
         assert_eq!(turn.reason, TurnEndReason::MaxTokens);
         let snap = loop_.log().snapshot();
         // TurnOpen, StepOpen, StepClose, TurnClose (no assistant message

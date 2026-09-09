@@ -23,8 +23,7 @@ use harnless_runtime::Disposer;
 use serde_json::Value;
 
 use harnless_seams::tools::{
-    FrozenResult, GuardVerdict, PipelineStage, PostDecision, PreDecision, ToolBody,
-    ToolDefinition,
+    FrozenResult, GuardVerdict, PipelineStage, PostDecision, PreDecision, ToolBody, ToolDefinition,
 };
 use harnless_seams::{CallId, ErrorCode, SeamError};
 
@@ -76,10 +75,11 @@ impl ToolRegistry {
             + 'static,
     {
         let mut listener = listener;
-        self.events
-            .on_waterfall(&self.fiber, move |e: &mut PreExecute, n| {
-                listener(e, n)
-            }, EventOptions::new())
+        self.events.on_waterfall(
+            &self.fiber,
+            move |e: &mut PreExecute, n| listener(e, n),
+            EventOptions::new(),
+        )
     }
 
     /// Register a post-execute waterfall listener.
@@ -90,37 +90,39 @@ impl ToolRegistry {
             + 'static,
     {
         let mut listener = listener;
-        self.events
-            .on_waterfall(&self.fiber, move |e: &mut PostExecute, n| {
-                listener(e, n)
-            }, EventOptions::new())
+        self.events.on_waterfall(
+            &self.fiber,
+            move |e: &mut PostExecute, n| listener(e, n),
+            EventOptions::new(),
+        )
     }
 
     /// Run the guarded pipeline for `call` on `name` with raw-JSON `args`.
     ///
     /// Permission is denied when nobody answers the pre-execute waterfall
     /// (failing closed). Returns the frozen result.
-    pub fn execute(&self, call_id: CallId, name: &str, args: &[u8]) -> harnless_seams::Result<FrozenResult> {
+    pub fn execute(
+        &self,
+        call_id: CallId,
+        name: &str,
+        args: &[u8],
+    ) -> harnless_seams::Result<FrozenResult> {
         let (_def, body) = {
             let tools = self.tools.read();
-            tools
-                .get(name)
-                .cloned()
-                .ok_or_else(|| {
-                    SeamError::new(ErrorCode::ToolNotFound, format!("tool {name} not found"))
-                })?
+            tools.get(name).cloned().ok_or_else(|| {
+                SeamError::new(ErrorCode::ToolNotFound, format!("tool {name} not found"))
+            })?
         };
 
         // 1. Pre-execute waterfall (reorderable allow/deny/ask). Fail closed.
-        let decision = self.events.waterfall(
-            (name.to_string(), args.to_vec()),
-            |(_, _)| PreDecision::Deny("no pre-execute handler".into()),
-        );
+        let decision = self
+            .events
+            .waterfall((name.to_string(), args.to_vec()), |(_, _)| {
+                PreDecision::Deny("no pre-execute handler".into())
+            });
         match decision {
             PreDecision::Allow => {}
-            PreDecision::Deny(reason) => {
-                return Err(SeamError::new(ErrorCode::ToolDenied, reason))
-            }
+            PreDecision::Deny(reason) => return Err(SeamError::new(ErrorCode::ToolDenied, reason)),
             PreDecision::Ask => {
                 return Err(SeamError::new(
                     ErrorCode::ToolDenied,
@@ -144,10 +146,9 @@ impl ToolRegistry {
         let result = body.run(call_id, args)?;
 
         // 6. Post-execute waterfall (accept, block, replace, add context).
-        let post = self.events.waterfall(
-            (call_id, result.clone()),
-            |(call, value)| (call, value),
-        );
+        let post = self
+            .events
+            .waterfall((call_id, result.clone()), |(call, value)| (call, value));
         let final_value = post.1;
 
         // 7. Frozen result notification (fire-and-forget).
@@ -172,9 +173,7 @@ impl ToolRegistry {
 
 impl harnless_seams::Tools for ToolRegistry {
     fn register(&self, def: ToolDefinition, body: Arc<dyn ToolBody>) -> harnless_seams::Result<()> {
-        self.tools
-            .write()
-            .insert(def.name.clone(), (def, body));
+        self.tools.write().insert(def.name.clone(), (def, body));
         Ok(())
     }
 
@@ -231,9 +230,8 @@ mod tests {
     fn pre_allow_lets_body_run_and_freeze_result() {
         let (reg, _f) = registry();
         reg.register(echo_def(), Arc::new(EchoBody)).unwrap();
-        let allow = |_: &mut PreExecute, _next: &mut Next<'_, PreExecute, PreDecision>| {
-            PreDecision::Allow
-        };
+        let allow =
+            |_: &mut PreExecute, _next: &mut Next<'_, PreExecute, PreDecision>| PreDecision::Allow;
         let _g = reg.on_pre_execute(move |e, n| allow(e, n)).unwrap();
         let frozen = reg.execute(CallId(2), "echo", b"hi").unwrap();
         assert_eq!(frozen.call_id, CallId(2));
@@ -244,9 +242,8 @@ mod tests {
     fn monotonic_guard_denies_before_body_runs() {
         let (reg, _f) = registry();
         reg.register(echo_def(), Arc::new(EchoBody)).unwrap();
-        let allow = |_: &mut PreExecute, _next: &mut Next<'_, PreExecute, PreDecision>| {
-            PreDecision::Allow
-        };
+        let allow =
+            |_: &mut PreExecute, _next: &mut Next<'_, PreExecute, PreDecision>| PreDecision::Allow;
         let _g = reg.on_pre_execute(allow).unwrap();
         reg.add_guard(
             "deny-all",
@@ -260,14 +257,12 @@ mod tests {
     fn post_execute_can_block_the_result() {
         let (reg, _f) = registry();
         reg.register(echo_def(), Arc::new(EchoBody)).unwrap();
-        let allow = |_: &mut PreExecute, _next: &mut Next<'_, PreExecute, PreDecision>| {
-            PreDecision::Allow
-        };
+        let allow =
+            |_: &mut PreExecute, _next: &mut Next<'_, PreExecute, PreDecision>| PreDecision::Allow;
         let _g = reg.on_pre_execute(allow).unwrap();
-        let block =
-            |_: &mut PostExecute, next: &mut Next<'_, PostExecute, PostDecision>| {
-                next.call((CallId(4), serde_json::json!({ "echo": b"hi" })))
-            };
+        let block = |_: &mut PostExecute, next: &mut Next<'_, PostExecute, PostDecision>| {
+            next.call((CallId(4), serde_json::json!({ "echo": b"hi" })))
+        };
         let _g2 = reg.on_post_execute(move |e, n| block(e, n)).unwrap();
         let frozen = reg.execute(CallId(4), "echo", b"hi").unwrap();
         assert_eq!(frozen.call_id, CallId(4));
