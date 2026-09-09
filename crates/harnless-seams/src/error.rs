@@ -8,7 +8,11 @@
 use std::fmt;
 
 /// Stable machine-readable error code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializable by its stable string spelling, so a recorded failure carries
+/// the same code a live stream failed with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ErrorCode {
     // Filesystem.
     NotFound,

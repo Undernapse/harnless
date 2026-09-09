@@ -31,6 +31,31 @@ pub enum BlockKind {
     ToolResult,
 }
 
+impl BlockKind {
+    /// The stable string spelling a recording names this kind with.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BlockKind::Text => "text",
+            BlockKind::Reasoning => "reasoning",
+            BlockKind::Image => "image",
+            BlockKind::ToolCall => "tool_call",
+            BlockKind::ToolResult => "tool_result",
+        }
+    }
+
+    /// Parse a kind from its [`BlockKind::as_str`] spelling.
+    pub fn parse(kind: &str) -> Option<Self> {
+        match kind {
+            "text" => Some(BlockKind::Text),
+            "reasoning" => Some(BlockKind::Reasoning),
+            "image" => Some(BlockKind::Image),
+            "tool_call" => Some(BlockKind::ToolCall),
+            "tool_result" => Some(BlockKind::ToolResult),
+            _ => None,
+        }
+    }
+}
+
 /// A single content block.
 ///
 /// Tool arguments are **raw JSON strings end to end** — never parsed or
@@ -166,7 +191,10 @@ impl Usage {
 
 /// The single provider-neutral failure shape both sanctioned failure paths
 /// normalize to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable so a recorded failure can live in a golden file: the replay
+/// adapter reproduces it in-band exactly as the live stream ended with it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderFailure {
     /// Canonical code.
     pub code: ErrorCode,
@@ -474,5 +502,40 @@ mod tests {
         assert_eq!(aligned.response, Some(serde_json::json!({"id": "r1"})));
         assert_eq!(aligned.blocks.len(), 1);
         assert_eq!(aligned.blocks[0], serde_json::json!({"index": 0}));
+    }
+
+    #[test]
+    fn error_codes_serialize_as_their_stable_spellings() {
+        // The golden-file format stores failures by their router-facing
+        // spelling; serde must agree with as_str for every code.
+        let codes = [
+            ErrorCode::ProviderFailure,
+            ErrorCode::StreamTerminated,
+            ErrorCode::EmptyCompletion,
+            ErrorCode::ContextOverflow,
+            ErrorCode::NotFound,
+            ErrorCode::ExecCancelled,
+        ];
+        for code in codes {
+            let json = serde_json::to_string(&code).unwrap();
+            assert_eq!(json, format!("\"{}\"", code.as_str()));
+            let back: ErrorCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, code);
+        }
+        assert!(serde_json::from_str::<ErrorCode>("\"bogus\"").is_err());
+    }
+
+    #[test]
+    fn block_kinds_round_trip_through_their_spellings() {
+        for kind in [
+            BlockKind::Text,
+            BlockKind::Reasoning,
+            BlockKind::Image,
+            BlockKind::ToolCall,
+            BlockKind::ToolResult,
+        ] {
+            assert_eq!(BlockKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(BlockKind::parse("smell"), None);
     }
 }
