@@ -4,6 +4,7 @@ members = [
     "crates/harnless-runtime",
     "crates/harnless-seams",
     "crates/harnless-agent",
+    "crates/harnless-fs-local",
     "crates/harnless-llm-openai",
     "crates/harnless-llm-replay",
 ]

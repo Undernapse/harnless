@@ -1,0 +1,15 @@
+[package]
+name = "harnless-fs-local"
+description = "Local filesystem provider for harnless: the fs-local implementation of the FileSystem seam, with opaque targets, backend-owned versions, and atomic write/edit."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harnless-seams = { path = "../harnless-seams" }
+harnless-runtime = { path = "../harnless-runtime" }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
