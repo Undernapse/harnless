@@ -289,5 +289,11 @@ fn corpus_is_a_stable_golden_document() {
     // And the recording's own tool-call inventory survives the round trip.
     assert_eq!(recording.tool_calls.len(), 1);
     assert_eq!(recording.tool_calls[0].name, "echo");
-    let _: &RecordedFrame = recording.frames.last().unwrap();
+    // The seam call id the stream minted is recorded from the delta frames.
+    assert_eq!(recording.tool_calls[0].call_id, 8);
+    assert!(
+        matches!(again.frames.last(), Some(RecordedFrame::Finish)),
+        "the replayed stream must still terminate; got: {:?}",
+        again.frames.last()
+    );
 }

@@ -69,7 +69,7 @@ impl ReplayAdapter {
     }
 }
 
-/// Whether a recording's frames carry any content: a block start or a
+/// Whether a recording's frames carry any content: a block boundary or a
 /// delta. A recording of only usage/finish frames is as silent as a live
 /// provider that completed without emitting.
 fn has_content(frames: &[StreamFrame]) -> bool {
@@ -80,6 +80,7 @@ fn has_content(frames: &[StreamFrame]) -> bool {
                 | StreamFrame::TextDelta { .. }
                 | StreamFrame::ReasoningDelta { .. }
                 | StreamFrame::ToolCallDelta { .. }
+                | StreamFrame::BlockEnd { .. }
         )
     })
 }
@@ -90,14 +91,18 @@ impl ModelAdapter for ReplayAdapter {
     }
 
     fn owns(&self, replay_state: &ReplayState) -> bool {
-        // Ownership is the marker's presence, whatever provider name it
-        // carries: this adapter replays recordings from any provider, and
-        // it is the family that can interpret the metadata.
+        // Exact-name match, mirroring the live adapters: the marker names
+        // the adapter family that produced the state. A replay adapter
+        // registered under an identity claims only state stamped with that
+        // identity — live provider state it cannot interpret is never
+        // claimed, so an owns-gated handoff can never silently drop it.
         replay_state
             .response
             .as_ref()
             .and_then(|r| r.get(REPLAY_OWNER_KEY))
-            .is_some()
+            .and_then(|v| v.as_str())
+            .map(|owner| owner == self.provider())
+            .unwrap_or(false)
     }
 
     fn stream(
@@ -107,11 +112,15 @@ impl ModelAdapter for ReplayAdapter {
         _tools: &[ToolSchema],
         _replay: Option<ReplayState>,
     ) -> Result<BoxStream> {
-        // Decoding happens at the entry: a corpus that fails to restore is
-        // a broken fixture, thrown as the first sanctioned failure path —
-        // never disguised as a provider failure the caller might retry.
+        // Decoding happens at the entry: a corpus that fails to restore or
+        // violates the stream protocol is a broken fixture, thrown as the
+        // first sanctioned failure path — never disguised as a provider
+        // failure the caller might retry.
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         let recording: &Recording = self.script.get(n);
+        recording
+            .validate()
+            .map_err(|e| SeamError::new(ErrorCode::ProviderFailure, e))?;
         let frames = recording
             .to_frames()
             .map_err(|e| SeamError::new(ErrorCode::ProviderFailure, e))?;
@@ -220,6 +229,38 @@ mod tests {
 
     #[tokio::test]
     async fn replays_the_recorded_stream_verbatim() {
+        // The expected stream is written independently of the capture path:
+        // what a replay must emit, piece for piece.
+        let expected = vec![
+            StreamFrame::BlockStart {
+                index: 0,
+                kind: BlockKind::Text,
+            },
+            StreamFrame::TextDelta {
+                index: 0,
+                text: "Hel".into(),
+            },
+            StreamFrame::TextDelta {
+                index: 0,
+                text: "lo".into(),
+            },
+            StreamFrame::BlockEnd {
+                index: 0,
+                assembled: ContentBlock {
+                    kind: BlockKind::Text,
+                    text: "Hello".into(),
+                },
+            },
+            StreamFrame::Usage(Usage {
+                uncached_input: 10,
+                cached_reads: 4,
+                cached_writes: 0,
+                output: 6,
+                reasoning: 2,
+            }),
+            StreamFrame::Finish,
+        ];
+        assert_eq!(expected, sample_frames(), "fixture drift");
         let adapter = ReplayAdapter::builder(sample_recording()).build();
         let events = collect(&adapter).await;
         let frames: Vec<StreamFrame> = events
@@ -229,15 +270,7 @@ mod tests {
                 other => panic!("unexpected event: {other:?}"),
             })
             .collect();
-        assert_eq!(frames, sample_frames());
-        // Deltas preserved piece for piece — the replay looks streamed.
-        assert_eq!(
-            frames[1],
-            StreamFrame::TextDelta {
-                index: 0,
-                text: "Hel".into()
-            }
-        );
+        assert_eq!(frames, expected);
     }
 
     #[tokio::test]
@@ -268,10 +301,16 @@ mod tests {
     async fn script_serves_recordings_in_order() {
         let first = sample_recording();
         let mut second = sample_recording();
-        second.frames.push(RecordedFrame::TextDelta {
-            index: 0,
-            text: " (second)".into(),
-        });
+        // Insert before the terminal frame: a delta after Finish would be a
+        // protocol violation the entry now rejects.
+        let last = second.frames.len() - 1;
+        second.frames.insert(
+            last,
+            RecordedFrame::TextDelta {
+                index: 0,
+                text: " (second)".into(),
+            },
+        );
         let adapter = ReplayAdapter::new("openai", Script::new(vec![first.clone(), second]));
         let a = collect(&adapter).await;
         let b = collect(&adapter).await;
@@ -313,6 +352,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn block_end_only_recording_is_content_not_silence() {
+        // A stream that only ever emits an assembled block still produced
+        // content; classifying it as an empty completion would report a
+        // full answer as provider silence.
+        let recording = Recording::capture(
+            &[
+                StreamFrame::BlockEnd {
+                    index: 0,
+                    assembled: ContentBlock {
+                        kind: BlockKind::Text,
+                        text: "full answer".into(),
+                    },
+                },
+                StreamFrame::Finish,
+            ],
+            &ReplayState::default(),
+        );
+        let adapter = ReplayAdapter::builder(recording).build();
+        let events = collect(&adapter).await;
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Failed(_))),
+            "BlockEnd-only content must not fail: {events:?}"
+        );
+    }
+
     #[test]
     fn broken_corpus_throws_from_the_entry() {
         // A recording naming an unknown block kind cannot restore; that is a
@@ -334,12 +399,22 @@ mod tests {
 
     #[test]
     fn owns_state_stamped_with_the_provider_marker() {
-        let adapter = ReplayAdapter::builder(sample_recording()).build();
+        let adapter = ReplayAdapter::builder(sample_recording())
+            .provider("openai")
+            .build();
         let owned = ReplayState {
             response: Some(json!({"__harnless_provider": "openai", "id": "resp-1"})),
             blocks: vec![],
         };
         assert!(adapter.owns(&owned));
+
+        // A foreign marker is another adapter family's private state: never
+        // claimed, so an owns-gated handoff cannot silently drop it.
+        let foreign = ReplayState {
+            response: Some(json!({"__harnless_provider": "deepseek"})),
+            blocks: vec![],
+        };
+        assert!(!adapter.owns(&foreign));
 
         let unstamped = ReplayState {
             response: Some(json!({"id": "resp-1"})),
@@ -355,5 +430,42 @@ mod tests {
             .provider("deepseek")
             .build();
         assert_eq!(adapter.provider(), "deepseek");
+    }
+
+    #[test]
+    fn frames_after_finish_throw_from_the_entry() {
+        // The golden file pins "nothing after finish"; a corpus violating it
+        // is a broken fixture, not a stream that replays delinquent frames.
+        let bad = Recording {
+            frames: vec![
+                RecordedFrame::Finish,
+                RecordedFrame::TextDelta {
+                    index: 0,
+                    text: "after terminal".into(),
+                },
+            ],
+            ..Recording::default()
+        };
+        let adapter = ReplayAdapter::builder(bad).build();
+        let err = match adapter.stream(CallId(1), &[], &[], None) {
+            Err(err) => err,
+            Ok(_) => panic!("post-Finish corpus must throw"),
+        };
+        assert!(err.message.contains("Finish"), "got: {err}");
+    }
+
+    #[test]
+    fn finish_and_failure_together_throw_from_the_entry() {
+        // A stream ends exactly one way; a corpus claiming both is broken.
+        let bad = Recording {
+            frames: vec![RecordedFrame::Finish],
+            failure: Some(ProviderFailure {
+                code: ErrorCode::StreamTerminated,
+                message: "and also failed".into(),
+            }),
+            ..Recording::default()
+        };
+        let adapter = ReplayAdapter::builder(bad).build();
+        assert!(adapter.stream(CallId(1), &[], &[], None).is_err());
     }
 }

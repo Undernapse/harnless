@@ -31,11 +31,14 @@ impl Script {
 
     /// Build a script from golden-file JSON documents, in call order.
     pub fn from_json(docs: &[&str]) -> Result<Self, String> {
+        if docs.is_empty() {
+            return Err("a replay script needs at least one recording".into());
+        }
         let recordings = docs
             .iter()
             .map(|d| Recording::from_json(d))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::new(recordings))
+        Ok(Self { recordings })
     }
 
     /// Build a script from a single golden-file JSON document.

@@ -9,7 +9,11 @@
 //! Recordings are produced by folding a live stream through
 //! [`Recording::capture`], and replayed by the [`ReplayAdapter`]. The same
 //! JSON document serves both directions, so `replay(record(x)) == x` holds
-//! by construction.
+//! whenever `x` honors the seam protocol (a terminal frame, owner-stamped
+//! replay state) — [`Recording::validate`] is where a corpus that doesn't
+//! gets rejected rather than silently replayed.
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,11 +52,13 @@ impl RecordedBlock {
     }
 }
 
-/// One recorded tool call: the call id the stream minted and the tool name.
+/// One recorded tool call: the seam call id the stream minted and the tool
+/// name.
 ///
-/// The call id is part of the recording so a replayed stream mints the same
-/// ids the original did — a replayed conversation correlates with its
-/// original tool results.
+/// The seam call id is recorded so a replayed stream mints the same ids the
+/// original did — a replayed conversation correlates with its original tool
+/// results. The provider's own call id lives inside the assembled JSON and
+/// is never parsed here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedToolCall {
     /// The seam call id the original stream minted.
@@ -197,24 +203,30 @@ impl Recording {
     /// emitted (in order) plus the replay state it would have stamped on the
     /// message, and the result replays deterministically.
     pub fn capture(frames: &[StreamFrame], replay: &ReplayState) -> Self {
+        // The seam call id is taken from the stream's own ToolCallDelta
+        // frames (it is a seam id, not the provider's call_... id, which
+        // lives inside the assembled JSON untouched); the name from the
+        // assembled block on BlockEnd.
+        let mut minted: HashMap<usize, u64> = HashMap::new();
         let mut tool_calls = Vec::new();
         let mut recorded = Vec::with_capacity(frames.len());
         for frame in frames {
-            // The tool name arrives inside the assembled block; the id →
-            // name pairing is taken from the assembled JSON on BlockEnd.
             recorded.push(RecordedFrame::capture(frame));
-            if let StreamFrame::BlockEnd { assembled, .. } = frame {
-                if assembled.kind == BlockKind::ToolCall {
-                    if let Ok(value) = serde_json::from_str::<Value>(&assembled.text) {
-                        let id = value.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let name = value
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        tool_calls.push(RecordedToolCall { call_id: id, name });
+            match frame {
+                StreamFrame::ToolCallDelta { index, call_id, .. } => {
+                    minted.insert(*index, call_id.0);
+                }
+                StreamFrame::BlockEnd { index, assembled } => {
+                    if assembled.kind == BlockKind::ToolCall {
+                        let call_id = minted.remove(index).unwrap_or(0);
+                        let name = serde_json::from_str::<Value>(&assembled.text)
+                            .ok()
+                            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
+                            .unwrap_or_default();
+                        tool_calls.push(RecordedToolCall { call_id, name });
                     }
                 }
+                _ => {}
             }
         }
         Self {
@@ -238,8 +250,43 @@ impl Recording {
     }
 
     /// Restore the recorded frames into seam frames.
+    ///
+    /// Does not check terminal invariants; a corpus whose frames violate the
+    /// stream protocol is caught by [`Recording::validate`], which the
+    /// replay adapter runs at the stream entry.
     pub fn to_frames(&self) -> Result<Vec<StreamFrame>, String> {
         self.frames.iter().map(|f| f.to_frame()).collect()
+    }
+
+    /// Check the golden file's terminal invariants: `Finish` must be the
+    /// last frame with nothing after it, and a recording carrying a
+    /// terminal failure must not also carry a `Finish` — a stream ends
+    /// exactly one way.
+    ///
+    /// The seam contract ("usage before finish and nothing after") is what
+    /// a golden file pins; a document violating it is a broken fixture, not
+    /// a stream outcome.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(pos) = self
+            .frames
+            .iter()
+            .position(|f| matches!(f, RecordedFrame::Finish))
+        {
+            if pos + 1 != self.frames.len() {
+                return Err(format!(
+                    "frame {} follows Finish; nothing may follow the terminal frame",
+                    pos + 1
+                ));
+            }
+            if self.failure.is_some() {
+                return Err(
+                    "recording carries both a Finish frame and a terminal failure; \
+                     a stream ends exactly one way"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The replay state this recording carries: response metadata plus the
@@ -256,7 +303,8 @@ impl Recording {
         serde_json::from_str(json).map_err(|e| format!("invalid recording: {e}"))
     }
 
-    /// Serialize to golden-file JSON (pretty, stable ordering).
+    /// Serialize to golden-file JSON (pretty; serde_json's default sorted
+    /// key order — golden diffs stay stable).
     pub fn to_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(self).map_err(|e| format!("cannot serialize: {e}"))
     }
