@@ -1,0 +1,9 @@
+{"parent_session":null,"seed_len":0,"working_dir":"/work/repo"}
+{"event":{"type":"user_message","id":1,"blocks":[{"kind":"text","text":"list the files"}],"provider":null,"model":null}}
+{"event":{"type":"turn_open"}}
+{"event":{"type":"step_open"}}
+{"event":{"type":"assistant_chunk","message_id":2,"block_index":0,"delta":"READM"}}
+{"event":{"type":"assistant_chunk","message_id":2,"block_index":0,"delta":"E.md, src/"}}
+{"event":{"type":"assistant_message","id":2,"blocks":[{"kind":"text","text":"README.md, src/"}],"provider":"replay","model":"test"}}
+{"event":{"type":"step_close"}}
+{"event":{"type":"turn_close","reason":{"kind":"completed"}}}
