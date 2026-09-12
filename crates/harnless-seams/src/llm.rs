@@ -223,11 +223,15 @@ pub enum StreamEvent {
 
 /// Replay state is adapter-owned but its shape is shared: response-level
 /// metadata plus per-block entries aligned to emitted blocks.
+///
+/// The `blocks` Vec is in emission order: providers append each entry when
+/// the block's metadata becomes available (at its `BlockEnd`), so alignment
+/// consumes emission order, never index order.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReplayState {
     /// Response-level metadata.
     pub response: Option<Value>,
-    /// Per-block entries aligned to emitted blocks, in order.
+    /// Per-block entries aligned to emitted blocks, in emission order.
     pub blocks: Vec<Value>,
 }
 
@@ -243,7 +247,7 @@ pub struct ReplayState {
 /// stored metadata always describes stored content.
 #[derive(Debug, Default)]
 pub struct BlockAssembler {
-    /// Completely assembled blocks in index order.
+    /// Completely assembled blocks in emission order.
     completed: Vec<(usize, ContentBlock)>,
     /// Blocks started but not yet ended, keyed by index.
     open: Vec<usize>,
@@ -283,7 +287,9 @@ impl BlockAssembler {
     /// The completed content blocks, in index order, with keep-or-drop
     /// applied: on a truncated finish, tool-call blocks are dropped.
     pub fn blocks(&self) -> Vec<ContentBlock> {
-        // Sort by index to keep interleaved blocks deterministic.
+        // Sort by index to keep interleaved blocks deterministic; the sort
+        // is for message assembly only — replay alignment consumes emission
+        // order (see [`ReplayState`]).
         let mut completed = self.completed.clone();
         completed.sort_by_key(|(index, _)| *index);
         completed
@@ -303,17 +309,18 @@ impl BlockAssembler {
         self.usage
     }
 
-    /// emitted blocks in index order. Dropped blocks (from a truncated
+    /// Align provider replay state with the assembled blocks:
+    /// `replay.blocks[i]` is the entry the provider appended at emission
+    /// slot `i`, so entries are paired with blocks in emission order —
+    /// never index order, which would mispair metadata whenever providers
+    /// interleave blocks. Dropped blocks (from a truncated
     /// finish) have their entries pruned so stored metadata always describes
     /// stored content.
     pub fn align_replay(&self, replay: ReplayState) -> ReplayState {
-        // All emitted blocks in index order; the drop filter decides which
-        // survive. `replay.blocks[i]` aligns to emitted block `i`.
-        let mut emitted = self.completed.clone();
-        emitted.sort_by_key(|(index, _)| *index);
-
-        let mut blocks = Vec::with_capacity(emitted.len());
-        for (i, (_, block)) in emitted.iter().enumerate() {
+        // All emitted blocks in emission order; the drop filter decides
+        // which survive. `replay.blocks[i]` aligns to emitted block `i`.
+        let mut blocks = Vec::with_capacity(self.completed.len());
+        for (i, (_, block)) in self.completed.iter().enumerate() {
             let kept = !(self.truncated && block.kind == BlockKind::ToolCall);
             if kept {
                 if let Some(entry) = replay.blocks.get(i) {
@@ -490,9 +497,11 @@ mod tests {
 
         let replay = ReplayState {
             response: Some(serde_json::json!({"id": "r1"})),
+            // Entries are appended in emission order: the tool (index 1)
+            // ended first, so its entry sits at slot 0.
             blocks: vec![
-                serde_json::json!({"index": 0}),
                 serde_json::json!({"index": 1}),
+                serde_json::json!({"index": 0}),
                 // Emitted block 2 was opened but never completed and is not
                 // in `completed`; the provider supplied no entry for it.
             ],
@@ -537,5 +546,40 @@ mod tests {
             assert_eq!(BlockKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(BlockKind::parse("smell"), None);
+    }
+
+    #[test]
+    fn align_replay_pairs_metadata_by_emission_order() {
+        // Providers append per-block metadata in emission order: the entry
+        // appended at slot `i` describes the block that ended at slot `i`,
+        // regardless of correlating index.
+        let mut a = BlockAssembler::new();
+        a.push(&StreamFrame::BlockStart {
+            index: 0,
+            kind: BlockKind::Text,
+        });
+        a.push(&StreamFrame::BlockStart {
+            index: 1,
+            kind: BlockKind::ToolCall,
+        });
+        // Emission order: tool (index 1) ends first, text (index 0) second.
+        a.push(&tool_block(1, 7));
+        a.push(&text_block(0, "hello"));
+        a.push(&StreamFrame::Finish);
+
+        let replay = ReplayState {
+            response: None,
+            blocks: vec![
+                serde_json::json!({"tool": 1}),
+                serde_json::json!({"text": "hello"}),
+            ],
+        };
+        let aligned = a.align_replay(replay.clone());
+        // Message assembly keeps index order: text (index 0) first.
+        assert_eq!(a.blocks()[0].kind, BlockKind::Text);
+        // No truncation: both blocks are kept, each paired with the entry
+        // appended at ITS emission slot — the tool's metadata stays on the
+        // tool entry and never leaks onto the text block's entry.
+        assert_eq!(aligned.blocks, replay.blocks);
     }
 }
