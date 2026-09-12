@@ -10,6 +10,7 @@ rust-version.workspace = true
 harnless-seams = { path = "../harnless-seams" }
 harnless-runtime = { path = "../harnless-runtime" }
 parking_lot = "0.12"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

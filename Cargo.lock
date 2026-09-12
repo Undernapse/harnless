@@ -284,6 +284,7 @@ version = "0.1.0"
 dependencies = [
  "harnless-runtime",
  "harnless-seams",
+ "libc",
  "parking_lot",
  "tempfile",
 ]
