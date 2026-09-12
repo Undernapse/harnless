@@ -225,6 +225,17 @@ impl LocalSandbox {
     ///    `AWS_*`, `SSH_AUTH_SOCK`, `GOOGLE_*`);
     /// 2. `chdir`s to the workspace root;
     /// 3. sets `RLIMIT_AS` to `rlimit_as_bytes` if configured.
+    /// # Wiring constraint (tool-bash integration, follow-up)
+    ///
+    /// `prepare` uses `std::env` and `set_current_dir`, which are **not**
+    /// POSIX async-signal-safe. That is acceptable from a `pre_exec` hook
+    /// only while the spawning process is single-threaded at the fork
+    /// point. The command-tool spawner is tokio (multi-threaded), so when
+    /// the tool pipeline wires this in, either call `pre_exec` only under
+    /// that documented constraint, or move confinement to a
+    /// `posix_spawn`/fork-early boundary where the child is immediately
+    /// quiescent. Integration wiring is a follow-up; this crate provides
+    /// the pieces, not the spawn site.
     ///
     /// Returns an error if the workspace root cannot be entered — the
     /// spawner must then treat the spawn as refused, not proceed anyway.
