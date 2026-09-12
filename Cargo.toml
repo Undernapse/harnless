@@ -6,6 +6,9 @@ members = [
     "crates/harnless-agent",
     "crates/harnless-llm-openai",
     "crates/harnless-llm-replay",
+    "crates/harnless-exec-subprocess",
+    "crates/harnless-exec-bash",
+    "crates/harnless-exec-sandbox",
 ]
 
 [workspace.package]

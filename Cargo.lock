@@ -269,6 +269,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnless-exec-bash"
+version = "0.1.0"
+dependencies = [
+ "harnless-exec-sandbox",
+ "harnless-exec-subprocess",
+ "harnless-seams",
+ "parking_lot",
+]
+
+[[package]]
+name = "harnless-exec-sandbox"
+version = "0.1.0"
+dependencies = [
+ "harnless-seams",
+]
+
+[[package]]
+name = "harnless-exec-subprocess"
+version = "0.1.0"
+dependencies = [
+ "harnless-seams",
+]
+
+[[package]]
 name = "harnless-llm-openai"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,10 @@
+[package]
+name = "harnless-exec-sandbox"
+description = "Sandbox execution-world provider for harnless: decides and reports what confinement a spawn is enforced under, plus the shared PolicyHome policy."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harnless-seams = { path = "../harnless-seams" }
