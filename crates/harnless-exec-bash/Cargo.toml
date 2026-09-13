@@ -1,0 +1,13 @@
+[package]
+name = "harnless-exec-bash"
+description = "Shell execution-world provider for harnless: builds argv from a command line and runs it through the subprocess seam."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harnless-seams = { path = "../harnless-seams" }
+harnless-exec-subprocess = { path = "../harnless-exec-subprocess" }
+harnless-exec-sandbox = { path = "../harnless-exec-sandbox" }
+parking_lot = "0.12"
