@@ -706,6 +706,15 @@ fn read_binary_is_not_text(fs: &dyn FileSystem, cx: &mut Cx) {
 }
 
 fn read_directory_is_not_a_regular_file(fs: &dyn FileSystem, cx: &mut Cx) {
+    // Materialize the fixture directory through the provider itself: a
+    // case must not assume state another case left behind (each case runs
+    // against a fresh provider).
+    if cx
+        .must_write(fs, "conf/fixture_seed.txt", b"seed")
+        .is_none()
+    {
+        return;
+    }
     let dir = match fs.resolve("conf") {
         Ok(d) => d,
         Err(e) => {
