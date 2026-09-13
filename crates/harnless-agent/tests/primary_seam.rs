@@ -1004,3 +1004,30 @@ fn corpus_builders_round_trip() {
     ));
     let _ = StreamFrame::Finish; // the builder vocabulary is the seam's frames
 }
+
+/// An unscripted harness still drives turns: the placeholder recording
+/// replays (repeat-last semantics) and commits deterministically, so helper
+/// tests that only exercise the pipeline never panic on an empty script.
+#[test]
+fn unscripted_harness_drives_turns_without_panicking() {
+    let h = Harness::new(SessionId(1980));
+    let turn = h.run_turn();
+    assert_eq!(turn.reason, TurnEndReason::Completed);
+    // Past the (placeholder) script's end the last recording repeats.
+    let _ = h.run_turn();
+    assert_eq!(
+        h.event_kinds(),
+        vec![
+            "turn_open",
+            "step_open",
+            "assistant_message",
+            "step_close",
+            "turn_close",
+            "turn_open",
+            "step_open",
+            "assistant_message",
+            "step_close",
+            "turn_close",
+        ]
+    );
+}

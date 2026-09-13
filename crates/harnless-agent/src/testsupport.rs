@@ -174,13 +174,14 @@ impl Harness {
             fiber.clone(),
             tools.clone(),
         ));
-        // A script needs at least one recording; an unscripted harness gets
-        // a trivial placeholder so construction never panics.
-        let recordings: Vec<Recording> = if script.is_empty() {
-            vec![text_recording(&["no script"])]
-        } else {
-            script.iter().map(|c| c.recording.clone()).collect()
-        };
+        // The adapter needs at least one recording; an unscripted harness
+        // gets a trivial placeholder so construction never panics, and the
+        // driver's id list keeps the same length so indexing can never
+        // underflow (the adapter's repeat-last semantics then apply).
+        let mut recordings: Vec<Recording> = script.iter().map(|c| c.recording.clone()).collect();
+        if recordings.is_empty() {
+            recordings.push(text_recording(&["no script"]));
+        }
         let adapter = Arc::new(ReplayAdapter::new("replay", Script::new(recordings)));
         Self {
             log,
@@ -188,7 +189,15 @@ impl Harness {
             loop_,
             events,
             fiber,
-            script,
+            script: if script.is_empty() {
+                // Mirror the placeholder recording with the id it commits.
+                vec![ScriptedCall::new(
+                    text_recording(&["no script"]),
+                    MessageId(0),
+                )]
+            } else {
+                script
+            },
             provider: "replay".into(),
             model: "golden".into(),
             calls: Arc::new(AtomicUsize::new(0)),
@@ -239,6 +248,14 @@ impl Harness {
     }
     /// Register an accept-all post-execute listener: observe the body's
     /// value and delegate it onward (the post waterfall's accept path).
+    ///
+    /// NOTE (ISSUE-19): until the registry's post-execute dispatch key is
+    /// unified, a listener registered this way — like any
+    /// [`crate::tools::ToolRegistry::on_post_execute`] listener — is never
+    /// invoked (see the ignored
+    /// `post_execute_listener_runs_in_the_locked_order` test in
+    /// `tests/primary_seam.rs`). Do not assert a post-stage effect as
+    /// passing behavior.
     pub fn accept_post(&self) -> RtResult<Disposer> {
         self.tools.on_post_execute(
             |e: &mut crate::tools::PostExecute,
