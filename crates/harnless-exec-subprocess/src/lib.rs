@@ -120,6 +120,11 @@ pub fn kill_process(pid: u32, signal: i32) -> bool {
 #[cfg(unix)]
 pub const SIGTERM: i32 = 15;
 
+/// SIGKILL, the undeliverable-block signal for a `pre_exec` refusal path
+/// where the child must die even if it has (or inherits) a TERM handler.
+#[cfg(unix)]
+pub const SIGKILL: i32 = 9;
+
 /// The seam handle: owns the child and its bounded output readers.
 struct ChildHandle {
     inner: Arc<Inner>,

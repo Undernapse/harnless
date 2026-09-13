@@ -18,6 +18,7 @@ fn sh(script: &str) -> Spawn {
     Spawn {
         argv: argv(&["/bin/sh", "-c", script]),
         cwd: None,
+        confine: None,
     }
 }
 
@@ -51,6 +52,7 @@ fn spawn_is_exact_argv_with_no_shell_rewriting() {
         .spawn(&Spawn {
             argv: argv(&["/bin/sh", "-c", "printf '%s\\n' \"$@\" | wc -l", "--", "*.txt"]),
             cwd: None,
+            confine: None,
         })
         .expect("spawn");
     let out = handle.output().expect("exit 0");
@@ -65,6 +67,7 @@ fn cwd_coordinate_is_applied() {
         .spawn(&Spawn {
             argv: argv(&["/bin/sh", "-c", "pwd"]),
             cwd: Some(dir.display().to_string()),
+            confine: None,
         })
         .expect("spawn");
     let out = handle.output().expect("exit 0");
@@ -119,6 +122,7 @@ fn missing_program_is_a_spawn_failure() {
     let err = match provider.spawn(&Spawn {
         argv: argv(&["/definitely/not/a/program"]),
         cwd: None,
+        confine: None,
     }) {
         Ok(_) => panic!("spawn must fail"),
         Err(err) => err,
@@ -132,6 +136,7 @@ fn empty_argv_is_a_spawn_failure() {
     let err = match provider.spawn(&Spawn {
         argv: Vec::new(),
         cwd: None,
+        confine: None,
     }) {
         Ok(_) => panic!("empty argv must fail"),
         Err(err) => err,

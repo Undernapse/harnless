@@ -199,41 +199,57 @@ impl LocalSandbox {
     /// Apply the best-effort confinement in the current process.
     ///
     /// Called by a spawner in the forked child **after** fork and **before**
-    /// exec (e.g. via `Command::pre_exec`). On `SandboxMode::SandboxLocal`
-    /// this:
+    /// exec (via `Command::pre_exec`). On `SandboxMode::SandboxLocal` this:
     ///
     /// 1. scrubs environment variables whose names look credential-bearing
     ///    (`*KEY*`, `*SECRET*`, `*TOKEN*`, `*PASS*`, `*CRED*`, `*API*`,
     ///    `AWS_*`, `SSH_AUTH_SOCK`, `GOOGLE_*`);
     /// 2. `chdir`s to the workspace root;
     /// 3. sets `RLIMIT_AS` to `rlimit_as_bytes` if configured.
-    /// # Wiring constraint (tool-bash integration, follow-up)
     ///
-    /// `prepare` uses `std::env` and `set_current_dir`, which are **not**
-    /// POSIX async-signal-safe. That is acceptable from a `pre_exec` hook
-    /// only while the spawning process is single-threaded at the fork
-    /// point. The command-tool spawner is tokio (multi-threaded), so when
-    /// the tool pipeline wires this in, either call `pre_exec` only under
-    /// that documented constraint, or move confinement to a
-    /// `posix_spawn`/fork-early boundary where the child is immediately
-    /// quiescent. Integration wiring is a follow-up; this crate provides
-    /// the pieces, not the spawn site.
+    /// # Safety
+    ///
+    /// The scrub is performed with `unsetenv(3)` — POSIX marks
+    /// `setenv`/`unsetenv` async-signal-safe (and glibc's implementation
+    /// takes no lock), so it is sound inside a `pre_exec` hook. The cwd
+    /// pin uses `chdir(2)` directly (not `std::env::set_current_dir`, whose
+    /// stdio-path locking is not safe there), and the rlimit step uses
+    /// `setrlimit(2)` — also async-signal-safe.
+    ///
+    /// # Wiring constraint (shipped boundary)
+    ///
+    /// `harnless-exec-bash`'s [`ConfinedSpawner`](harnless_exec_bash::ConfinedSpawner)
+    /// funnels confined commands onto a dedicated single-threaded spawner
+    /// thread and forks there, so the hook body runs while the forking
+    /// process is single-threaded at the fork point — the constraint
+    /// `pre_exec` safety needs, guaranteed by construction regardless of
+    /// how many tokio worker threads the caller has. The full decision and
+    /// the rejected alternatives are documented on that type.
     ///
     /// Returns an error if the workspace root cannot be entered — the
     /// spawner must then treat the spawn as refused, not proceed anyway.
     pub fn prepare(&self, policy: &PolicyHome, rlimit_as_bytes: Option<u64>) -> Result<()> {
         let root = Path::new(&policy.workspace_root);
         // Env scrub: conservative name match; drops more than it keeps.
+        // The removal itself goes through the async-signal-safe `unsetenv`
+        // (see the Safety note), never `std::env::remove_var`.
         const NEEDLES: [&str; 9] = [
             "KEY", "SECRET", "TOKEN", "PASS", "CRED", "API", "AWS_", "GOOGLE_", "SSH_AUTH",
         ];
-        for (name, _) in std::env::vars() {
-            let upper = name.to_ascii_uppercase();
-            if NEEDLES.iter().any(|n| upper.contains(n)) {
-                std::env::remove_var(&name);
-            }
+        // Collect first, remove second: `std::env::vars()` iterates the
+        // live environment block, and removing during iteration is UB.
+        let doomed: Vec<String> = std::env::vars()
+            .map(|(name, _)| name)
+            .filter(|name| {
+                let upper = name.to_ascii_uppercase();
+                NEEDLES.iter().any(|n| upper.contains(n))
+            })
+            .collect();
+        for name in doomed {
+            scrub_var(&name);
         }
-        std::env::set_current_dir(root).map_err(|err| {
+        // `chdir(2)` directly: async-signal-safe, unlike the std wrapper.
+        pin_cwd(root).map_err(|err| {
             SeamError::new(
                 ErrorCode::SandboxDenied,
                 format!("sandbox-local cannot enter workspace root: {err}"),
@@ -272,6 +288,43 @@ fn best_effort_guarantees(workspace_root: &str) -> std::result::Result<String, S
         "env scrub + cwd pinned to {} (+ rlimit where supported)",
         canonical.display()
     ))
+}
+
+/// Remove `name` from the process environment via `unsetenv(3)`.
+///
+/// POSIX lists `setenv`/`unsetenv` among the async-signal-safe functions,
+/// which is what makes the scrub legal inside a `pre_exec` hook — unlike
+/// `std::env::remove_var`, which takes std's environment lock.
+#[cfg(unix)]
+fn scrub_var(name: &str) {
+    // NUL-free by construction: env var names cannot contain NUL.
+    let cname = std::ffi::CString::new(name.to_string()).expect("env name has no NUL");
+    unsafe { libc::unsetenv(cname.as_ptr()) };
+}
+
+#[cfg(not(unix))]
+fn scrub_var(name: &str) {
+    // Non-Unix has no fork/pre_exec path; the std API is fine there.
+    std::env::remove_var(name);
+}
+
+/// `chdir(2)` to `root` — async-signal-safe, unlike
+/// `std::env::set_current_dir` (which takes std's stdio-path lock).
+#[cfg(unix)]
+fn pin_cwd(root: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let cname = std::ffi::CString::new(root.as_os_str().as_bytes().to_vec())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "root has NUL"))?;
+    if unsafe { libc::chdir(cname.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn pin_cwd(root: &Path) -> std::io::Result<()> {
+    std::env::set_current_dir(root)
 }
 
 /// `setrlimit(RLIMIT_AS, bytes)` without a libc crate dependency.

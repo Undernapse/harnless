@@ -11,3 +11,9 @@ harnless-seams = { path = "../harnless-seams" }
 harnless-exec-subprocess = { path = "../harnless-exec-subprocess" }
 harnless-exec-sandbox = { path = "../harnless-exec-sandbox" }
 parking_lot = "0.12"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
