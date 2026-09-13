@@ -1,0 +1,20 @@
+[package]
+name = "harnless-credentials-local"
+description = "Local Credentials provider for harnless: a file record store resolved per operation (rotation reaches the next resolve), plus an authorization-flow registry with one attempt per key."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harnless-seams = { path = "../harnless-seams" }
+libc = "0.2"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+harnless-conformance = { path = "../harnless-conformance" }
