@@ -696,16 +696,14 @@ fn loop_never_emits_interrupted() {
     assert!(opens > 0);
 }
 
-// ISSUE-18: implementation violates the documented precedence "MaxTokens
-// wins over a later clean stop" (events.rs doc comment on TurnEndReason):
-// the loop closes each turn with whatever reason the driver last returned,
-// and nothing in loop_.rs or session.rs keeps a MaxTokens stop from being
-// overwritten by a later Completed close — so a session that hits the token
-// budget and is then driven to a clean stop logs the clean stop, and a
-// replay of it diverges from the documented contract. Pinned ignored until
-// the implementation (or the doc) is fixed.
+// ISSUE-18 (enforced): the documented precedence "MaxTokens wins over a
+// later clean stop" (events.rs doc comment on TurnEndReason) is now
+// enforced by the loop. Once a turn has closed with MaxTokens, a later
+// clean (`Completed`) close is displaced to MaxTokens in the log, so a
+// replay of a budget-exhausted session never rewrites the budget stop as
+// a clean stop. Non-clean closes (Aborted/Blocked/Error/Interrupted) are
+// not displaced.
 #[test]
-#[ignore = "ISSUE-18: loop does not implement MaxTokens-over-stop precedence"]
 fn max_tokens_wins_over_later_clean_stop() {
     let loop_ = AgentLoop::new(
         std::sync::Arc::new(SessionLog::new(SessionId(320))),

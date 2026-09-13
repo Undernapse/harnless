@@ -52,12 +52,22 @@ pub struct AgentLoop {
     log: Arc<SessionLog>,
     events: EventRegistry,
     fiber: Arc<Fiber>,
+    /// Sticky flag for the documented precedence "MaxTokens wins over a
+    /// later clean stop": set once any turn of this loop has closed with
+    /// [`TurnEndReason::MaxTokens`], so a later clean (`Completed`) close
+    /// is displaced to MaxTokens in the log.
+    closed_max_tokens: parking_lot::Mutex<bool>,
 }
 
 impl AgentLoop {
     /// Create a loop bound to `log` and `fiber` (which owns its effects).
     pub fn new(log: Arc<SessionLog>, events: EventRegistry, fiber: Arc<Fiber>) -> Self {
-        Self { log, events, fiber }
+        Self {
+            log,
+            events,
+            fiber,
+            closed_max_tokens: parking_lot::Mutex::new(false),
+        }
     }
 
     /// The session log this loop drives.
@@ -94,6 +104,13 @@ impl AgentLoop {
     ///
     /// Opens the turn, runs steps until the driver stops or finishes, then
     /// closes the turn with the resulting [`TurnEndReason`].
+    ///
+    /// Close precedence: once a turn of this loop has closed with
+    /// [`TurnEndReason::MaxTokens`], no later turn may close with a clean
+    /// reason — a `Completed` close is displaced to MaxTokens in the log
+    /// (and [`DerivedTurn::reason`] reports the reason actually logged).
+    /// Non-clean closes (Aborted/Blocked/Error/Interrupted) are never
+    /// displaced.
     pub fn run_turn(&self, driver: Driver) -> DerivedTurn {
         self.log.append(SessionEvent::TurnOpen);
         self.log.append(SessionEvent::StepOpen);
@@ -120,6 +137,20 @@ impl AgentLoop {
                 TurnEndReason::Completed
             }
             DriverOutcome::Stop(reason) => reason,
+        };
+
+        // Precedence guard: a budget-exhausted close is sticky, so a later
+        // clean close is displaced to MaxTokens; non-clean closes stand.
+        let final_reason = {
+            let mut sticky = self.closed_max_tokens.lock();
+            if *sticky && final_reason == TurnEndReason::Completed {
+                TurnEndReason::MaxTokens
+            } else {
+                if final_reason == TurnEndReason::MaxTokens {
+                    *sticky = true;
+                }
+                final_reason
+            }
         };
 
         self.log.append(SessionEvent::StepClose);
