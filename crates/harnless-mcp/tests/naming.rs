@@ -64,10 +64,37 @@ fn colliding_bases_get_deterministic_hash_suffixes() {
     let second = public_names("srv", &raws);
     // Deterministic: identical assignment on every run (re-syncs never rename).
     assert_eq!(first, second);
-    // The bases collide (both normalize to `mcp__srv__a_b`), so both names
-    // carry the collision suffix...
-    assert!(first[0].1.ends_with("_6883201b"));
-    assert!(first[1].1.ends_with("_68c0481b"));
+    // The lossy raw (`a-b` normalizes away from itself) carries the
+    // collision suffix; the faithful raw keeps its clean base. Suffixing
+    // is decided from the pair alone, so this assignment cannot change
+    // when a sibling disappears from a later batch.
+    // Suffix is the FNV digest of the *lossy* pair ("a-b"); the faithful
+    // raw ("a_b") keeps its clean base.
+    let suffix_dash = {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x100_0000_01b3;
+        let mut hash = OFFSET;
+        for byte in "srv"
+            .bytes()
+            .chain(std::iter::once(b'\x00'))
+            .chain("a-b".bytes())
+        {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(PRIME);
+        }
+        format!("{hash:016x}")[..8].to_string()
+    };
+    let by_raw: std::collections::HashMap<&str, &str> = first
+        .iter()
+        .map(|(r, p)| (r.as_str(), p.as_str()))
+        .collect();
+    // The lossy raw ("a-b": normalization rewrote it) carries the suffix;
+    // the faithful raw ("a_b") keeps the clean base.
+    assert_eq!(
+        by_raw["a-b"],
+        format!("mcp__srv__a_b_{suffix_dash}").as_str()
+    );
+    assert_eq!(by_raw["a_b"], "mcp__srv__a_b");
     // ...and the assignment is injective.
     let distinct: std::collections::HashSet<&str> = first.iter().map(|(_, p)| p.as_str()).collect();
     assert_eq!(distinct.len(), 2, "colliding raws must get distinct names");

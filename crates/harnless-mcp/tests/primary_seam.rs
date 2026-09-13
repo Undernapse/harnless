@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use harnless_mcp::bridge::{McpServerPlugin, McpToolBridge, ServerClaims};
+use harnless_mcp::bridge::{McpServerPlugin, McpToolBridge, RegistryHandle, ServerClaims};
 use harnless_mcp::config::{McpServerConfig, TransportConfig};
 use harnless_mcp::naming::public_name;
 use harnless_mcp::supervisor::{
@@ -66,6 +66,8 @@ fn stdio_config(name: &str) -> McpServerConfig {
 /// `run`, recording each connection's kill switch in `kills` so tests can
 /// script outages against the live transport.
 type Kills = Arc<Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>;
+type NotifyVec = Arc<Mutex<Vec<futures::channel::mpsc::Sender<rmcp::model::ServerNotification>>>>;
+type ListedVec = Arc<Mutex<Vec<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>>>;
 fn scripted_factory(
     server: &'static str,
     make: impl Fn() -> FakeServer + Send + Sync + 'static,
@@ -235,9 +237,6 @@ async fn list_changed_replaces_the_whole_generation() {
     let errors = Arc::new(Mutex::new(Vec::new()));
     let calls2 = calls.clone();
     let errors2 = errors.clone();
-    type NotifyVec =
-        Arc<Mutex<Vec<futures::channel::mpsc::Sender<rmcp::model::ServerNotification>>>>;
-    type ListedVec = Arc<Mutex<Vec<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>>>;
     let notify: NotifyVec = Arc::new(Mutex::new(Vec::new()));
     let listed: ListedVec = Arc::new(Mutex::new(Vec::new()));
     let factory: Arc<dyn TransportFactory> = {
@@ -670,8 +669,12 @@ async fn supervisor_backoff_budget_unregisters_when_exhausted() {
         .collect();
     assert_eq!(
         delays,
-        vec![backoff_delay(&cfg, 1), backoff_delay(&cfg, 2),],
-        "two reconnects then stop at attempt 3"
+        vec![
+            backoff_delay(&cfg, 1),
+            backoff_delay(&cfg, 2),
+            backoff_delay(&cfg, 3),
+        ],
+        "three reconnects (max_attempts=3) then stop"
     );
     assert_eq!(
         &*reg.0.lock(),
@@ -903,4 +906,503 @@ fn probe_published_generation_survives_handoff() {
         .expect("activation publishes the probe generation");
     assert_eq!(spy.names(), vec![public_name("handoff", "t")]);
     assert!(bridge.call("mcp__handoff__t", CallId(1), b"{}").is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Review-round regressions (PR #48 independent review).
+// ---------------------------------------------------------------------------
+
+/// A registry that overwrites on re-registration (like the real spine): a
+/// third party can take a name out-of-band, and re-registering replaces it.
+#[derive(Default)]
+struct MapRegistry {
+    tools: Arc<Mutex<std::collections::HashMap<String, ToolDefinition>>>,
+}
+
+impl Tools for MapRegistry {
+    fn register(&self, def: ToolDefinition, body: Arc<dyn ToolBody>) -> harnless_seams::Result<()> {
+        let _ = body;
+        self.tools.lock().insert(def.name.clone(), def);
+        Ok(())
+    }
+    fn get(&self, name: &str) -> Option<ToolDefinition> {
+        self.tools.lock().get(name).cloned()
+    }
+    fn names(&self) -> Vec<String> {
+        self.tools.lock().keys().cloned().collect()
+    }
+}
+
+/// P1a: a third party that took this server's public name out-of-band must
+/// conflict on re-sync — the underlying registry is authoritative, not the
+/// bridge's own liveness bookkeeping.
+#[tokio::test(flavor = "multi_thread")]
+async fn out_of_band_name_theft_conflicts_on_resync() {
+    let reg = Arc::new(MapRegistry::default());
+    let bridge = Arc::new(McpToolBridge::new(reg.clone()));
+    let handle = RegistryHandle::new(bridge.clone(), "alpha");
+    let gen = |names: &[&'static str]| -> Generation {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    public_name("alpha", n),
+                    ToolDefinition {
+                        name: public_name("alpha", n),
+                        schema: json!({"type": "object"}),
+                        serialized: false,
+                    },
+                    Arc::new(NoopBody) as Arc<dyn ToolBody>,
+                )
+            })
+            .collect()
+    };
+    handle
+        .replace_generation("alpha", gen(&["x", "y"]))
+        .expect("first generation registers");
+    // A third party takes mcp__alpha__y out-of-band (registry overwrite):
+    // a *different* definition lands under our public name.
+    reg.tools.lock().insert(
+        public_name("alpha", "y"),
+        ToolDefinition {
+            name: public_name("alpha", "y"),
+            schema: json!({"type": "string"}),
+            serialized: true,
+        },
+    );
+    // Re-sync including y: must conflict and roll back entirely.
+    let err = handle
+        .replace_generation("alpha", gen(&["x", "y"]))
+        .expect_err("out-of-band theft must conflict on re-sync");
+    assert!(
+        err.contains(&public_name("alpha", "y")),
+        "names the stolen tool: {err}"
+    );
+    // Rolled back: the attempted generation left nothing behind — the
+    // registry still shows the thief's definition for y, and the bridge
+    // did not silently re-shadow it.
+    assert!(
+        bridge.is_live("mcp__alpha__x"),
+        "previous generation intact"
+    );
+    assert!(
+        !bridge.is_live("mcp__alpha__y"),
+        "stolen name must not be silently re-shadowed"
+    );
+}
+
+/// P1b(i): `max_attempts` is the budget of *reconnects*; the initial
+/// connection is not charged against it.
+#[tokio::test(flavor = "multi_thread")]
+async fn max_attempts_counts_reconnects_not_the_initial_connection() {
+    struct AlwaysFail(&'static str);
+    impl TransportFactory for AlwaysFail {
+        fn run(
+            &self,
+            _sink: Arc<dyn GenerationSink>,
+            _stop: CancellationToken,
+        ) -> Result<(), String> {
+            Err("down".to_string())
+        }
+        fn server(&self) -> &str {
+            self.0
+        }
+    }
+    #[derive(Default)]
+    struct Counter(Mutex<Vec<SupervisorEvent>>);
+    impl SupervisorObserver for Counter {
+        fn on_event(&self, event: SupervisorEvent) {
+            self.0.lock().push(event);
+        }
+    }
+    #[derive(Default)]
+    struct UnregSpy(Mutex<Vec<String>>);
+    impl Registry for UnregSpy {
+        fn replace_generation(&self, _s: &str, _t: Generation) -> Result<(), String> {
+            Ok(())
+        }
+        fn unregister(&self, server: &str) {
+            self.0.lock().push(server.to_string());
+        }
+    }
+    let cfg = Arc::new(harnless_mcp::config::ReconnectConfig {
+        enabled: true,
+        backoff_initial: Duration::from_millis(1),
+        backoff_ceiling: Duration::from_millis(1),
+        max_attempts: 3,
+    });
+    let obs = Arc::new(Counter::default());
+    let reg = Arc::new(UnregSpy::default());
+    supervise(
+        Arc::new(AlwaysFail("alpha")),
+        reg.clone(),
+        cfg,
+        obs.clone(),
+        Arc::new(|_| {}),
+        CancellationToken::new(),
+    );
+    let events = obs.0.lock();
+    let reconnects = events
+        .iter()
+        .filter(|e| matches!(e, SupervisorEvent::Reconnect { .. }))
+        .count();
+    assert_eq!(
+        reconnects, 3,
+        "max_attempts=3 grants 3 reconnects (initial connection is free)"
+    );
+    assert!(
+        matches!(events.last(), Some(SupervisorEvent::Stopped { .. })),
+        "supervisor stops with Stopped: {:?}",
+        events.last()
+    );
+    assert_eq!(&*reg.0.lock(), &["alpha".to_string()]);
+}
+
+/// P1b(ii): after unload (stop cancelled), a late publish from an in-flight
+/// connection must not re-register tools.
+#[tokio::test(flavor = "multi_thread")]
+async fn late_publish_after_unload_does_not_reregister() {
+    let spy = Arc::new(SpyRegistry::default());
+    let bridge = Arc::new(McpToolBridge::new(spy.clone()));
+    let handle = Arc::new(RegistryHandle::new(bridge.clone(), "alpha"));
+    let stop = CancellationToken::new();
+    // The mount's unload path: stop, then unregister.
+    let disposed = handle.disposed_token();
+    stop.cancel();
+    disposed.cancel();
+    bridge.unregister_server("alpha");
+    // A late publish from a connection that had not noticed the stop yet.
+    handle.publish_after_dispose(vec![(
+        "x".to_string(),
+        ToolDefinition {
+            name: public_name("alpha", "x"),
+            schema: json!({"type": "object"}),
+            serialized: false,
+        },
+        Arc::new(NoopBody) as Arc<dyn ToolBody>,
+    )]);
+    assert!(
+        spy.names().is_empty(),
+        "disposed handle must not re-register: {:?}",
+        spy.names()
+    );
+}
+
+/// P2a: when a name disappears and later reappears, the server re-adopts
+/// its own orphan forwarder instead of conflicting with itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_forwarder_reappearance_is_readopted_not_conflict() {
+    let reg = Arc::new(MapRegistry::default());
+    let bridge = Arc::new(McpToolBridge::new(reg.clone()));
+    let handle = RegistryHandle::new(bridge.clone(), "alpha");
+    let gen = |names: &[&'static str]| -> Generation {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    public_name("alpha", n),
+                    ToolDefinition {
+                        name: public_name("alpha", n),
+                        schema: json!({"type": "object"}),
+                        serialized: false,
+                    },
+                    Arc::new(NoopBody) as Arc<dyn ToolBody>,
+                )
+            })
+            .collect()
+    };
+    handle
+        .replace_generation("alpha", gen(&["x", "y"]))
+        .expect("registers");
+    // y disappears from the server's list.
+    handle
+        .replace_generation("alpha", gen(&["x"]))
+        .expect("shrink ok");
+    // y reappears: the orphan forwarder (still in the registry, ours) must
+    // be re-adopted, not treated as a conflict.
+    handle
+        .replace_generation("alpha", gen(&["x", "y"]))
+        .expect("re-adoption must not conflict");
+    assert!(bridge.is_live("mcp__alpha__y"));
+    // And the call still routes through the bridge.
+    assert!(bridge.call("mcp__alpha__y", CallId(9), b"{}").is_ok());
+}
+
+/// P2b: a failed re-discovery must reach the supervisor observer as a
+/// distinct Outage event, not vanish into a sink call no consumer acts on.
+#[tokio::test(flavor = "multi_thread")]
+async fn rediscovery_failure_surfaces_as_outage_event() {
+    #[derive(Default)]
+    struct Events(Mutex<Vec<SupervisorEvent>>);
+    impl SupervisorObserver for Events {
+        fn on_event(&self, event: SupervisorEvent) {
+            if !matches!(event, SupervisorEvent::Connected { .. }) {
+                self.0.lock().push(event);
+            }
+        }
+    }
+    let notify: NotifyVec = Arc::new(Mutex::new(Vec::new()));
+    let listed: ListedVec = Arc::new(Mutex::new(Vec::new()));
+    let kills: Arc<Mutex<Vec<tokio::sync::oneshot::Sender<()>>>> = Arc::new(Mutex::new(Vec::new()));
+    struct F(
+        AtomicUsize,
+        NotifyVec,
+        ListedVec,
+        Arc<Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
+    );
+    impl TransportFactory for F {
+        fn run(
+            &self,
+            sink: Arc<dyn GenerationSink>,
+            stop: CancellationToken,
+        ) -> Result<(), String> {
+            let fake = fake_server(scripted(
+                harnless_mcp::test_support::scripted_tools(&["x"]),
+                move |req: &Request| {
+                    let _ = req;
+                    Response::Result(json!({"content": [{"type": "text", "text": "ok"}]}))
+                },
+            ));
+            let listed_rx = fake.listed.lock().unwrap().take();
+            self.2.lock().push(std::sync::Mutex::new(listed_rx));
+            self.1.lock().push(fake.notify_tx.clone());
+            if let Some(k) = fake.kill.lock().take() {
+                self.3.lock().push(k);
+            }
+            let (outcome, _peer) = harnless_mcp::supervisor::serve_fake_keepalive(
+                fake.transport,
+                sink.clone(),
+                stop,
+                "alpha".to_string(),
+                Duration::from_millis(400),
+                harnless_mcp::projection::RichContentGate::closed(),
+            );
+            outcome
+        }
+        fn server(&self) -> &str {
+            "alpha"
+        }
+    }
+    let factory = Arc::new(F(
+        AtomicUsize::new(0),
+        notify.clone(),
+        listed.clone(),
+        kills.clone(),
+    ));
+    let obs = Arc::new(Events::default());
+    let plugin =
+        McpServerPlugin::new(stdio_config("alpha").call_timeout(Duration::from_millis(400)))
+            .with_factory(factory)
+            .with_observer(obs.clone())
+            .with_keepalive_probe();
+    let (_bridge, _spy, _claims) = mount(plugin);
+    // Wait for the supervised connection (second) to answer tools/list.
+    let rx: Option<tokio::sync::oneshot::Receiver<()>> = loop {
+        let mut guard = listed.lock();
+        if guard.len() >= 2 {
+            break guard.get_mut(1).and_then(|g| g.lock().unwrap().take());
+        }
+        drop(guard);
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if let Some(rx) = rx {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _ = rx.blocking_recv();
+            })
+            .join()
+        })
+        .ok();
+    }
+    // Fire list_changed at the supervised connection...
+    {
+        let mut tx = notify.lock().get(1).cloned().expect("supervised notify tx");
+        let _ = futures::SinkExt::send(
+            &mut tx,
+            rmcp::model::ServerNotification::ToolListChangedNotification(
+                rmcp::model::NotificationNoParam::default(),
+            ),
+        )
+        .await;
+    }
+    // ...and kill its transport mid-re-discovery: the re-discovery fails,
+    // and the failure must be observable, not silent.
+    {
+        let k = kills.lock().remove(1);
+        let _ = k.send(());
+    }
+    let mut seen = false;
+    for _ in 0..300 {
+        if obs
+            .0
+            .lock()
+            .iter()
+            .any(|e| matches!(e, SupervisorEvent::Outage { .. }))
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        seen,
+        "re-discovery/transport failure must surface as an Outage observer event: {:?}",
+        obs.0
+            .lock()
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// P2e: the collision suffix is a pure function of (server, raw) — a
+/// re-sync where the colliding sibling disappeared must NOT rename the
+/// survivor.
+#[tokio::test(flavor = "multi_thread")]
+async fn collision_suffix_survives_sibling_removal() {
+    // Two raws whose normalization collides ("a-b" and "a.b" → "a_b").
+    let both = harnless_mcp::naming::public_names("s", &["a-b".into(), "a.b".into()]);
+    let (_, name_ab) = &both[0];
+    // Re-sync with only the first sibling present.
+    let solo = harnless_mcp::naming::public_names("s", &["a-b".into()]);
+    assert_eq!(
+        solo[0].1, *name_ab,
+        "public name must not change when a colliding sibling disappears"
+    );
+    // And the other sibling keeps its own stable name too.
+    let solo2 = harnless_mcp::naming::public_names("s", &["a.b".into()]);
+    assert_eq!(solo2[0].1, both[1].1);
+}
+
+/// P2c: a call that exceeds the per-call timeout must send the MCP
+/// `notifications/cancelled` notification for the pending request id —
+/// the server learns the call is abandoned, not just the client future.
+#[test]
+fn call_timeout_sends_cancelled_notification() {
+    let hang = Arc::new(AtomicUsize::new(0));
+    let hang2 = hang.clone();
+    // The fake answers everything; the FIRST `tools/call` hangs (the
+    // timeout leg), later calls answer normally.
+    let fake = fake_server(Arc::new(move |req: &Request| match req.method.as_str() {
+        "initialize" => Some(Response::initialize(false)),
+        "tools/list" => Some(Response::tools(harnless_mcp::test_support::scripted_tools(
+            &["slow"],
+        ))),
+        "tools/call" => {
+            if hang2.fetch_add(1, Ordering::SeqCst) == 0 {
+                None
+            } else {
+                Some(Response::Result(json!({"content": []})))
+            }
+        }
+        _ => Some(Response::Result(json!({}))),
+    }));
+    let peer = harnless_mcp::supervisor::serve_fake_peer_now(
+        fake.transport,
+        "alpha".to_string(),
+        Duration::from_millis(200),
+    );
+    let body = harnless_mcp::supervisor::call_body_for_test(
+        "slow".to_string(),
+        peer.clone(),
+        Duration::from_millis(200),
+    );
+    let err = body
+        .run(CallId(1), b"{}")
+        .expect_err("hanging call must time out");
+    assert_eq!(err.code, ErrorCode::ToolTimeout);
+    // The fake's own transcript records notifications too.
+    let mut saw_cancelled = false;
+    for _ in 0..100 {
+        if fake
+            .seen
+            .lock()
+            .iter()
+            .any(|r| r.method == "notifications/cancelled")
+        {
+            saw_cancelled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        saw_cancelled,
+        "timeout must emit notifications/cancelled; fake saw {:?}",
+        fake.seen
+            .lock()
+            .iter()
+            .map(|r| r.method.clone())
+            .collect::<Vec<_>>()
+    );
+    // And the cancellation names the abandoned request.
+    let cancelled = fake
+        .seen
+        .lock()
+        .iter()
+        .find(|r| r.method == "notifications/cancelled")
+        .expect("cancelled notification")
+        .params
+        .clone();
+    assert_eq!(
+        cancelled["requestId"],
+        json!(2),
+        "names the pending call: {cancelled}"
+    );
+}
+
+/// P3: a strict load failure must surface the real detail, not a
+/// constant. `RuntimeError` messages are `&'static str` (runtime
+/// contract), so the detail travels through the load boundary's log line.
+#[test]
+fn strict_failure_detail_is_logged() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+    struct CapturingLayer(Mutex<Vec<String>>);
+    impl<S: tracing::Subscriber> Layer<S> for CapturingLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = Vec::new();
+            event.record(&mut CollectFields(&mut fields));
+            self.0.lock().push(fields.join(" "));
+        }
+    }
+    struct CollectFields<'a>(&'a mut Vec<String>);
+    impl tracing::field::Visit for CollectFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
+    }
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    struct SharedLayer(Arc<Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> Layer<S> for SharedLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = Vec::new();
+            event.record(&mut CollectFields(&mut fields));
+            self.0.lock().push(fields.join(" "));
+        }
+    }
+    // A process-wide default is required: the probe logs from its own
+    // thread, where a thread-local default is invisible.
+    let subscriber =
+        tracing_subscriber::registry::Registry::default().with(SharedLayer(captured.clone()));
+    let _ = tracing::subscriber::set_global_default(subscriber);
+    let spy = Arc::new(SpyRegistry::default());
+    let bridge = Arc::new(McpToolBridge::new(spy.clone()));
+    let mut config = stdio_config("detail");
+    config.strict = true;
+    let plugin = McpServerPlugin::new(config)
+        .with_factory(Arc::new(DyingFactory("transport refused by peer")));
+    let result = plugin.activate(bridge, Arc::new(ServerClaims::default()));
+    assert!(result.is_err());
+    let logged = captured.lock().clone();
+    assert!(
+        logged.iter().any(|line| line.contains("transport refused")),
+        "the real failure detail must reach the log: {logged:?}"
+    );
 }

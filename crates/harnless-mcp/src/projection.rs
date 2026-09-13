@@ -449,27 +449,63 @@ fn type_matches(value: &Value, ty: &str) -> bool {
     }
 }
 
-/// A simple in-memory attachment store (content-addressed by digest of the
+/// The default store's capacity: server output is untrusted, so the
+/// process must not grow unbounded no matter what a server returns.
+pub const DEFAULT_ATTACHMENT_CAPACITY: usize = 256;
+
+/// An in-memory attachment store (content-addressed by digest of the
 /// base64 payload), used when the harness mounts a default store.
-#[derive(Default)]
+///
+/// Bounded: once `capacity` entries are held, the least-recently-used
+/// entry is evicted. Re-storing identical content refreshes the entry
+/// instead of adding one.
 pub struct InMemoryAttachmentStore {
-    entries: Mutex<std::collections::HashMap<String, (String, String)>>,
+    capacity: usize,
+    entries: Mutex<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    /// reference → (mime, payload), in insertion/refresh order (oldest
+    /// first).
+    map: std::collections::BTreeMap<String, (String, String)>,
+    /// Recency list: oldest → newest reference.
+    order: Vec<String>,
+}
+
+impl Default for InMemoryAttachmentStore {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_ATTACHMENT_CAPACITY)
+    }
 }
 
 impl InMemoryAttachmentStore {
-    /// An empty store.
+    /// An empty store with the default capacity.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// An empty store holding at most `capacity` attachments (at least 1).
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: Mutex::new(Inner::default()),
+        }
+    }
+
     /// Number of stored attachments.
     pub fn len(&self) -> usize {
-        self.entries.lock().len()
+        self.entries.lock().map.len()
     }
 
     /// Whether the store is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Whether `reference` is still held (not evicted).
+    pub fn contains(&self, reference: &str) -> bool {
+        self.entries.lock().map.contains_key(reference)
     }
 }
 
@@ -488,9 +524,17 @@ impl AttachmentStore for InMemoryAttachmentStore {
             hash = hash.wrapping_mul(PRIME);
         }
         let reference = format!("attachment-{hash:016x}");
-        self.entries
-            .lock()
+        let mut inner = self.entries.lock();
+        inner.order.retain(|r| r != &reference);
+        inner.order.push(reference.clone());
+        inner
+            .map
             .insert(reference.clone(), (mime.to_string(), base64.to_string()));
+        // Evict least-recently-used beyond capacity.
+        while inner.order.len() > self.capacity {
+            let oldest = inner.order.remove(0);
+            inner.map.remove(&oldest);
+        }
         Ok(reference)
     }
 }

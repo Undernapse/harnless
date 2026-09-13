@@ -252,3 +252,28 @@ fn no_schema_means_unconstrained_passthrough() {
     assert_eq!(out["structured"], json!({"x": 1}));
     assert_eq!(out["schemaValidated"], json!(false));
 }
+
+// P2d: the default store must not grow unbounded on untrusted server output.
+#[test]
+fn attachment_store_is_bounded_and_evicts() {
+    // Capacity is part of the store's contract.
+    let store = harnless_mcp::projection::InMemoryAttachmentStore::with_capacity(3);
+    let mut refs = Vec::new();
+    for i in 0..10 {
+        let r = store
+            .put("image/png", &format!("payload-{i}"))
+            .expect("put");
+        refs.push(r);
+        assert!(store.len() <= 3, "store must stay bounded: {}", store.len());
+    }
+    // The most recent survive; the oldest were evicted.
+    assert_eq!(store.len(), 3);
+    assert!(store.contains(&refs[9]));
+    assert!(store.contains(&refs[8]));
+    assert!(store.contains(&refs[7]));
+    assert!(!store.contains(&refs[0]), "oldest must be evicted");
+    // Re-storing the same content refreshes it (content-addressed).
+    let again = store.put("image/png", "payload-9").expect("put");
+    assert_eq!(again, refs[9]);
+    assert!(store.contains(&refs[9]));
+}

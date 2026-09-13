@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RwLock};
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use harnless_runtime::context::Context;
 use harnless_runtime::fiber::Fiber;
@@ -103,6 +103,25 @@ struct BridgeState {
     generations: HashMap<String, HashMap<String, Entry>>,
     /// public name → live (not yet unregistered).
     live: HashSet<String>,
+    /// public name → the definition we registered there. `Tools` has no
+    /// unregister, so names that disappear from a generation leave an
+    /// orphan forwarder in the registry; we remember the definition so the
+    /// name's reappearance re-adopts our own forwarder instead of
+    /// conflicting with ourselves.
+    registered: HashMap<String, ToolDefinition>,
+    /// public names whose forwarder outlived its generation (still ours,
+    /// not callable).
+    orphans: HashSet<String>,
+    /// public names we believe are ours but the registry no longer holds
+    /// our definition under — taken out-of-band. Not live, not callable.
+    stolen: HashSet<String>,
+}
+
+/// Whether two definitions are the same registration we placed.
+/// `ToolDefinition` has no `PartialEq` (it is a seam type we must not
+/// edit); name + schema + serialized flag identify it.
+fn same_definition(a: &ToolDefinition, b: &ToolDefinition) -> bool {
+    a.name == b.name && a.schema == b.schema && a.serialized == b.serialized
 }
 
 /// The bridge service: owns the MCP-side dispatch table and registers thin
@@ -152,6 +171,15 @@ impl McpToolBridge {
         call_id: CallId,
         args: &[u8],
     ) -> harnless_seams::Result<serde_json::Value> {
+        {
+            let state = self.state.read();
+            if state.stolen.contains(public) {
+                return Err(SeamError::new(
+                    ErrorCode::ToolNotFound,
+                    format!("mcp tool {public} was taken over out-of-band"),
+                ));
+            }
+        }
         let entry = self
             .state
             .read()
@@ -182,7 +210,8 @@ impl McpToolBridge {
 
     /// Whether the bridge currently serves `public`.
     pub fn is_live(&self, public: &str) -> bool {
-        self.state.read().live.contains(public)
+        let state = self.state.read();
+        state.live.contains(public) && !state.stolen.contains(public)
     }
 }
 
@@ -204,20 +233,79 @@ impl ToolBody for Forwarder {
 pub struct RegistryHandle {
     bridge: Arc<McpToolBridge>,
     server: String,
+    /// Cancelled at unload/dispose: late publishes are dropped.
+    disposed: CancellationToken,
 }
 
 impl RegistryHandle {
-    /// A handle for `server` over `bridge`.
+    /// A handle for `server` over `bridge` with its own dispose token
+    /// (cancelled at unload; a late publish from an in-flight connection
+    /// is then dropped instead of resurrecting tools).
     pub fn new(bridge: Arc<McpToolBridge>, server: impl Into<String>) -> Self {
+        Self::with_dispose(bridge, server, CancellationToken::new())
+    }
+
+    /// A handle whose dispose token is `disposed`.
+    pub fn with_dispose(
+        bridge: Arc<McpToolBridge>,
+        server: impl Into<String>,
+        disposed: CancellationToken,
+    ) -> Self {
         Self {
             bridge,
             server: server.into(),
+            disposed,
         }
     }
 }
 
 impl Registry for RegistryHandle {
     fn replace_generation(&self, server: &str, tools: Generation) -> Result<(), String> {
+        // The handle is bound to one server (the plugin's); the supervisor
+        // names that server, and it must be the one we serve.
+        assert_eq!(
+            server, self.server,
+            "registry handle is bound to `{}`",
+            self.server
+        );
+        self.publish(tools)
+    }
+
+    fn unregister(&self, server: &str) {
+        self.bridge.unregister_server(server);
+    }
+}
+
+impl RegistryHandle {
+    /// The public names currently served for this handle's server.
+    pub fn served_names(&self) -> Vec<String> {
+        self.bridge.public_names(&self.server)
+    }
+
+    /// The dispose token: cancelled by unload/supervisor-stop. A publish
+    /// after disposal is dropped, so a late in-flight connection cannot
+    /// resurrect tools after unload.
+    pub fn disposed_token(&self) -> CancellationToken {
+        self.disposed.clone()
+    }
+
+    /// Publish a generation, honoring the dispose guard. This is the only
+    /// publish path; [`Registry::replace_generation`] delegates here.
+    pub fn publish(&self, tools: Generation) -> Result<(), String> {
+        self.publish_inner(tools)
+    }
+
+    /// Test-visible name for the guarded publish (a late publish arriving
+    /// after unload must be dropped).
+    pub fn publish_after_dispose(&self, tools: Generation) -> Result<(), String> {
+        self.publish_inner(tools)
+    }
+
+    fn publish_inner(&self, tools: Generation) -> Result<(), String> {
+        if self.disposed.is_cancelled() {
+            return Err("registry handle disposed; generation dropped".to_string());
+        }
+        let server = self.server.as_str();
         let mut state = self.bridge.state.write();
         let previous = state.generations.get(server).cloned().unwrap_or_default();
         // Conflict check: every attempted public name must be free, or
@@ -233,9 +321,28 @@ impl Registry for RegistryHandle {
                     ));
                 }
             }
-            let ours = previous.contains_key(public) || state.live.contains(public);
-            if !ours && self.bridge.inner.get(public).is_some() {
-                return Err(format!("public name `{public}` is taken by a non-MCP tool"));
+            // The underlying registry is authoritative — never our own
+            // bookkeeping: a third party that took our public name
+            // out-of-band must conflict, even while we believe the name
+            // is ours. A name that is absent from the registry is free.
+            if let Some(existing) = self.bridge.inner.get(public) {
+                // The registry holds something under this name. It is
+                // ours only if we registered that exact definition there
+                // (live or orphaned) and it still matches. Anything else —
+                // a third party's tool, or our name overwritten out-of-band
+                // — conflicts, even if our bookkeeping still claims it.
+                let ours_intact = state
+                    .registered
+                    .get(public)
+                    .is_some_and(|ours_def| same_definition(ours_def, &existing));
+                if !ours_intact {
+                    if state.live.contains(public) || state.orphans.contains(public) {
+                        state.stolen.insert(public.clone());
+                        state.live.remove(public);
+                        state.orphans.remove(public);
+                    }
+                    return Err(format!("public name `{public}` is taken by a non-MCP tool"));
+                }
             }
         }
         // Build the new table.
@@ -250,44 +357,45 @@ impl Registry for RegistryHandle {
             if previous.contains_key(public) || state.live.contains(public) {
                 continue;
             }
+            // An orphan forwarder of ours is still in the registry —
+            // re-adopt it instead of re-registering (Tools has no
+            // unregister, and re-registering would mask a theft check).
+            if state.orphans.remove(public) {
+                state.live.insert(public.clone());
+                continue;
+            }
             let def = table[public].1.clone();
             let forwarder = Arc::new(Forwarder {
                 bridge: self.bridge.clone(),
                 public: public.clone(),
             });
-            match self.bridge.inner.register(def, forwarder) {
+            match self.bridge.inner.register(def.clone(), forwarder) {
                 Ok(()) => {
                     state.live.insert(public.clone());
+                    state.registered.insert(public.clone(), def);
                     added.push(public.clone());
                 }
                 Err(e) => {
                     // Roll the attempted generation back entirely.
                     for name in added {
                         state.live.remove(&name);
+                        state.registered.remove(&name);
                     }
                     return Err(format!("registering `{public}` failed: {}", e.message));
                 }
             }
         }
-        // Drop liveness for names that disappeared.
+        // Names that disappeared: drop liveness, remember the orphan.
         for public in previous.keys() {
             if !table.contains_key(public) {
                 state.live.remove(public);
+                if state.registered.contains_key(public) {
+                    state.orphans.insert(public.clone());
+                }
             }
         }
         state.generations.insert(server.to_string(), table);
         Ok(())
-    }
-
-    fn unregister(&self, server: &str) {
-        self.bridge.unregister_server(server);
-    }
-}
-
-impl RegistryHandle {
-    /// The public names currently served for this handle's server.
-    pub fn served_names(&self) -> Vec<String> {
-        self.bridge.public_names(&self.server)
     }
 }
 
@@ -372,7 +480,6 @@ impl McpServerPlugin {
         if !claims.claim(&name) {
             return Err(format!("mcp server name `{name}` is already claimed"));
         }
-        let registry = Arc::new(RegistryHandle::new(bridge.clone(), name.clone()));
         let factory: Arc<dyn TransportFactory> = match &self.factory_override {
             Some(f) => f.clone(),
             None => Arc::new(RmcpFactory::with_gate(
@@ -381,6 +488,13 @@ impl McpServerPlugin {
             )),
         };
         let stop = CancellationToken::new();
+        // Unload (stop cancelled) disposes the handle: a late publish from
+        // an in-flight connection can no longer re-register tools.
+        let registry = Arc::new(RegistryHandle::with_dispose(
+            bridge.clone(),
+            name.clone(),
+            stop.clone(),
+        ));
 
         // First discovery must complete before the first turn: probe the
         // initial handshake + discovery synchronously.
@@ -398,22 +512,65 @@ impl McpServerPlugin {
         };
         let probe_stop_run = probe_stop.clone();
         let probe_factory = factory.clone();
+        let probe_name = name.clone();
         let probe = std::thread::Builder::new()
             .name(format!("harnless-mcp-probe-{name}"))
-            .spawn(move || probe_factory.run(probe_sink, probe_stop_run.clone()))
+            .spawn(move || {
+                let result = probe_factory.run(probe_sink, probe_stop_run.clone());
+                if let Err(e) = &result {
+                    // Surface the real handshake failure: the probe is
+                    // the strict start's only diagnostic moment.
+                    error!(server = %probe_name, detail = %e,
+                        "mcp probe transport failed before publishing a generation");
+                }
+                result
+            })
             .map_err(|e| e.to_string())?;
-        let outcome = wait_for_first(&first, self.probe_timeout, || probe.is_finished());
+        // `join` moves the handle, so park it in an Option the closure can
+        // take exactly once.
+        let probe = std::sync::Mutex::new(Some(probe));
+        let outcome = wait_for_first(&first, self.probe_timeout, || {
+            // Once the probe thread exits, recover its real error so the
+            // strict failure carries the factory's detail, not a generic
+            // "factory exited" placeholder.
+            let done = probe
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|p| p.is_finished());
+            if !done {
+                return None;
+            }
+            let handle = probe.lock().unwrap().take();
+            Some(
+                handle
+                    .map(|p| {
+                        p.join()
+                            .unwrap_or_else(|_| Err("probe thread panicked".to_string()))
+                    })
+                    .unwrap_or_else(|| {
+                        Err("factory exited before publishing a generation".to_string())
+                    }),
+            )
+        });
         // Either way the probe's job is done: it proved (or failed to
         // prove) the handshake. Cancel it so the supervisor's first `run`
         // owns the only live connection.
         probe_stop.cancel();
-        let _ = probe.join();
+        if let Some(handle) = probe.lock().unwrap().take() {
+            let _ = handle.join();
+        }
         match &outcome {
             Ok(()) => info!(server = %name, "mcp server activated"),
             Err(e) => {
                 if self.config.strict {
                     claims.release(&name);
                     stop.cancel();
+                    // The detail must reach the log: `RuntimeError`
+                    // messages are static, so this line is the only
+                    // carrier of the real failure reason.
+                    error!(server = %name, detail = %e,
+                        "mcp server failed to start (strict); plugin load failed");
                     return Err(format!("mcp server `{name}` failed to start: {e}"));
                 }
                 warn!(server = %name, reason = %e,
@@ -452,19 +609,20 @@ impl McpServerPlugin {
 }
 
 /// Wait for the first generation publication (Ok) or a terminal failure
-/// (Err). `factory_done` reports whether the probe thread has exited.
+/// (Err). `factory_exit` reports the probe thread's result once it has
+/// exited (so the real error detail survives the thread boundary).
 fn wait_for_first(
     first: &Arc<FirstGeneration>,
     timeout: Duration,
-    factory_done: impl Fn() -> bool,
+    mut factory_exit: impl FnMut() -> Option<Result<(), String>>,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = first.status.lock().clone() {
             return status;
         }
-        if factory_done() {
-            return Err("factory exited before publishing a generation".into());
+        if let Some(result) = factory_exit() {
+            return result;
         }
         if Instant::now() > deadline {
             return Err("timed out waiting for first generation".into());
@@ -522,9 +680,13 @@ impl Plugin for McpServerPlugin {
             )
         })?;
         let claims = ctx.get::<ServerClaims>().unwrap_or_default();
-        let mount = self
-            .activate(bridge.clone(), claims.clone())
-            .map_err(|e| RuntimeError::new("MCP_START_FAILED", describe(&e)))?;
+        let mount = self.activate(bridge.clone(), claims.clone()).map_err(|e| {
+            // The detail is logged here — this is the load boundary — and
+            // the RuntimeError keeps a stable code.
+            error!(server = %self.config.name, detail = %e,
+                "mcp server failed to start; plugin load failed");
+            RuntimeError::new("MCP_START_FAILED", "mcp server failed to start (see logs)")
+        })?;
         let fiber: Arc<Fiber> = ctx.fiber().expect("mcp plugin runs within a fiber");
         let server = mount.config.name.clone();
         let stop = mount.stop.clone();
@@ -542,13 +704,4 @@ impl Plugin for McpServerPlugin {
         ctx.provide(mount)?;
         Ok(())
     }
-}
-
-/// `RuntimeError` carries a static message; the failure detail is logged
-/// and a stable code is surfaced instead of leaking the string.
-fn describe(detail: &str) -> &'static str {
-    // The detail travels through the log line emitted by `activate`'s
-    // callers; the RuntimeError stays stable.
-    let _ = detail;
-    "mcp server failed to start (see logs)"
 }

@@ -92,6 +92,14 @@ pub enum SupervisorEvent {
         /// The server that came up.
         server: String,
     },
+    /// A connection was lost (or re-discovery failed) while the last-good
+    /// generation stays registered and failing.
+    Outage {
+        /// The server that dropped.
+        server: String,
+        /// What the connection reported.
+        reason: String,
+    },
     /// Reconnecting after `attempt` consecutive failures, in `delay`.
     Reconnect {
         /// Which consecutive failure this is (1-based).
@@ -186,7 +194,9 @@ pub fn supervise(
                     warn!(server = %server, "mcp supervisor stopped (reconnect disabled)");
                     return;
                 }
-                if failures >= cfg.max_attempts {
+                // `max_attempts` is the budget of *reconnects*; the
+                // initial connection is not charged against it.
+                if failures > cfg.max_attempts {
                     registry.unregister(&server);
                     observer.on_event(SupervisorEvent::Stopped {
                         attempts: failures,
@@ -234,7 +244,11 @@ impl GenerationSink for SupervisorSink {
     }
 
     fn outage(&self, reason: String) {
-        info!(server = %self.server, reason = %reason, "mcp connection outage");
+        self.observer.on_event(SupervisorEvent::Outage {
+            server: self.server.clone(),
+            reason: reason.clone(),
+        });
+        warn!(server = %self.server, reason = %reason, "mcp connection outage");
     }
 }
 
@@ -375,6 +389,27 @@ pub fn serve_fake_keepalive(
     Result<(), String>,
     Option<rmcp::service::Peer<rmcp::RoleClient>>,
 ) {
+    let (_tx, rx) = std::sync::mpsc::channel();
+    drop(rx);
+    serve_fake_keepalive_handoff(transport, sink, stop, server, call_timeout, gate, _tx)
+}
+
+/// The handoff form: after discovery publishes, the live peer is sent on
+/// `peer_tx` so a test thread can call through the connection while the
+/// serve call is still running.
+#[cfg(feature = "test-support")]
+pub fn serve_fake_keepalive_handoff(
+    transport: crate::test_support::FakeTransport,
+    sink: Arc<dyn GenerationSink>,
+    stop: CancellationToken,
+    server: String,
+    call_timeout: Duration,
+    gate: crate::projection::RichContentGate,
+    peer_tx: std::sync::mpsc::Sender<Peer<rmcp::RoleClient>>,
+) -> (
+    Result<(), String>,
+    Option<rmcp::service::Peer<rmcp::RoleClient>>,
+) {
     let cfg = McpServerConfig::new(
         server,
         crate::config::TransportConfig::Stdio {
@@ -387,10 +422,23 @@ pub fn serve_fake_keepalive(
     let _guard = bridge::runtime().enter();
     tokio::runtime::Handle::current().block_on(async move {
         let handler = BridgeHandler::new(sink.clone(), cfg.clone(), gate.clone());
-        let client = match handler.serve_with_ct(transport, stop.clone()).await {
-            Ok(c) => c,
-            Err(e) => return (Err(e.to_string()), None),
+        // Keep-alive mode: `serve_with_ct` tears a freshly-built service
+        // down the instant it sees an already-cancelled token, so when the
+        // token is pre-cancelled (the activation handoff shape) serve
+        // without the token and let the connection run until the fake's
+        // transport dies.
+        let client = if stop.is_cancelled() {
+            match handler.serve(transport).await {
+                Ok(c) => c,
+                Err(e) => return (Err(format!("keepalive serve: {e}")), None),
+            }
+        } else {
+            match handler.serve_with_ct(transport, stop.clone()).await {
+                Ok(c) => c,
+                Err(e) => return (Err(e.to_string()), None),
+            }
         };
+
         let tools = match discover(client.peer(), call_timeout).await {
             Ok(t) => t,
             Err(e) => return (Err(e.to_string()), None),
@@ -398,6 +446,8 @@ pub fn serve_fake_keepalive(
         let peer = client.peer().clone();
         let generation = build_generation(&cfg.name, tools, peer.clone(), call_timeout, &gate);
         sink.publish(generation);
+        let _ = peer_tx.send(peer.clone());
+
         // With a keep-alive peer the connection must outlive `stop`: the
         // probe's stop token is cancelled the moment activation completes,
         // and the test's calls still need this peer. Otherwise stop ends
@@ -418,6 +468,13 @@ pub fn serve_fake_keepalive(
         };
         (outcome, Some(peer))
     })
+}
+
+/// Open the configured transport (test-visible wrapper over
+/// [`open_transport`] so config-knob coverage can assert both variants
+/// construct and open without a live endpoint).
+pub fn try_open_transport(cfg: &McpServerConfig) -> Result<(), String> {
+    open_transport(cfg).map(|_| ())
 }
 
 /// Open the configured transport.
@@ -587,6 +644,58 @@ pub(crate) fn build_generation(
         .collect()
 }
 
+/// Build a [`CallBody`] for tests: the same body the generation uses, so
+/// the timeout/cancellation path is exercised exactly as registered.
+/// Serve a fake connection on a helper thread and hand back the live peer
+/// the moment discovery published — the exact moment calls can flow. The
+/// connection runs until its transport dies.
+#[cfg(feature = "test-support")]
+pub fn serve_fake_peer_now(
+    transport: crate::test_support::FakeTransport,
+    server: String,
+    call_timeout: Duration,
+) -> Peer<rmcp::RoleClient> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let stop = CancellationToken::new();
+        stop.cancel(); // keep-alive shape (post-handoff)
+        let _ = serve_fake_keepalive_handoff(
+            transport,
+            Arc::new(NoopSink),
+            stop,
+            server,
+            call_timeout,
+            crate::projection::RichContentGate::closed(),
+            tx,
+        );
+    });
+    rx.recv().expect("handoff sender dropped before publishing")
+}
+
+/// A sink that ignores everything (peer-only test connections).
+#[cfg(feature = "test-support")]
+struct NoopSink;
+
+#[cfg(feature = "test-support")]
+impl GenerationSink for NoopSink {
+    fn publish(&self, _tools: Generation) {}
+    fn outage(&self, _reason: String) {}
+}
+
+pub fn call_body_for_test(
+    raw: String,
+    peer: Peer<rmcp::RoleClient>,
+    timeout: Duration,
+) -> Arc<dyn harnless_seams::ToolBody> {
+    Arc::new(CallBody {
+        raw,
+        peer,
+        timeout,
+        output_schema: None,
+        gate: crate::projection::RichContentGate::closed(),
+    })
+}
+
 /// A tool body that forwards to the MCP server under the raw wire name.
 pub(crate) struct CallBody {
     pub raw: String,
@@ -632,15 +741,79 @@ impl ToolBody for CallBody {
             s.spawn(move || {
                 let _guard = bridge::runtime().enter();
                 tokio::runtime::Handle::current().block_on(async move {
-                    let result = tokio::time::timeout(timeout, peer.call_tool(params))
+                    // Cancellable request path with the timeout carried
+                    // in the request options: on timeout rmcp's request
+                    // handle sends the MCP `notifications/cancelled`
+                    // notification for this request id, so the server
+                    // stops working on the call instead of the future
+                    // simply being dropped server-blind.
+                    let request = rmcp::model::ClientRequest::CallToolRequest(
+                        rmcp::model::Request::new(params),
+                    );
+                    // Carry no timeout in the request options (that path
+                    // would also fire on progress-reset bookkeeping); drive
+                    // the wait with an explicit timeout and cancel the
+                    // request ourselves so `notifications/cancelled` is
+                    // sent for this exact request id.
+                    let options = rmcp::service::PeerRequestOptions::no_options();
+                    let handle = peer
+                        .send_cancellable_request(request, options)
                         .await
-                        .map_err(|_| {
-                            SeamError::new(
-                                ErrorCode::ToolTimeout,
-                                format!("mcp call {raw} timed out"),
-                            )
-                        })?
                         .map_err(|e| SeamError::new(ErrorCode::ProviderFailure, e.to_string()))?;
+                    // Split the handle: wait on the response channel with
+                    // our own timeout; on expiry send the MCP
+                    // `notifications/cancelled` for this exact request id
+                    // before surfacing the timeout.
+                    let rmcp::service::RequestHandle {
+                        mut rx, peer, id, ..
+                    } = handle;
+                    let response = tokio::time::timeout(timeout, &mut rx).await;
+                    let response = match response {
+                        Err(_elapsed) => {
+                            let notification =
+                                rmcp::model::ClientNotification::CancelledNotification(
+                                    rmcp::model::Notification::new(
+                                        rmcp::model::CancelledNotificationParam::new(
+                                            Some(id),
+                                            Some("call timeout".to_string()),
+                                        ),
+                                    ),
+                                );
+                            let _ = peer.send_notification(notification).await;
+                            return Err(SeamError::new(
+                                ErrorCode::ToolTimeout,
+                                format!("mcp call {raw} timed out; cancellation sent"),
+                            ));
+                        }
+                        Ok(Err(_send_err)) => {
+                            return Err(SeamError::new(
+                                ErrorCode::ProviderFailure,
+                                "mcp response channel closed",
+                            ))
+                        }
+                        Ok(Ok(response)) => response,
+                    };
+                    let result = match response {
+                        Ok(rmcp::model::ServerResult::CallToolResult(result)) => result,
+                        Ok(other) => {
+                            return Err(SeamError::new(
+                                ErrorCode::ProviderFailure,
+                                format!("unexpected server result for {raw}: {other:?}"),
+                            ))
+                        }
+                        Err(rmcp::service::ServiceError::Timeout { .. }) => {
+                            return Err(SeamError::new(
+                                ErrorCode::ToolTimeout,
+                                format!("mcp call {raw} timed out; cancellation sent"),
+                            ))
+                        }
+                        Err(other) => {
+                            return Err(SeamError::new(
+                                ErrorCode::ProviderFailure,
+                                other.to_string(),
+                            ))
+                        }
+                    };
                     projection::project(result, schema.as_ref(), &gate)
                 })
             })

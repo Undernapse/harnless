@@ -147,6 +147,23 @@ pub fn fake_server(responder: Responder) -> FakeServer {
                 }
                 msg = to_fake_rx.next() => {
                     let Some(msg) = msg else { break };
+                    // Record every client message — including
+                    // notifications, which carry no id and are not
+                    // requests — so tests can observe cancellation.
+                    // Record notifications (no id) explicitly; requests go
+                    // through decode_client_request below.
+                    if let Ok(wire) = serde_json::to_value(&msg) {
+                        let is_notification = wire.get("method").and_then(Value::as_str).is_some()
+                            && wire.get("id").is_none();
+                        if is_notification {
+                            seen2.lock().push(Request {
+                                id: Value::Null,
+                                method: wire.get("method").and_then(Value::as_str).unwrap_or("").to_string(),
+                                params: wire.get("params").cloned().unwrap_or(Value::Null),
+                            });
+                            continue;
+                        }
+                    }
                     let Some((id, req)) = decode_client_request(&msg) else { continue };
                     let decoded = Request {
                         id: serde_json::to_value(&id).unwrap_or(Value::Null),

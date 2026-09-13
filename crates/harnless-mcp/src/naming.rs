@@ -91,28 +91,26 @@ fn trim_separators(name: &str) -> String {
 
 /// Deterministically disambiguate a set of raw names for one server.
 ///
-/// Returns `(raw, public)` pairs in the input order. Any raw name whose
-/// base public name is not unique within the batch gets
-/// `_<hash>` (8 hex digits of the FNV-1a digest of the raw pair) appended;
-/// if the suffixed name would breach the length limit, the base is shortened
-/// to make room for the suffix. The suffix depends only on `(server, raw)`,
-/// so a re-sync of the same tool set produces the identical assignment.
+/// Returns `(raw, public)` pairs in the input order. Suffixing is decided
+/// from the `(server, raw)` pair *alone* — never from batch membership:
+/// any raw whose base public name is lossy (normalization or truncation
+/// changed it, so other raws could share it) carries `_<hash>` (8 hex
+/// digits of the FNV-1a digest of the raw pair). A tool's public name is
+/// therefore stable across re-syncs even when a colliding sibling
+/// disappears. If the suffixed name would breach the length limit, the
+/// base is shortened to make room for the suffix.
 pub fn public_names(server: &str, raws: &[String]) -> Vec<(String, String)> {
-    let bases: Vec<String> = raws.iter().map(|raw| public_name(server, raw)).collect();
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for base in &bases {
-        *counts.entry(base.clone()).or_insert(0) += 1;
-    }
     let mut used: BTreeSet<String> = BTreeSet::new();
     raws.iter()
-        .zip(bases)
-        .map(|(raw, base)| {
-            let name = if counts[&base] > 1 {
+        .map(|raw| {
+            let base = public_name(server, raw);
+            let lossy = lossy_pair(server, raw);
+            let name = if lossy {
                 let tagged = with_suffix(&base, &suffix(server, raw));
                 // A deterministic suffix must never be dropped: if two
-                // suffixed names still collide (astronomically unlikely and
-                // only within one batch), the later one takes the next
-                // ordinal so the batch stays injective.
+                // suffixed names still collide (astronomically unlikely
+                // and only within one batch), the later one takes the
+                // next ordinal so the batch stays injective.
                 let mut name = tagged.clone();
                 let mut ordinal = 2;
                 while used.contains(&name) {
@@ -130,6 +128,27 @@ pub fn public_names(server: &str, raws: &[String]) -> Vec<(String, String)> {
             (raw.clone(), name)
         })
         .collect()
+}
+
+/// Whether `public_name(server, raw)` had to alter the pair: a character
+/// was rewritten/dropped, or the name was truncated to the length limit.
+/// A lossy base is not a faithful rendering of `(server, raw)` — another
+/// raw could normalize to the same thing — so it carries the suffix.
+/// Decided from the pair alone, never from batch membership.
+fn lossy_pair(server: &str, raw: &str) -> bool {
+    let joined = format!(
+        "mcp{SEPARATOR}{}{SEPARATOR}{}",
+        normalize_segment(server),
+        normalize_segment(raw)
+    );
+    let trimmed = trim_separators(&joined);
+    // Truncation: the untrimmed join exceeded the cap.
+    let truncated = joined.len() > MAX_NAME_LEN;
+    // Rewritten: the normalized segments differ from the raw inputs, or
+    // trimming removed characters.
+    let rewritten =
+        normalize_segment(server) != server || normalize_segment(raw) != raw || trimmed != joined;
+    truncated || rewritten
 }
 
 /// Append `_<hash>`, shortening `base` as needed to stay within the limit.

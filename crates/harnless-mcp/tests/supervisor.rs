@@ -169,9 +169,10 @@ fn noop_sleep() -> Arc<dyn Fn(Duration) + Send + Sync> {
 
 #[test]
 fn outage_backoff_schedule_doubles_to_ceiling_then_stops_at_budget() {
-    // Six failures with ceiling 800ms and budget 5: delays 100/200/400/800
-    // then stop (attempt 5 exhausts the budget).
-    let factory = ScriptedFactory::new(vec![Outcome::Fail; 5]);
+    // Ceiling 800ms, budget 5: five reconnects (100/200/400/800/800) —
+    // `max_attempts` counts reconnects, the initial connection is free —
+    // then the sixth loss exhausts the budget and the supervisor stops.
+    let factory = ScriptedFactory::new(vec![Outcome::Fail; 6]);
     let registry = Arc::new(RecordingRegistry::default());
     let observer = Arc::new(RecordingObserver::default());
     supervise(
@@ -197,11 +198,12 @@ fn outage_backoff_schedule_doubles_to_ceiling_then_stops_at_budget() {
             Duration::from_millis(200),
             Duration::from_millis(400),
             Duration::from_millis(800),
+            Duration::from_millis(800),
         ],
         "backoff must double to the ceiling"
     );
     match events.last().unwrap() {
-        SupervisorEvent::Stopped { attempts, .. } => assert_eq!(*attempts, 5),
+        SupervisorEvent::Stopped { attempts, .. } => assert_eq!(*attempts, 6),
         other => panic!("expected Stopped, got {other:?}"),
     }
     assert_eq!(
@@ -244,7 +246,8 @@ fn surviving_past_the_ceiling_resets_the_budget() {
         .collect();
     // Losses 1 and 2: delays 100, 200. The reconnect survives past the
     // ceiling, resetting the budget, so the next loss is attempt 1 again →
-    // delay 100, not 400.
+    // delay 100, not 400. Budget 3 grants a fifth reconnect (400) before
+    // the fourth consecutive failure stops the supervisor.
     assert_eq!(
         delays,
         vec![
@@ -252,13 +255,15 @@ fn surviving_past_the_ceiling_resets_the_budget() {
             Duration::from_millis(200),
             Duration::from_millis(100),
             Duration::from_millis(200),
+            Duration::from_millis(400),
         ]
     );
-    // The fresh budget after the reset is again 3, so the run continues
-    // past the first post-reset loss and stops only when the *new* budget
-    // exhausts at attempt 3 — proving the counter was reset, not capped.
+    // The fresh budget after the reset is again 3 reconnects, so the run
+    // continues past the first post-reset loss and stops only when the
+    // *new* budget exhausts (4 consecutive failures) — proving the counter
+    // was reset, not capped.
     match events.last().unwrap() {
-        SupervisorEvent::Stopped { attempts, .. } => assert_eq!(*attempts, 3),
+        SupervisorEvent::Stopped { attempts, .. } => assert_eq!(*attempts, 4),
         other => panic!("expected Stopped, got {other:?}"),
     }
 }
@@ -298,14 +303,19 @@ fn a_run_that_survived_past_the_ceiling_resets_the_attempt_counter() {
         .collect();
     // Loss 1 → delay 100. The reconnect survives past the ceiling, the
     // budget resets, and the next loss is attempt 1 again → delay 100, not
-    // 200. The fresh budget (2) then exhausts after one more doubling.
+    // 200. The fresh budget (2 reconnects) then doubles once more (200)
+    // before the third consecutive failure stops the supervisor.
     assert_eq!(
         delays,
-        vec![Duration::from_millis(100), Duration::from_millis(100)],
+        vec![
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        ],
         "budget reset must restart the backoff at the initial delay"
     );
     match events.last().unwrap() {
-        SupervisorEvent::Stopped { attempts, .. } => assert_eq!(*attempts, 2),
+        SupervisorEvent::Stopped { attempts, .. } => assert_eq!(*attempts, 3),
         other => panic!("expected Stopped, got {other:?}"),
     }
 }
@@ -395,4 +405,50 @@ impl GenerationSink for TestSink {
         let _ = self.registry.replace_generation("srv", tools);
     }
     fn outage(&self, _reason: String) {}
+}
+
+/// Config-knob coverage: both transport variants must be constructible
+/// with their full field sets, and `open_transport` must accept the HTTP
+/// shape (URL + headers) without a live endpoint — opening the transport
+/// is lazy, so the failure mode is connection loss, not a panic.
+#[test]
+fn transport_knobs_construct_and_open_both_transports() {
+    use harnless_mcp::config::{McpServerConfig, TransportConfig};
+
+    // stdio: program + args + spawn env.
+    let stdio = McpServerConfig::new(
+        "local",
+        TransportConfig::Stdio {
+            program: "mcp-server".to_string(),
+            args: vec!["--stdio".to_string(), "--verbose".to_string()],
+            env: std::collections::BTreeMap::from([("API_KEY".to_string(), "secret".to_string())]),
+        },
+    );
+    assert!(matches!(stdio.transport, TransportConfig::Stdio { .. }));
+
+    // http: URL + headers.
+    let http = McpServerConfig::new(
+        "remote",
+        TransportConfig::Http {
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            headers: std::collections::BTreeMap::from([(
+                "Authorization".to_string(),
+                "Bearer t".to_string(),
+            )]),
+        },
+    );
+    assert!(matches!(http.transport, TransportConfig::Http { .. }));
+
+    // Opening the HTTP transport must not panic and must not require a
+    // live endpoint (the endpoint is contacted on serve, not open).
+    // `open_transport` spawns the transport worker, so it needs a runtime.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let opened = rt.block_on(async { harnless_mcp::supervisor::try_open_transport(&http) });
+    assert!(
+        opened.is_ok(),
+        "HTTP transport must open lazily: {opened:?}"
+    );
 }
