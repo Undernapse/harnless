@@ -7,6 +7,7 @@ members = [
     "crates/harnless-fs-local",
     "crates/harnless-llm-openai",
     "crates/harnless-llm-replay",
+    "crates/harnless-cli",
     "crates/harnless-conformance",
 ]
 

@@ -1,0 +1,22 @@
+[package]
+name = "harnless-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The harnless CLI (hrls): profile-driven headless runner, REPL entry, and config dump."
+
+[dependencies]
+harnless-runtime = { path = "../harnless-runtime" }
+harnless-seams = { path = "../harnless-seams" }
+harnless-agent = { path = "../harnless-agent" }
+harnless-llm-replay = { path = "../harnless-llm-replay" }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+[[bin]]
+name = "hrls"
+path = "src/main.rs"
