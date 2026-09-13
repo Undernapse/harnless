@@ -563,34 +563,43 @@ impl ConfigComposer {
             if row.plugin.starts_with(DOC_PLUGIN_PREFIX) {
                 match row.id.as_str() {
                     SYSTEM_PROMPT_ROW_KEY => {
-                        let value = row.config.as_str().ok_or_else(|| {
-                            CliError::new(
-                                "plugin-build-failed",
-                                format!(
-                                    "system_prompt row config must be a string: {:?}",
-                                    row.config
-                                ),
-                            )
-                        })?;
-                        system_prompt = Some(value.to_string());
-                    }
-                    TOOLS_ROW_KEY => {
-                        let items = row.config.as_sequence().ok_or_else(|| {
-                            CliError::new(
-                                "plugin-build-failed",
-                                format!("tools row config must be a sequence: {:?}", row.config),
-                            )
-                        })?;
-                        for item in items {
-                            let name = item.as_str().ok_or_else(|| {
-                                CliError::new(
+                        // A null value is YAML's "no value": the field
+                        // stays unset, exactly as a null-valued key did in
+                        // the legacy field-wise merge. A non-string is the
+                        // authoring error.
+                        match &row.config {
+                            serde_yaml::Value::Null => {}
+                            serde_yaml::Value::String(value) => {
+                                system_prompt = Some(value.clone());
+                            }
+                            other => {
+                                return Err(CliError::new(
                                     "plugin-build-failed",
-                                    format!("tools entries must be strings: {item:?}"),
-                                )
-                            })?;
-                            tools.push(name.to_string());
+                                    format!("system_prompt row config must be a string: {other:?}"),
+                                ));
+                            }
                         }
                     }
+                    TOOLS_ROW_KEY => match &row.config {
+                        serde_yaml::Value::Null => {}
+                        serde_yaml::Value::Sequence(items) => {
+                            for item in items {
+                                let name = item.as_str().ok_or_else(|| {
+                                    CliError::new(
+                                        "plugin-build-failed",
+                                        format!("tools entries must be strings: {item:?}"),
+                                    )
+                                })?;
+                                tools.push(name.to_string());
+                            }
+                        }
+                        other => {
+                            return Err(CliError::new(
+                                "plugin-build-failed",
+                                format!("tools row config must be a sequence: {other:?}"),
+                            ));
+                        }
+                    },
                     other => {
                         return Err(CliError::new(
                             "unknown-plugin",
@@ -651,15 +660,24 @@ impl ConfigComposer {
     /// unwinds (dropping the registry alone does not dispose fibers) — so a
     /// failed boot leaves no half-mounted service holding a context.
     pub fn mount_config(&self, doc: &ConfigDoc) -> Result<CompositionMount, CliError> {
-        use harnless_config::doc::DOC_PLUGIN_PREFIX;
+        use harnless_config::doc::{DOC_PLUGIN_PREFIX, SYSTEM_PROMPT_ROW_KEY, TOOLS_ROW_KEY};
         let ctx = Context::root();
         let mut guard = harnless_config::MountGuard::new();
         let mut spine: Option<Arc<Registry>> = None;
         let mut model: Option<ModelHandle> = None;
         for row in &doc.rows {
             // A field-wise patch's document rows are plan content, not
-            // services — the same rows `plan` projects; nothing mounts them.
+            // services — but they are validated here exactly as `plan`
+            // validates them, so a document that mounts is a document the
+            // plan projection accepts (dump-equals-mount's error clause).
             if row.plugin.starts_with(DOC_PLUGIN_PREFIX) {
+                if !matches!(row.id.as_str(), SYSTEM_PROMPT_ROW_KEY | TOOLS_ROW_KEY) {
+                    guard.dispose();
+                    return Err(CliError::new(
+                        "unknown-plugin",
+                        format!("document row {:?} is not a known document field", row.id),
+                    ));
+                }
                 continue;
             }
             match self.specs.seam(&row.plugin) {
@@ -1099,5 +1117,38 @@ mod tests {
             .mount_config(&doc)
             .expect("doc rows are inert at mount");
         assert!(mounted.ctx.get::<harnless_agent::AgentLoop>().is_some());
+    }
+
+    /// Dump-equals-mount's error-semantics clause: plan and `mount_config`
+    /// must agree about which documents are valid. A null-valued doc field
+    /// (`--patch system_prompt:`) means "unset" — the profile's own value
+    /// survives — and an unknown `doc:`-namespaced row is an
+    /// `unknown-plugin` failure in both halves, never plan-only.
+    #[test]
+    fn plan_and_mount_agree_on_document_rows() {
+        let composer = composer();
+        let default_prompt = composer
+            .compose_config("default", &[])
+            .and_then(|doc| composer.plan(&doc))
+            .map(|plan| plan.system_prompt)
+            .unwrap();
+        let nulls = parse_overlays(Some("system_prompt:\ntools:\n")).unwrap();
+        let doc = composer.compose_config("default", &nulls).unwrap();
+        let plan = composer.plan(&doc).expect("a null doc field is unset");
+        assert_eq!(plan.system_prompt, default_prompt);
+        assert!(composer.mount_config(&doc).is_ok());
+
+        let mystery = vec![harnless_config::doc::Layer::rows(
+            "mystery",
+            vec![Row::new("mystery", "doc:mystery")],
+        )];
+        let doc = composer.compose_config("default", &mystery).unwrap();
+        let plan_err = composer.plan(&doc).unwrap_err();
+        assert_eq!(plan_err.code, "unknown-plugin");
+        let mount_err = composer
+            .mount_config(&doc)
+            .err()
+            .expect("an unknown doc: row fails mount too");
+        assert_eq!(mount_err.code, "unknown-plugin");
     }
 }

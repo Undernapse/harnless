@@ -171,7 +171,7 @@ impl Layer {
     /// Build a layer from an already-parsed YAML value.
     pub fn from_value(value: Value) -> crate::error::Result<Self> {
         use crate::error::{ConfigError, Stage};
-        reject_tags(&value, false, "<root>")?;
+        reject_tags(&value, false, "<root>", Stage::Patch)?;
         match value {
             Value::Null => Ok(Layer {
                 name: String::new(),
@@ -204,7 +204,13 @@ impl Layer {
                     return Ok(Layer::patch(String::new(), vec![op]));
                 }
                 if let Some(layer) = decode::<Layer>(value.clone()).ok() {
-                    return Ok(layer);
+                    // `name` defaults, so `name: x` alone decodes as a
+                    // contentless layer. An overlay that contributes nothing
+                    // is a typo, not a no-op — reject it so the caller's
+                    // discard-by-emptiness never sees it.
+                    if !layer.rows.is_empty() || !layer.patch.is_empty() {
+                        return Ok(layer);
+                    }
                 }
                 if let Some(row) = decode::<Row>(value.clone()).ok() {
                     return Ok(Layer::rows(String::new(), vec![row]));
@@ -388,17 +394,25 @@ fn decode<T: serde::de::DeserializeOwned>(value: Value) -> serde_yaml::Result<T>
 }
 
 /// Reject YAML tags outside a row's opaque `config`, which is plugin-owned
-/// data and may carry anything.
+/// data and may carry anything (as values only — tagged keys are rejected
+/// everywhere; see the mapping arm).
 ///
 /// `in_row_config` flips once inside a row mapping's `config` key and stays
 /// set below it; everything above that level is composition vocabulary,
-/// where a tag is an authoring error, not data.
-fn reject_tags(value: &Value, in_row_config: bool, path: &str) -> crate::error::Result<()> {
+/// where a tag is an authoring error, not data. `stage` names the loading
+/// document's step (`Compose` for bundle/profile/config files, `Patch` for
+/// overlay layers) so the error reports the file kind that actually broke.
+fn reject_tags(
+    value: &Value,
+    in_row_config: bool,
+    path: &str,
+    stage: crate::error::Stage,
+) -> crate::error::Result<()> {
     match value {
         Value::Tagged(tagged) => {
             if !in_row_config {
                 return Err(crate::error::ConfigError::new(
-                    crate::error::Stage::Patch,
+                    stage,
                     "bad-tag",
                     format!(
                         "YAML tag {:?} at {path} is not allowed; only a row's \
@@ -407,19 +421,30 @@ fn reject_tags(value: &Value, in_row_config: bool, path: &str) -> crate::error::
                     ),
                 ));
             }
-            reject_tags(&tagged.value, true, path)?;
+            reject_tags(&tagged.value, true, path, stage)?;
         }
         Value::Sequence(items) => {
             for (i, item) in items.iter().enumerate() {
-                reject_tags(item, in_row_config, &format!("{path}[{i}]"))?;
+                reject_tags(item, in_row_config, &format!("{path}[{i}]"), stage)?;
             }
         }
         Value::Mapping(map) => {
             let row = is_row_mapping(map);
             for (key, val) in map {
+                // A tagged key is rejected everywhere — even inside a row's
+                // opaque config — because a YAML emitter cannot represent
+                // one: accepting it would let a composed document panic
+                // `dump()`, breaking "a document that composes can dump".
+                if matches!(key, Value::Tagged(_)) {
+                    return Err(crate::error::ConfigError::new(
+                        stage,
+                        "bad-tag",
+                        format!("YAML tag on a mapping key at {path} is not representable"),
+                    ));
+                }
                 let key_name = key.as_str().unwrap_or("");
                 let child_in_config = in_row_config || (row && key_name == "config");
-                reject_tags(val, child_in_config, &format!("{path}.{key_name}"))?;
+                reject_tags(val, child_in_config, &format!("{path}.{key_name}"), stage)?;
             }
         }
         _ => {}
@@ -451,7 +476,7 @@ fn parse(yaml: &str) -> crate::error::Result<Value> {
     let value = serde_yaml::from_str::<Value>(text).map_err(|e| {
         crate::error::ConfigError::new(crate::error::Stage::Compose, "bad-yaml", e.to_string())
     })?;
-    reject_tags(&value, false, "<root>")?;
+    reject_tags(&value, false, "<root>", crate::error::Stage::Compose)?;
     Ok(value)
 }
 
@@ -638,5 +663,49 @@ mod tests {
         assert_eq!(err.code, "bad-tag");
         // A tag inside a row's opaque config is plugin-owned data: legal.
         assert!(Layer::load("rows:\n- id: a\n  plugin: p\n  config: !mytag\n").is_ok());
+    }
+
+    /// A tagged mapping key is unrepresentable in a YAML dump (the emitter
+    /// rejects it), so accepting one inside a row's opaque config would
+    /// let a composed document panic `dump()`. Tags are legal only as
+    /// values, never as keys.
+    #[test]
+    fn a_tagged_mapping_key_is_a_typed_error() {
+        let err = ConfigDoc::load(
+            "name: d\nrows:\n- id: a\n  plugin: p\n  config:\n    ? !mytag k\n    : v\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad-tag");
+        // Outside config a tagged key is rejected too, as bad-tag not a
+        // later shape error.
+        let err = ConfigDoc::load("name: d\n? !mytag rows\n: []\n").unwrap_err();
+        assert_eq!(err.code, "bad-tag");
+    }
+
+    /// The stage names which step of booting broke: a tag in a bundle or
+    /// profile document is a compose-stage failure, not a patch failure —
+    /// every other failure from those loaders reports `Compose`.
+    #[test]
+    fn a_tag_reports_the_loading_documents_stage() {
+        let err = BundleDoc::load("name: b\nrows:\n- id: a\n  plugin: !mytag\n").unwrap_err();
+        assert_eq!(err.code, "bad-tag");
+        assert_eq!(err.stage, crate::error::Stage::Compose);
+        let err = ProfileSpec::load("name: p\nrows:\n- id: a\n  plugin: !mytag\n").unwrap_err();
+        assert_eq!(err.code, "bad-tag");
+        assert_eq!(err.stage, crate::error::Stage::Compose);
+        let err = Layer::load("rows:\n- id: a\n  plugin: !mytag\n").unwrap_err();
+        assert_eq!(err.code, "bad-tag");
+        assert_eq!(err.stage, crate::error::Stage::Patch);
+    }
+
+    /// A `--patch name: typo` overlay must not silently do nothing: `name`
+    /// is profile identity, never patch content, so it is a typed error —
+    /// matching the neighbouring `name` + content case.
+    #[test]
+    fn a_name_only_overlay_is_a_typed_error() {
+        assert!(Layer::load("name: x\n").is_err());
+        // A real layer document (with rows or patch) keeps its name.
+        let layer = Layer::load("name: real\nrows:\n- id: a\n  plugin: p\n").unwrap();
+        assert_eq!(layer.name, "real");
     }
 }

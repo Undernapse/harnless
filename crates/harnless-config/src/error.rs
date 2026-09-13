@@ -12,7 +12,7 @@ use std::fmt;
 ///
 /// Stable string spellings (`compose`, `substitute`, `patch`, `mount`) so a
 /// recorded failure names the same stage a live boot failed in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
     /// Resolving the layer set: reading profile/bundle/home files, resolving
     /// a named profile, or requiring a bundle.
