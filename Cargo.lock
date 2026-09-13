@@ -406,6 +406,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnless-credentials-local"
+version = "0.1.0"
+dependencies = [
+ "harnless-conformance",
+ "harnless-seams",
+ "libc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "harnless-exec-bash"
 version = "0.1.0"
 dependencies = [
@@ -487,6 +501,31 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "harnless-settings-file"
+version = "0.1.0"
+dependencies = [
+ "harnless-conformance",
+ "harnless-seams",
+ "parking_lot",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+]
+
+[[package]]
+name = "harnless-storage-jsonl"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "harnless-conformance",
+ "harnless-seams",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
