@@ -85,7 +85,12 @@ fn argv_handed_to_sandbox_is_byte_identical_to_argv_spawned() {
     // And it is the exact outer shell invocation, command verbatim.
     assert_eq!(
         seen.as_slice(),
-        [SHELL_PROGRAM.to_string(), "-c".to_string(), command.to_string()].as_slice()
+        [
+            SHELL_PROGRAM.to_string(),
+            "-c".to_string(),
+            command.to_string()
+        ]
+        .as_slice()
     );
     // The sandbox's bytes are the same bytes, not just equal after
     // normalisation: compare the raw UTF-8 of the command element.
@@ -112,14 +117,27 @@ fn denied_command_surfaces_an_auditable_enforced_result() {
     let err = shell
         .exec(
             "touch /tmp/must-not-exist-13",
-            &policy("/nonexistent/root-for-conformance", SandboxMode::SandboxLocal),
+            &policy(
+                "/nonexistent/root-for-conformance",
+                SandboxMode::SandboxLocal,
+            ),
         )
         .expect_err("refusal must not pass");
-    assert_eq!(ErrorCode::SandboxDenied, err.code, "refusal must be sandbox-denied: {err}");
+    assert_eq!(
+        ErrorCode::SandboxDenied,
+        err.code,
+        "refusal must be sandbox-denied: {err}"
+    );
     // Auditable: the error names the refusing mode *and* carries the reason
     // the sandbox gave for the verdict.
-    assert!(err.message.contains("mode=sandbox-local"), "unenforceable: {err}");
-    assert!(err.message.contains("cannot be established"), "unexplained refusal: {err}");
+    assert!(
+        err.message.contains("mode=sandbox-local"),
+        "unenforceable: {err}"
+    );
+    assert!(
+        err.message.contains("cannot be established"),
+        "unexplained refusal: {err}"
+    );
     // And nothing was spawned — the refusal happened before the subprocess.
     assert!(spawned.lock().is_empty(), "denied command still spawned");
 }
@@ -189,10 +207,7 @@ fn consumer_routes_on_allowed_not_on_confined_or_mode() {
         }),
     );
     let err = shell
-        .exec(
-            "true",
-            &policy("/tmp", SandboxMode::SandboxLocal),
-        )
+        .exec("true", &policy("/tmp", SandboxMode::SandboxLocal))
         .expect_err("allowed=false must refuse regardless of confined/mode");
     assert_eq!(ErrorCode::SandboxDenied, err.code);
     assert!(spawned.lock().is_empty(), "refused command still spawned");

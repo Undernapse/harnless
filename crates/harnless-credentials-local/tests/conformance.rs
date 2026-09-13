@@ -16,9 +16,10 @@ fn make() -> LocalCredentials {
     std::mem::forget(dir);
     LocalCredentials::builder()
         .path(path)
-        .flow(harnless_seams::credentials::CredentialKind::OAuth2, |_reference| {
-            Ok("conformance-secret".to_string())
-        })
+        .flow(
+            harnless_seams::credentials::CredentialKind::OAuth2,
+            |_reference| Ok("conformance-secret".to_string()),
+        )
         .build()
 }
 
@@ -26,7 +27,10 @@ fn make() -> LocalCredentials {
 fn credentials_conformance_is_clean() {
     let provider = make();
     let violations = harnless_conformance::check_credentials(&provider);
-    assert!(violations.is_empty(), "conformance violations: {violations:?}");
+    assert!(
+        violations.is_empty(),
+        "conformance violations: {violations:?}"
+    );
 }
 
 #[test]
@@ -42,5 +46,8 @@ fn credentials_conformance_after_a_write_is_clean() {
         )
         .expect("store");
     let violations = harnless_conformance::check_credentials(&provider);
-    assert!(violations.is_empty(), "conformance violations: {violations:?}");
+    assert!(
+        violations.is_empty(),
+        "conformance violations: {violations:?}"
+    );
 }

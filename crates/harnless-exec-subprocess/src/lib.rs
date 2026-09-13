@@ -16,7 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use harnless_seams::error::{ErrorCode, SeamError, Result};
+use harnless_seams::error::{ErrorCode, Result, SeamError};
 use harnless_seams::exec::{Spawn, SpawnHandle, Subprocess};
 
 /// Default per-stream capture cap: one mebibyte of retained bytes.
@@ -274,8 +274,7 @@ impl Reader {
                         match pipe.read(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => {
-                                let mut capture =
-                                    publisher.lock().expect("capture slot poisoned");
+                                let mut capture = publisher.lock().expect("capture slot poisoned");
                                 let room = max_output_bytes.saturating_sub(capture.bytes.len());
                                 let keep = n.min(room);
                                 capture.bytes.extend_from_slice(&buf[..keep]);

@@ -550,10 +550,56 @@ impl ConfigComposer {
     /// does with it (dump-equals-mount covers error semantics as well as
     /// bytes).
     pub fn plan(&self, doc: &ConfigDoc) -> Result<ProfileDoc, CliError> {
+        use harnless_config::doc::{DOC_PLUGIN_PREFIX, SYSTEM_PROMPT_ROW_KEY, TOOLS_ROW_KEY};
         let mut seams = Vec::new();
         let mut tools = Vec::new();
         let mut model = ModelSpec::None;
+        // A field-wise patch's `system_prompt:` outranks the profile's own
+        // document field, exactly as a later row outranks an earlier one.
+        let mut system_prompt = doc.system_prompt.clone();
         for row in &doc.rows {
+            // A field-wise patch's document rows are content, not services:
+            // they project onto the plan's fields and never mount.
+            if row.plugin.starts_with(DOC_PLUGIN_PREFIX) {
+                match row.id.as_str() {
+                    SYSTEM_PROMPT_ROW_KEY => {
+                        let value = row.config.as_str().ok_or_else(|| {
+                            CliError::new(
+                                "plugin-build-failed",
+                                format!(
+                                    "system_prompt row config must be a string: {:?}",
+                                    row.config
+                                ),
+                            )
+                        })?;
+                        system_prompt = Some(value.to_string());
+                    }
+                    TOOLS_ROW_KEY => {
+                        let items = row.config.as_sequence().ok_or_else(|| {
+                            CliError::new(
+                                "plugin-build-failed",
+                                format!("tools row config must be a sequence: {:?}", row.config),
+                            )
+                        })?;
+                        for item in items {
+                            let name = item.as_str().ok_or_else(|| {
+                                CliError::new(
+                                    "plugin-build-failed",
+                                    format!("tools entries must be strings: {item:?}"),
+                                )
+                            })?;
+                            tools.push(name.to_string());
+                        }
+                    }
+                    other => {
+                        return Err(CliError::new(
+                            "unknown-plugin",
+                            format!("document row {other:?} is not a known document field"),
+                        ));
+                    }
+                }
+                continue;
+            }
             match self.specs.seam(&row.plugin) {
                 Seam::Spine => {
                     // The spine plugin provides the whole core chain, so its
@@ -577,7 +623,7 @@ impl ConfigComposer {
             seams,
             model,
             tools,
-            system_prompt: doc.system_prompt.clone().unwrap_or_default(),
+            system_prompt: system_prompt.unwrap_or_default(),
         })
     }
 
@@ -605,11 +651,17 @@ impl ConfigComposer {
     /// unwinds (dropping the registry alone does not dispose fibers) — so a
     /// failed boot leaves no half-mounted service holding a context.
     pub fn mount_config(&self, doc: &ConfigDoc) -> Result<CompositionMount, CliError> {
+        use harnless_config::doc::DOC_PLUGIN_PREFIX;
         let ctx = Context::root();
         let mut guard = harnless_config::MountGuard::new();
         let mut spine: Option<Arc<Registry>> = None;
         let mut model: Option<ModelHandle> = None;
         for row in &doc.rows {
+            // A field-wise patch's document rows are plan content, not
+            // services — the same rows `plan` projects; nothing mounts them.
+            if row.plugin.starts_with(DOC_PLUGIN_PREFIX) {
+                continue;
+            }
             match self.specs.seam(&row.plugin) {
                 Seam::Spine => {
                     let registry = Arc::new(Registry::new());
@@ -775,7 +827,10 @@ mod tests {
     fn a_config_patch_overlay_swaps_the_model_row() {
         let composer = composer();
         let doc = composer
-            .compose("default", Some("op: set\nid: model\nconfig:\n  kind: none\n"))
+            .compose(
+                "default",
+                Some("op: set\nid: model\nconfig:\n  kind: none\n"),
+            )
             .unwrap();
         assert!(!doc.has_model());
         assert_eq!(
@@ -842,14 +897,21 @@ mod tests {
             "name: store\nrows:\n- id: store\n  plugin: storage-jsonl\n  config:\n    dir: ${home}/state\n",
         )
         .unwrap();
-        std::fs::write(dir.join("profiles/store.yml"), "name: store\nbundles:\n- store\n").unwrap();
+        std::fs::write(
+            dir.join("profiles/store.yml"),
+            "name: store\nbundles:\n- store\n",
+        )
+        .unwrap();
         let composer = ConfigComposer::with_dir_and_subst(
             Some(dir.clone()),
             Subst::new().with_home("/home/tester"),
             None,
         );
         let doc = composer.compose_config("store", &[]).unwrap();
-        assert_eq!(doc.row("store").unwrap().config["dir"], "/home/tester/state");
+        assert_eq!(
+            doc.row("store").unwrap().config["dir"],
+            "/home/tester/state"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -862,8 +924,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("profiles/b.yml"), "name: b\nbundles:\n- b\n").unwrap();
-        let composer =
-            ConfigComposer::with_dir_and_subst(Some(dir.clone()), Subst::new(), None);
+        let composer = ConfigComposer::with_dir_and_subst(Some(dir.clone()), Subst::new(), None);
         let err = composer.compose_config("b", &[]).unwrap_err();
         assert_eq!(err.code, "unknown-substitution");
         assert!(err.message.starts_with("substitute:"), "{}", err.message);
@@ -959,7 +1020,9 @@ mod tests {
     #[test]
     fn a_malformed_home_patch_is_reported_and_the_profile_still_boots() {
         let composer = ConfigComposer::built_in_with_home_patch(Some("op: set\nid: model\nbad: ["));
-        let doc = composer.compose("default", None).expect("last good config boots");
+        let doc = composer
+            .compose("default", None)
+            .expect("last good config boots");
         assert!(doc.has_model());
     }
 
@@ -968,26 +1031,19 @@ mod tests {
         let composer = ConfigComposer::built_in_with_home_patch(Some(
             "op: set\nid: model\nconfig:\n  kind: replay\n  provider: from-home\n",
         ));
-        let doc = composer.compose("default", None).unwrap();
+        let doc = composer.compose_config("default", &[]).unwrap();
         assert_eq!(
-            doc.model,
-            ModelSpec::Replay {
-                provider: "from-home".to_string(),
-                script: None
-            }
+            doc.row("model").unwrap().config["provider"],
+            serde_yaml::Value::String("from-home".to_string())
         );
-        let doc = composer
-            .compose(
-                "default",
-                Some("op: set\nid: model\nconfig:\n  kind: replay\n  provider: from-overlay\n"),
-            )
-            .unwrap();
+        let overlays = parse_overlays(Some(
+            "op: set\nid: model\nconfig:\n  kind: replay\n  provider: from-overlay\n",
+        ))
+        .unwrap();
+        let doc = composer.compose_config("default", &overlays).unwrap();
         assert_eq!(
-            doc.model,
-            ModelSpec::Replay {
-                provider: "from-overlay".to_string(),
-                script: None
-            }
+            doc.row("model").unwrap().config["provider"],
+            serde_yaml::Value::String("from-overlay".to_string())
         );
     }
 
@@ -1023,5 +1079,25 @@ mod tests {
                 script: None
             }
         );
+    }
+
+    /// A field-wise `--patch` overlay's document rows must project onto the
+    /// plan's `system_prompt`/`tools` fields — the legacy `--patch tools:…`
+    /// contract — and never reach the mount as services.
+    #[test]
+    fn a_field_wise_overlay_projects_onto_the_plan() {
+        let composer = composer();
+        let overlays =
+            parse_overlays(Some("system_prompt: be terse\ntools:\n- bash\n- read\n")).unwrap();
+        let doc = composer.compose_config("default", &overlays).unwrap();
+        let plan = composer.plan(&doc).expect("plan projects doc rows");
+        assert_eq!(plan.system_prompt, "be terse");
+        assert_eq!(plan.tools, vec!["bash", "read"]);
+        // The doc rows never appear as seams and never mount.
+        assert_eq!(plan.seams, SPINE_SEAMS);
+        let mounted = composer
+            .mount_config(&doc)
+            .expect("doc rows are inert at mount");
+        assert!(mounted.ctx.get::<harnless_agent::AgentLoop>().is_some());
     }
 }

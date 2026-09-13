@@ -6,9 +6,7 @@ use std::fs;
 use harnless_fs_local::{FsEditIntent, FsObserved, FsWriteIntent, Intent, LocalFileSystem};
 use harnless_runtime::events::{EventOptions, EventRegistry};
 use harnless_runtime::fiber::Fiber;
-use harnless_seams::{
-    Edit, ErrorCode, FileSystem, SeamError, TargetKey, VersionToken, WriteGuard,
-};
+use harnless_seams::{Edit, ErrorCode, FileSystem, SeamError, TargetKey, VersionToken, WriteGuard};
 use parking_lot::Mutex;
 use std::sync::Arc;
 

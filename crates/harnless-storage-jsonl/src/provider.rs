@@ -41,7 +41,13 @@ impl BackendNameExt for BackendName {
         let sanitized: String = self
             .0
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         if sanitized.is_empty() || sanitized.chars().all(|c| c == '.') {
             // Empty, or nothing but dots (`.`, `..`, `///`) — a name that
@@ -68,15 +74,24 @@ enum Entry {
 impl Entry {
     fn to_line(&self) -> harnless_seams::error::Result<String> {
         let obj = match self {
-            Entry::Set { key, value } => serde_json::json!({ "op": "set", "key": key, "value": value }),
+            Entry::Set { key, value } => {
+                serde_json::json!({ "op": "set", "key": key, "value": value })
+            }
             Entry::Delete { key } => serde_json::json!({ "op": "del", "key": key }),
         };
         serde_json::to_string(&obj).map_err(|e| {
-            SeamError::new(ErrorCode::IoError, format!("serializing storage entry: {e}"))
+            SeamError::new(
+                ErrorCode::IoError,
+                format!("serializing storage entry: {e}"),
+            )
         })
     }
 
-    fn from_line(line: &str, backend: &str, lineno: usize) -> harnless_seams::error::Result<Option<Self>> {
+    fn from_line(
+        line: &str,
+        backend: &str,
+        lineno: usize,
+    ) -> harnless_seams::error::Result<Option<Self>> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return Ok(None);
@@ -102,9 +117,14 @@ impl Entry {
         match op {
             "set" => {
                 let value = parsed.get("value").cloned().unwrap_or(Value::Null);
-                Ok(Some(Entry::Set { key: key.to_string(), value }))
+                Ok(Some(Entry::Set {
+                    key: key.to_string(),
+                    value,
+                }))
             }
-            "del" => Ok(Some(Entry::Delete { key: key.to_string() })),
+            "del" => Ok(Some(Entry::Delete {
+                key: key.to_string(),
+            })),
             other => Err(SeamError::new(
                 ErrorCode::IoError,
                 format!("backend {backend} line {lineno} has unknown op {other:?}"),
@@ -127,7 +147,9 @@ pub struct JsonlStorage {
 
 impl std::fmt::Debug for JsonlStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JsonlStorage").field("root", &self.root).finish_non_exhaustive()
+        f.debug_struct("JsonlStorage")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
     }
 }
 
@@ -141,7 +163,10 @@ impl JsonlStorage {
                 format!("creating storage root {}: {e}", root.display()),
             )
         })?;
-        Ok(Self { root, lock: parking_lot::Mutex::new(()) })
+        Ok(Self {
+            root,
+            lock: parking_lot::Mutex::new(()),
+        })
     }
 
     /// The hub root directory.
@@ -155,7 +180,10 @@ impl JsonlStorage {
     }
 
     /// Replay a backend's log, returning the live key → value map.
-    fn replay(&self, backend: &BackendName) -> harnless_seams::error::Result<HashMap<String, Value>> {
+    fn replay(
+        &self,
+        backend: &BackendName,
+    ) -> harnless_seams::error::Result<HashMap<String, Value>> {
         let path = self.path_for(backend)?;
         let mut live = HashMap::new();
         let file = match std::fs::File::open(&path) {
@@ -235,9 +263,9 @@ impl JsonlStorage {
         let mut snapshot = String::new();
         for (key, value) in live {
             snapshot.push_str(
-                &Entry::Set { key, value }.to_line().map_err(|e| {
-                    SeamError::new(ErrorCode::IoError, format!("compaction: {e}"))
-                })?,
+                &Entry::Set { key, value }
+                    .to_line()
+                    .map_err(|e| SeamError::new(ErrorCode::IoError, format!("compaction: {e}")))?,
             );
             snapshot.push('\n');
         }
@@ -252,7 +280,8 @@ impl JsonlStorage {
                     format!("compaction tail read {}: {e}", backend.0),
                 )
             })?;
-            file.seek(SeekFrom::Start(before)).and_then(|_| file.read_to_end(&mut tail))
+            file.seek(SeekFrom::Start(before))
+                .and_then(|_| file.read_to_end(&mut tail))
                 .map_err(|e| {
                     SeamError::new(
                         ErrorCode::IoError,
@@ -277,10 +306,7 @@ impl JsonlStorage {
                 .and_then(|()| out.flush())
                 .and_then(|()| out.sync_all())
                 .map_err(|e| {
-                    SeamError::new(
-                        ErrorCode::IoError,
-                        format!("writing compaction temp: {e}"),
-                    )
+                    SeamError::new(ErrorCode::IoError, format!("writing compaction temp: {e}"))
                 })?;
         }
         std::fs::rename(&tmp, &path).map_err(|e| {
@@ -293,7 +319,11 @@ impl JsonlStorage {
 }
 
 impl Storage for JsonlStorage {
-    fn get(&self, backend: &BackendName, key: &str) -> harnless_seams::error::Result<Option<Value>> {
+    fn get(
+        &self,
+        backend: &BackendName,
+        key: &str,
+    ) -> harnless_seams::error::Result<Option<Value>> {
         // Replay sees every append this process made (each is durable
         // before its call returned) — read-your-writes falls out.
         Ok(self.replay(backend)?.remove(key))
@@ -305,11 +335,22 @@ impl Storage for JsonlStorage {
         key: &str,
         value: Value,
     ) -> harnless_seams::error::Result<()> {
-        self.append(backend, &Entry::Set { key: key.to_string(), value })
+        self.append(
+            backend,
+            &Entry::Set {
+                key: key.to_string(),
+                value,
+            },
+        )
     }
 
     fn delete(&self, backend: &BackendName, key: &str) -> harnless_seams::error::Result<()> {
-        self.append(backend, &Entry::Delete { key: key.to_string() })
+        self.append(
+            backend,
+            &Entry::Delete {
+                key: key.to_string(),
+            },
+        )
     }
 }
 
@@ -325,7 +366,9 @@ pub struct JsonlDomain {
 
 impl std::fmt::Debug for JsonlDomain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JsonlDomain").field("version", &self.version).finish()
+        f.debug_struct("JsonlDomain")
+            .field("version", &self.version)
+            .finish()
     }
 }
 
@@ -348,7 +391,11 @@ impl StorageDomain for JsonlDomain {
         let text = serde_json::to_vec(&envelope).map_err(|e| {
             SeamError::new(ErrorCode::IoError, format!("encoding domain unit: {e}"))
         })?;
-        Ok(OpaqueUnit(base64::engine::general_purpose::STANDARD.encode(text).into_bytes()))
+        Ok(OpaqueUnit(
+            base64::engine::general_purpose::STANDARD
+                .encode(text)
+                .into_bytes(),
+        ))
     }
 
     fn decode(&self, unit: &OpaqueUnit) -> harnless_seams::error::Result<Value> {
@@ -358,19 +405,31 @@ impl StorageDomain for JsonlDomain {
                 SeamError::new(ErrorCode::IoError, format!("decoding opaque unit: {e}"))
             })?;
         let envelope: Value = serde_json::from_slice(&text).map_err(|e| {
-            SeamError::new(ErrorCode::IoError, format!("opaque unit envelope is corrupt: {e}"))
+            SeamError::new(
+                ErrorCode::IoError,
+                format!("opaque unit envelope is corrupt: {e}"),
+            )
         })?;
         let version = envelope.get("v").and_then(Value::as_u64).ok_or_else(|| {
-            SeamError::new(ErrorCode::IoError, "opaque unit envelope has no version".to_string())
+            SeamError::new(
+                ErrorCode::IoError,
+                "opaque unit envelope has no version".to_string(),
+            )
         })?;
         if version > self.version as u64 {
             return Err(SeamError::new(
                 ErrorCode::IoError,
-                format!("opaque unit is envelope v{version}, this domain reads up to v{}", self.version),
+                format!(
+                    "opaque unit is envelope v{version}, this domain reads up to v{}",
+                    self.version
+                ),
             ));
         }
         envelope.get("payload").cloned().ok_or_else(|| {
-            SeamError::new(ErrorCode::IoError, "opaque unit envelope has no payload".to_string())
+            SeamError::new(
+                ErrorCode::IoError,
+                "opaque unit envelope has no payload".to_string(),
+            )
         })
     }
 }
@@ -378,8 +437,8 @@ impl StorageDomain for JsonlDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use serde_json::json;
+    use std::sync::Arc;
 
     fn backend(name: &str) -> BackendName {
         BackendName(name.to_string())
@@ -395,18 +454,30 @@ mod tests {
         let hub = hub_in(dir.path());
         assert_eq!(hub.get(&backend("notes"), "a").unwrap(), None);
         hub.set(&backend("notes"), "a", json!({"n": 1})).unwrap();
-        assert_eq!(hub.get(&backend("notes"), "a").unwrap(), Some(json!({"n": 1})));
+        assert_eq!(
+            hub.get(&backend("notes"), "a").unwrap(),
+            Some(json!({"n": 1}))
+        );
         hub.delete(&backend("notes"), "a").unwrap();
-        assert_eq!(hub.get(&backend("notes"), "a").unwrap(), None, "tombstone must outrank the set");
+        assert_eq!(
+            hub.get(&backend("notes"), "a").unwrap(),
+            None,
+            "tombstone must outrank the set"
+        );
     }
 
     #[test]
     fn restart_sees_persisted_log() {
         // Persistence: a fresh provider over the same root replays the log.
         let dir = tempfile::tempdir().unwrap();
-        hub_in(dir.path()).set(&backend("kv"), "k", json!("v1")).unwrap();
+        hub_in(dir.path())
+            .set(&backend("kv"), "k", json!("v1"))
+            .unwrap();
         let reopened = hub_in(dir.path());
-        assert_eq!(reopened.get(&backend("kv"), "k").unwrap(), Some(json!("v1")));
+        assert_eq!(
+            reopened.get(&backend("kv"), "k").unwrap(),
+            Some(json!("v1"))
+        );
         reopened.delete(&backend("kv"), "k").unwrap();
         assert_eq!(hub_in(dir.path()).get(&backend("kv"), "k").unwrap(), None);
     }
@@ -416,10 +487,18 @@ mod tests {
         // Named-backend coexistence: side-by-side files, no cross-talk.
         let dir = tempfile::tempdir().unwrap();
         let hub = hub_in(dir.path());
-        hub.set(&backend("alpha"), "shared-key", json!("from-alpha")).unwrap();
-        hub.set(&backend("beta"), "shared-key", json!("from-beta")).unwrap();
-        assert_eq!(hub.get(&backend("alpha"), "shared-key").unwrap(), Some(json!("from-alpha")));
-        assert_eq!(hub.get(&backend("beta"), "shared-key").unwrap(), Some(json!("from-beta")));
+        hub.set(&backend("alpha"), "shared-key", json!("from-alpha"))
+            .unwrap();
+        hub.set(&backend("beta"), "shared-key", json!("from-beta"))
+            .unwrap();
+        assert_eq!(
+            hub.get(&backend("alpha"), "shared-key").unwrap(),
+            Some(json!("from-alpha"))
+        );
+        assert_eq!(
+            hub.get(&backend("beta"), "shared-key").unwrap(),
+            Some(json!("from-beta"))
+        );
         hub.delete(&backend("alpha"), "shared-key").unwrap();
         assert_eq!(hub.get(&backend("alpha"), "shared-key").unwrap(), None);
         assert_eq!(
@@ -483,10 +562,18 @@ mod tests {
             Some(json!(49)),
             "an append racing compaction was lost"
         );
-        assert_eq!(shared.get(&backend("c"), "keep").unwrap(), Some(json!("live")));
+        assert_eq!(
+            shared.get(&backend("c"), "keep").unwrap(),
+            Some(json!("live"))
+        );
         // Writes after compaction still work and replay.
-        shared.set(&backend("c"), "after", json!("post-compact")).unwrap();
-        assert_eq!(hub_in(dir.path()).get(&backend("c"), "after").unwrap(), Some(json!("post-compact")));
+        shared
+            .set(&backend("c"), "after", json!("post-compact"))
+            .unwrap();
+        assert_eq!(
+            hub_in(dir.path()).get(&backend("c"), "after").unwrap(),
+            Some(json!("post-compact"))
+        );
     }
 
     #[test]
@@ -496,7 +583,11 @@ mod tests {
         let err = hub.get(&backend(""), "k").unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         let err = hub.get(&backend("..."), "k").unwrap_err();
-        assert_eq!(err.code, ErrorCode::NotFound, "a name of only dots is unusable");
+        assert_eq!(
+            err.code,
+            ErrorCode::NotFound,
+            "a name of only dots is unusable"
+        );
     }
 
     #[test]
@@ -504,11 +595,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hub = hub_in(dir.path());
         hub.set(&backend("x"), "a", json!(1)).unwrap();
-        std::fs::OpenOptions::new().append(true).open(dir.path().join("x.jsonl")).unwrap()
-            .write_all(b"i am not json\n").unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("x.jsonl"))
+            .unwrap()
+            .write_all(b"i am not json\n")
+            .unwrap();
         let err = hub.get(&backend("x"), "a").unwrap_err();
         assert_eq!(err.code, ErrorCode::IoError);
-        assert!(err.message.contains("line 2"), "error names the bad line: {}", err.message);
+        assert!(
+            err.message.contains("line 2"),
+            "error names the bad line: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -516,14 +615,24 @@ mod tests {
         let domain = JsonlDomain::new();
         let value = json!({"record": "note", "tags": ["a", "b"]});
         let unit = domain.encode(value.clone()).unwrap();
-        assert_ne!(String::from_utf8_lossy(&unit.0), value.to_string(), "unit is opaque, not raw JSON");
+        assert_ne!(
+            String::from_utf8_lossy(&unit.0),
+            value.to_string(),
+            "unit is opaque, not raw JSON"
+        );
         assert_eq!(domain.decode(&unit).unwrap(), value);
     }
 
     #[test]
     fn domain_rejects_corrupt_and_future_envelopes() {
         let domain = JsonlDomain::new();
-        assert_eq!(domain.decode(&OpaqueUnit(b"not base64 !!".to_vec())).unwrap_err().code, ErrorCode::IoError);
+        assert_eq!(
+            domain
+                .decode(&OpaqueUnit(b"not base64 !!".to_vec()))
+                .unwrap_err()
+                .code,
+            ErrorCode::IoError
+        );
         let future = OpaqueUnit(
             base64::engine::general_purpose::STANDARD
                 .encode(br#"{"v":99,"payload":null}"#)

@@ -31,6 +31,6 @@
 
 mod provider;
 pub use provider::{
-    AuthorizeState, AuthorizationFlow, CredentialRecord, FileLock, LocalCredentials,
+    AuthorizationFlow, AuthorizeState, CredentialRecord, FileLock, LocalCredentials,
     LocalCredentialsBuilder,
 };

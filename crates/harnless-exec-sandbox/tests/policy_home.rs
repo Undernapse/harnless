@@ -119,8 +119,8 @@ fn refusal_is_an_auditable_verdict_on_the_seam_never_a_quiet_pass() {
     };
     let denied = LocalSandbox::with_mode(SandboxMode::DenyAll)
         .enforce_verdict(["/bin/bash".to_string()].as_slice(), &confined);
-    let passed = LocalSandbox::new()
-        .enforce_verdict(["/bin/bash".to_string()].as_slice(), &unconfined);
+    let passed =
+        LocalSandbox::new().enforce_verdict(["/bin/bash".to_string()].as_slice(), &unconfined);
 
     // The refusal is an explicit verdict with an explanation, carried on the
     // seam struct itself — no side-channel report, no inference from mode.
@@ -139,7 +139,11 @@ fn seam_enforce_and_verdict_body_agree() {
     // The seam is total: enforce() reports exactly the verdict body.
     let policy = PolicyHome::from_root_and_mode(std::env::temp_dir(), SandboxMode::SandboxLocal);
     let sandbox = LocalSandbox::new();
-    let argv = vec!["/bin/bash".to_string(), "-c".to_string(), "true".to_string()];
+    let argv = vec![
+        "/bin/bash".to_string(),
+        "-c".to_string(),
+        "true".to_string(),
+    ];
     let via_seam: Enforced = sandbox.enforce(&argv, &policy).expect("decide");
     assert_eq!(via_seam, decisions(&LocalSandbox::new(), &policy));
 }

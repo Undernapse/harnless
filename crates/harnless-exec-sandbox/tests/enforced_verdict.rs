@@ -10,7 +10,11 @@ use harnless_exec_sandbox::{LocalSandbox, PolicyHomeExt, SandboxMode};
 use harnless_seams::exec::{Enforced, Sandbox};
 
 fn argv() -> Vec<String> {
-    vec!["/bin/bash".to_string(), "-c".to_string(), "true".to_string()]
+    vec![
+        "/bin/bash".to_string(),
+        "-c".to_string(),
+        "true".to_string(),
+    ]
 }
 
 #[test]
@@ -80,5 +84,8 @@ fn an_unestablishable_root_denies_on_the_seam_not_in_a_side_report() {
     assert!(!enforced.allowed, "an unenforceable root must refuse");
     assert!(!enforced.confined, "a refusal must not look confined");
     assert_eq!("sandbox-local", enforced.mode);
-    assert!(enforced.reason.contains("cannot be established"), "{enforced:?}");
+    assert!(
+        enforced.reason.contains("cannot be established"),
+        "{enforced:?}"
+    );
 }

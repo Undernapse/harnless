@@ -22,7 +22,10 @@ fn make() -> JsonlStorage {
 fn storage_conformance_is_clean() {
     let hub = make();
     let violations = harnless_conformance::check_storage(&hub);
-    assert!(violations.is_empty(), "conformance violations: {violations:?}");
+    assert!(
+        violations.is_empty(),
+        "conformance violations: {violations:?}"
+    );
 }
 
 #[test]
@@ -31,9 +34,13 @@ fn storage_conformance_after_compaction_is_clean() {
     // break read-your-writes or delete honesty.
     let hub = make();
     let backend = harnless_seams::storage::BackendName("pre-compaction".to_string());
-    hub.set(&backend, "old", serde_json::json!("stale")).expect("set");
+    hub.set(&backend, "old", serde_json::json!("stale"))
+        .expect("set");
     hub.delete(&backend, "old").expect("delete");
     hub.compact(&backend).expect("compact");
     let violations = harnless_conformance::check_storage(&hub);
-    assert!(violations.is_empty(), "conformance violations: {violations:?}");
+    assert!(
+        violations.is_empty(),
+        "conformance violations: {violations:?}"
+    );
 }

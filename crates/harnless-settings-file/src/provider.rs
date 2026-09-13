@@ -67,7 +67,10 @@ impl LayerSource {
                 Ok(text) => serde_yaml::from_str::<Value>(&text).map_err(|e| {
                     SeamError::new(
                         ErrorCode::IoError,
-                        format!("settings layer {} is not valid YAML/JSON: {e}", path.display()),
+                        format!(
+                            "settings layer {} is not valid YAML/JSON: {e}",
+                            path.display()
+                        ),
                     )
                 }),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
@@ -255,13 +258,19 @@ mod tests {
     }
 
     fn keys(pairs: &[(&str, Value)]) -> serde_json::Map<String, Value> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     #[test]
     fn later_layer_outranks_earlier() {
         // Layered order: shipped base beneath the user layer.
-        let base = doc(&[("app", keys(&[("theme", json!("dark")), ("locale", json!("en"))]))]);
+        let base = doc(&[(
+            "app",
+            keys(&[("theme", json!("dark")), ("locale", json!("en"))]),
+        )]);
         let user = doc(&[("app", keys(&[("theme", json!("light"))]))]);
         let settings = SettingsFile::new(vec![LayerSource::doc(base), LayerSource::doc(user)]);
         assert_eq!(
@@ -284,11 +293,16 @@ mod tests {
         let path = dir.path().join("user.yml");
         std::fs::write(&path, "app:\n  theme: light\n").unwrap();
         let base = doc(&[("app", keys(&[("theme", json!("dark"))]))]);
-        let settings =
-            SettingsFile::new(vec![LayerSource::doc(base), LayerSource::file(&path)]);
-        assert_eq!(settings.get(&ns("app"), "theme").unwrap(), Some(json!("light")));
+        let settings = SettingsFile::new(vec![LayerSource::doc(base), LayerSource::file(&path)]);
+        assert_eq!(
+            settings.get(&ns("app"), "theme").unwrap(),
+            Some(json!("light"))
+        );
         std::fs::write(&path, "app:\n  theme: solarized\n").unwrap();
-        assert_eq!(settings.get(&ns("app"), "theme").unwrap(), Some(json!("solarized")));
+        assert_eq!(
+            settings.get(&ns("app"), "theme").unwrap(),
+            Some(json!("solarized"))
+        );
     }
 
     #[test]
@@ -297,7 +311,10 @@ mod tests {
         let path = dir.path().join("base.json");
         std::fs::write(&path, r#"{"app":{"theme":"dark"}}"#).unwrap();
         let settings = SettingsFile::new(vec![LayerSource::file(&path)]);
-        assert_eq!(settings.get(&ns("app"), "theme").unwrap(), Some(json!("dark")));
+        assert_eq!(
+            settings.get(&ns("app"), "theme").unwrap(),
+            Some(json!("dark"))
+        );
     }
 
     #[test]
@@ -307,7 +324,10 @@ mod tests {
             LayerSource::doc(base),
             LayerSource::file("/nonexistent/harnless-user-settings.yml"),
         ]);
-        assert_eq!(settings.get(&ns("app"), "theme").unwrap(), Some(json!("dark")));
+        assert_eq!(
+            settings.get(&ns("app"), "theme").unwrap(),
+            Some(json!("dark"))
+        );
     }
 
     #[test]
@@ -376,10 +396,38 @@ mod tests {
         assert_eq!((d.key.as_str(), d.present), ("token", true));
         assert_eq!(d.summary, "string");
         assert!(!d.summary.contains("hunter2"));
-        assert_eq!(settings.describe(&ns("app"), "retries").unwrap().unwrap().summary, "integer");
-        assert_eq!(settings.describe(&ns("app"), "ratio").unwrap().unwrap().summary, "float");
-        assert_eq!(settings.describe(&ns("app"), "verbose").unwrap().unwrap().summary, "boolean");
-        assert_eq!(settings.describe(&ns("app"), "nothing").unwrap().unwrap().summary, "present");
+        assert_eq!(
+            settings
+                .describe(&ns("app"), "retries")
+                .unwrap()
+                .unwrap()
+                .summary,
+            "integer"
+        );
+        assert_eq!(
+            settings
+                .describe(&ns("app"), "ratio")
+                .unwrap()
+                .unwrap()
+                .summary,
+            "float"
+        );
+        assert_eq!(
+            settings
+                .describe(&ns("app"), "verbose")
+                .unwrap()
+                .unwrap()
+                .summary,
+            "boolean"
+        );
+        assert_eq!(
+            settings
+                .describe(&ns("app"), "nothing")
+                .unwrap()
+                .unwrap()
+                .summary,
+            "present"
+        );
         // describe mirrors resolution for absent coordinates.
         assert!(settings.describe(&ns("app"), "ghost").unwrap().is_none());
     }
@@ -394,5 +442,4 @@ mod tests {
         assert_eq!(d.summary, "string");
         assert!(!d.summary.contains("base-value") && !d.summary.contains("user-value"));
     }
-
 }

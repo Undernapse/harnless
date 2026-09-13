@@ -30,8 +30,10 @@
 
 use std::sync::{mpsc, Arc};
 
-use harnless_seams::error::{ErrorCode, SeamError, Result};
-use harnless_seams::exec::{ConfineHint, Enforced, PolicyHome, Sandbox, Shell, Spawn, SpawnHandle, Subprocess};
+use harnless_seams::error::{ErrorCode, Result, SeamError};
+use harnless_seams::exec::{
+    ConfineHint, Enforced, PolicyHome, Sandbox, Shell, Spawn, SpawnHandle, Subprocess,
+};
 
 use harnless_exec_sandbox::LocalSandbox;
 use harnless_exec_subprocess::SubprocessLocal;
@@ -85,7 +87,10 @@ impl std::fmt::Debug for BashLocal {
 impl BashLocal {
     /// Wire a shell over any subprocess and sandbox provider pair.
     pub fn new(subprocess: Box<dyn Subprocess>, sandbox: Box<dyn Sandbox>) -> Self {
-        Self { subprocess, sandbox }
+        Self {
+            subprocess,
+            sandbox,
+        }
     }
 
     /// The default wiring: subprocess-local execution with the local
@@ -157,7 +162,11 @@ impl Shell for BashLocal {
 
 /// A request to the spawner thread: spawn these confined coordinates and
 /// report the handle (or refusal) back over the reply channel.
-type Job = (Spawn, Confinement, mpsc::Sender<Result<Box<dyn SpawnHandle>>>);
+type Job = (
+    Spawn,
+    Confinement,
+    mpsc::Sender<Result<Box<dyn SpawnHandle>>>,
+);
 
 /// The confined-spawn boundary: a dedicated single-threaded spawner thread.
 ///
@@ -368,8 +377,7 @@ fn confined_spawn(spawn: &Spawn, confinement: &Confinement) -> Result<Box<dyn Sp
     // child-side scrub would; extras are merged before the filter, so a
     // credential-shaped extra is scrubbed exactly like an inherited
     // variable (proof-by-injection stays sound).
-    let scrubbed =
-        LocalSandbox::new().prepare_scrubbed_env(confinement.extra_env.iter().cloned());
+    let scrubbed = LocalSandbox::new().prepare_scrubbed_env(confinement.extra_env.iter().cloned());
     command.env_clear();
     command.envs(scrubbed);
     // Same process-group policy as the plain provider, so cancel() reaches
@@ -555,11 +563,16 @@ mod confinement_unit_tests {
     #[test]
     fn prepare_scrubbed_env_filters_extras_by_needle() {
         let scrubbed = LocalSandbox::new().prepare_scrubbed_env([
-            ("HARNLESS_TEST_FAKE_TOKEN".to_string(), "hunter2".to_string()),
+            (
+                "HARNLESS_TEST_FAKE_TOKEN".to_string(),
+                "hunter2".to_string(),
+            ),
             ("HARNLESS_TEST_SAFE_VAR".to_string(), "keepme".to_string()),
         ]);
         assert!(
-            !scrubbed.iter().any(|(n, _)| n == "HARNLESS_TEST_FAKE_TOKEN"),
+            !scrubbed
+                .iter()
+                .any(|(n, _)| n == "HARNLESS_TEST_FAKE_TOKEN"),
             "credential-shaped extra survived the scrub"
         );
         assert!(

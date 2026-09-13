@@ -28,7 +28,10 @@ fn make() -> SettingsFile {
 fn settings_conformance_is_clean() {
     let provider = make();
     let violations = harnless_conformance::check_settings(&provider);
-    assert!(violations.is_empty(), "conformance violations: {violations:?}");
+    assert!(
+        violations.is_empty(),
+        "conformance violations: {violations:?}"
+    );
 }
 
 #[test]
@@ -40,12 +43,19 @@ fn settings_conformance_over_file_layers_is_clean() {
     let dir = tempfile::tempdir().expect("tempdir");
     let base_path = dir.path().join("base.yml");
     let user_path = dir.path().join("user.yml");
-    std::fs::write(&base_path, "harnless-conformance:\n  shipped: base\n  count: 2\n").unwrap();
+    std::fs::write(
+        &base_path,
+        "harnless-conformance:\n  shipped: base\n  count: 2\n",
+    )
+    .unwrap();
     std::fs::write(&user_path, "harnless-conformance:\n  shipped: user\n").unwrap();
     let provider = SettingsFile::new(vec![
         LayerSource::file(&base_path),
         LayerSource::file(&user_path),
     ]);
     let violations = harnless_conformance::check_settings(&provider);
-    assert!(violations.is_empty(), "conformance violations: {violations:?}");
+    assert!(
+        violations.is_empty(),
+        "conformance violations: {violations:?}"
+    );
 }

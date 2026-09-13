@@ -490,7 +490,11 @@ pub fn apply_layer(
 /// The `Value` form of a document, for substitution.
 fn to_value(doc: &ConfigDoc) -> Result<Value> {
     serde_yaml::to_value(doc).map_err(|e| {
-        ConfigError::new(Stage::Substitute, "bad-config", format!("config is not YAML: {e}"))
+        ConfigError::new(
+            Stage::Substitute,
+            "bad-config",
+            format!("config is not YAML: {e}"),
+        )
     })
 }
 
@@ -521,7 +525,10 @@ mod tests {
     fn cfg(pairs: &[(&str, &str)]) -> Value {
         let mut map = serde_yaml::Mapping::new();
         for (k, v) in pairs {
-            map.insert(Value::String((*k).to_string()), Value::String((*v).to_string()));
+            map.insert(
+                Value::String((*k).to_string()),
+                Value::String((*v).to_string()),
+            );
         }
         Value::Mapping(map)
     }
@@ -668,7 +675,8 @@ mod tests {
         assert_eq!(err.stage, Stage::Compose);
         assert!(err.names_plugin("nope"));
 
-        let store = std::sync::Arc::new(MemoryStore::new().with_profile(spec("default", &["gone"])));
+        let store =
+            std::sync::Arc::new(MemoryStore::new().with_profile(spec("default", &["gone"])));
         let composer = Composer::new(store.clone(), store, Subst::new());
         let err = composer.compose("default", &[]).unwrap_err();
         assert_eq!(err.code, "unknown-bundle");
@@ -704,7 +712,7 @@ mod tests {
                     vec![Row {
                         id: "store".to_string(),
                         plugin: "x".to_string(),
-                        config: cfg(&[("dir", "${eval:1}"),]),
+                        config: cfg(&[("dir", "${eval:1}")]),
                     }],
                 ))
                 .with_profile(spec("default", &["b"])),

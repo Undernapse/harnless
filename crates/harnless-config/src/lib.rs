@@ -57,7 +57,7 @@ pub mod doc;
 pub mod error;
 pub mod subst;
 
-pub use boot::{mount, MountedResource, MountGuard, PluginFactory, PluginRegistry};
+pub use boot::{mount, MountGuard, MountedResource, PluginFactory, PluginRegistry};
 pub use compose::{Composer, Composition, Warning};
 pub use doc::{BundleDoc, ConfigDoc, Layer, PatchOp, ProfileSpec, Row};
 pub use error::{ConfigError, Stage};

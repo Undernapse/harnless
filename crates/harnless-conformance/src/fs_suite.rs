@@ -123,10 +123,7 @@ impl Cx {
 
     fn into_violations(self, case: &str) -> Vec<Violation> {
         if std::env::var_os("HARNLESS_CONFORMANCE_DEBUG").is_some() && !self.skips.is_empty() {
-            eprintln!(
-                "[conformance skip] {case}: {}",
-                self.skips.join("; ")
-            );
+            eprintln!("[conformance skip] {case}: {}", self.skips.join("; "));
         }
         self.violations
             .into_iter()
@@ -209,7 +206,11 @@ fn stale_version_guard(fs: &dyn FileSystem, cx: &mut Cx) {
     }
     // Write again with the *first* version token: the file has moved on, so
     // the guard must refuse with stale-version.
-    match fs.write(&target, b"v2", Some(WriteGuard::ReplaceAtVersion(first.version))) {
+    match fs.write(
+        &target,
+        b"v2",
+        Some(WriteGuard::ReplaceAtVersion(first.version)),
+    ) {
         Err(e) if e.code == ErrorCode::StaleVersion => {}
         Err(e) => cx.fail(format!(
             "stale ReplaceAtVersion failed with `{}`, expected `stale-version`",
@@ -230,7 +231,9 @@ fn stale_version_guard(fs: &dyn FileSystem, cx: &mut Cx) {
     let current = match fs.write(&target, b"v1b", None) {
         Ok(m) => m,
         Err(e) => {
-            cx.fail(format!("unconditional write after refused guard failed: {e}"));
+            cx.fail(format!(
+                "unconditional write after refused guard failed: {e}"
+            ));
             return;
         }
     };
@@ -424,10 +427,7 @@ fn sibling_debris(fs: &dyn FileSystem, dir: &str) -> Option<Vec<String>> {
 }
 
 fn atomic_write_no_debris(fs: &dyn FileSystem, cx: &mut Cx) {
-    if cx
-        .must_write(fs, "conf/atomic_write.txt", b"one")
-        .is_none()
-    {
+    if cx.must_write(fs, "conf/atomic_write.txt", b"one").is_none() {
         return;
     }
     cx.must_write(fs, "conf/atomic_write.txt", b"two");
@@ -494,10 +494,7 @@ fn overwrite_in_place(fs: &dyn FileSystem, cx: &mut Cx) {
 // ---------------------------------------------------------------------------
 
 fn same_file_same_key(fs: &dyn FileSystem, cx: &mut Cx) {
-    if cx
-        .must_write(fs, "conf/identity.txt", b"same")
-        .is_none()
-    {
+    if cx.must_write(fs, "conf/identity.txt", b"same").is_none() {
         return;
     }
     let spellings = [
@@ -747,8 +744,10 @@ fn permission_denied_vs_sandbox_denied(fs: &dyn FileSystem, cx: &mut Cx) {
     match fs.resolve(path) {
         Ok(t) if t.key == target.key => {}
         _ => {
-            cx.skip("provider display does not round-trip through resolve; cannot build \
-                     an OS permission fixture");
+            cx.skip(
+                "provider display does not round-trip through resolve; cannot build \
+                     an OS permission fixture",
+            );
             return;
         }
     }

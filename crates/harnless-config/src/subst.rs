@@ -176,7 +176,10 @@ impl Subst {
                         Value::String(s) => Some(s.clone()),
                         other => {
                             let expanded = other.clone();
-                            if out.insert(expanded.clone(), self.expand_value(val)?).is_some() {
+                            if out
+                                .insert(expanded.clone(), self.expand_value(val)?)
+                                .is_some()
+                            {
                                 let label = format!("{other:?}");
                                 return Err(collision(&label, &label));
                             }
@@ -210,8 +213,10 @@ fn collision(original: &str, expanded: &str) -> ConfigError {
     ConfigError::new(
         Stage::Substitute,
         "substitution-key-collision",
-        format!("expanding key {original:?} yields {expanded:?}, which the mapping already \
-                 carries; a substituted key must not overwrite another entry"),
+        format!(
+            "expanding key {original:?} yields {expanded:?}, which the mapping already \
+                 carries; a substituted key must not overwrite another entry"
+        ),
     )
 }
 
@@ -226,7 +231,9 @@ mod tests {
     use super::*;
 
     fn subst() -> Subst {
-        Subst::new().with_env("HARNESS_KEY", "sk-1").with_home("/home/u")
+        Subst::new()
+            .with_env("HARNESS_KEY", "sk-1")
+            .with_home("/home/u")
     }
 
     fn yaml(text: &str) -> Value {
