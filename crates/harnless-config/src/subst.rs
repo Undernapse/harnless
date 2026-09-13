@@ -172,11 +172,21 @@ impl Subst {
             Value::Mapping(map) => {
                 let mut out = serde_yaml::Mapping::new();
                 for (key, val) in map {
-                    let key = match key {
-                        Value::String(s) => Value::String(self.expand_str(s)?),
-                        other => other.clone(),
+                    let original = match key {
+                        Value::String(s) => Some(s.clone()),
+                        other => {
+                            let expanded = other.clone();
+                            if out.insert(expanded.clone(), self.expand_value(val)?).is_some() {
+                                let label = format!("{other:?}");
+                                return Err(collision(&label, &label));
+                            }
+                            continue;
+                        }
                     };
-                    out.insert(key, self.expand_value(val)?);
+                    let key = Value::String(self.expand_str(original.as_ref().unwrap())?);
+                    if out.insert(key.clone(), self.expand_value(val)?).is_some() {
+                        return Err(collision(original.as_ref().unwrap(), &format!("{key:?}")));
+                    }
                 }
                 Ok(Value::Mapping(out))
             }
@@ -191,6 +201,17 @@ fn unknown(whole: &str, reason: impl std::fmt::Display) -> ConfigError {
         Stage::Substitute,
         "unknown-substitution",
         format!("unsupported expression {whole:?}: {reason}"),
+    )
+}
+
+/// A `substitution-key-collision` failure: expansion made two distinct
+/// mapping keys identical, so one entry would silently vanish.
+fn collision(original: &str, expanded: &str) -> ConfigError {
+    ConfigError::new(
+        Stage::Substitute,
+        "substitution-key-collision",
+        format!("expanding key {original:?} yields {expanded:?}, which the mapping already \
+                 carries; a substituted key must not overwrite another entry"),
     )
 }
 
@@ -263,5 +284,17 @@ mod tests {
         let once = expand(&value, &subst()).unwrap();
         let twice = expand(&value, &subst()).unwrap();
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn a_colliding_substituted_key_is_a_typed_error() {
+        // Expansion is the security-relevant pass; losing an entry to a
+        // silent key collision is the one composition failure mode that
+        // must be typed, not swallowed by Mapping::insert.
+        let s = Subst::new().with_env("A", "fixed");
+        let value = yaml("${env:A}: one\nfixed: two\n");
+        let err = expand(&value, &s).unwrap_err();
+        assert_eq!(err.code, "substitution-key-collision");
+        assert_eq!(err.stage, Stage::Substitute);
     }
 }

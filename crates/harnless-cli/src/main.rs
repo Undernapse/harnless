@@ -40,6 +40,11 @@ struct Cli {
     #[arg(long)]
     dump_config: bool,
 
+    /// Print the full composed configuration (every row, with its mounted
+    /// config) instead of the projected profile plan.
+    #[arg(long)]
+    dump_full_config: bool,
+
     /// Directory holding `profiles/` and `bundles/` YAML documents.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -137,10 +142,20 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             repl::repl(&mounted, stdin.lock(), std::io::stdout())
         }
         None => {
-            if cli.dump_config {
-                let doc = composer.compose(&cli.profile, patch.as_deref())?;
+            if cli.dump_config || cli.dump_full_config {
+                let dumped = if cli.dump_full_config {
+                    let overlays = harnless_cli::config_boot::parse_overlays(patch)?;
+                    let doc = composer.compose_config(&cli.profile, &overlays)?;
+                    serde_yaml::to_string(&doc).expect("config doc is plain YAML")
+                } else {
+                    let doc = composer.compose(&cli.profile, patch.as_deref())?;
+                    composer.dump(&doc)
+                };
+                // Warnings after composing: `warnings()` reflects the most
+                // recent composition, so reporting first would print the
+                // previous run's set (or none at all).
                 report(&composer);
-                print!("{}", composer.dump(&doc));
+                print!("{dumped}");
                 Ok(())
             } else {
                 // No verb and no dump flag: clap's help is the right answer,

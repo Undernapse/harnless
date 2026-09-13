@@ -196,25 +196,49 @@ impl LocalSandbox {
         }
     }
 
-    /// Apply the best-effort confinement in the current process.
+    /// Compute the scrubbed environment a confined child should receive.
+    ///
+    /// The scrub is a conservative name match; it drops more than it keeps.
+    /// Spawners apply it **parent-side** — build the child's environment
+    /// from the returned pairs via `Command::env_clear` + `Command::envs` —
+    /// never by mutating a live environment in a forked child:
+    /// `setenv`/`unsetenv` take an environment lock on macOS and are **not**
+    /// async-signal-safe there, so a child-side scrub is unsound under any
+    /// multi-threaded forker.
+    ///
+    /// `extra` entries are merged *before* the filter, so a credential-
+    /// shaped extra is scrubbed exactly like an inherited variable.
+    #[must_use]
+    pub fn prepare_scrubbed_env(
+        &self,
+        extra: impl IntoIterator<Item = (String, String)>,
+    ) -> Vec<(String, String)> {
+        std::env::vars()
+            .chain(extra)
+            .filter(|(name, _)| !scrub_needle(name))
+            .collect()
+    }
+
+    /// Apply the post-fork half of the best-effort confinement in the
+    /// current process.
     ///
     /// Called by a spawner in the forked child **after** fork and **before**
     /// exec (via `Command::pre_exec`). On `SandboxMode::SandboxLocal` this:
     ///
-    /// 1. scrubs environment variables whose names look credential-bearing
-    ///    (`*KEY*`, `*SECRET*`, `*TOKEN*`, `*PASS*`, `*CRED*`, `*API*`,
-    ///    `AWS_*`, `SSH_AUTH_SOCK`, `GOOGLE_*`);
-    /// 2. `chdir`s to the workspace root;
-    /// 3. sets `RLIMIT_AS` to `rlimit_as_bytes` if configured.
+    /// 1. `chdir`s to the workspace root;
+    /// 2. sets `RLIMIT_AS` to `rlimit_as_bytes` where supported.
+    ///
+    /// The environment scrub is **not** part of this hook — it is applied
+    /// parent-side by [`Self::prepare_scrubbed_env`], because env mutators
+    /// are not async-signal-safe on macOS.
     ///
     /// # Safety
     ///
-    /// The scrub is performed with `unsetenv(3)` — POSIX marks
-    /// `setenv`/`unsetenv` async-signal-safe (and glibc's implementation
-    /// takes no lock), so it is sound inside a `pre_exec` hook. The cwd
-    /// pin uses `chdir(2)` directly (not `std::env::set_current_dir`, whose
-    /// stdio-path locking is not safe there), and the rlimit step uses
-    /// `setrlimit(2)` — also async-signal-safe.
+    /// The hook body is async-signal-safe by construction: the cwd pin uses
+    /// `chdir(2)` directly (not `std::env::set_current_dir`, whose stdio-
+    /// path locking is not safe there), and the rlimit step uses
+    /// `setrlimit(2)` — both true async-signal-safe syscalls. No allocator
+    ///-dependent or environment-locked call runs between fork and exec.
     ///
     /// # Wiring constraint (shipped boundary)
     ///
@@ -230,24 +254,6 @@ impl LocalSandbox {
     /// spawner must then treat the spawn as refused, not proceed anyway.
     pub fn prepare(&self, policy: &PolicyHome, rlimit_as_bytes: Option<u64>) -> Result<()> {
         let root = Path::new(&policy.workspace_root);
-        // Env scrub: conservative name match; drops more than it keeps.
-        // The removal itself goes through the async-signal-safe `unsetenv`
-        // (see the Safety note), never `std::env::remove_var`.
-        const NEEDLES: [&str; 9] = [
-            "KEY", "SECRET", "TOKEN", "PASS", "CRED", "API", "AWS_", "GOOGLE_", "SSH_AUTH",
-        ];
-        // Collect first, remove second: `std::env::vars()` iterates the
-        // live environment block, and removing during iteration is UB.
-        let doomed: Vec<String> = std::env::vars()
-            .map(|(name, _)| name)
-            .filter(|name| {
-                let upper = name.to_ascii_uppercase();
-                NEEDLES.iter().any(|n| upper.contains(n))
-            })
-            .collect();
-        for name in doomed {
-            scrub_var(&name);
-        }
         // `chdir(2)` directly: async-signal-safe, unlike the std wrapper.
         pin_cwd(root).map_err(|err| {
             SeamError::new(
@@ -290,22 +296,18 @@ fn best_effort_guarantees(workspace_root: &str) -> std::result::Result<String, S
     ))
 }
 
-/// Remove `name` from the process environment via `unsetenv(3)`.
+/// Whether `name` matches a credential-bearing scrub needle.
 ///
-/// POSIX lists `setenv`/`unsetenv` among the async-signal-safe functions,
-/// which is what makes the scrub legal inside a `pre_exec` hook — unlike
-/// `std::env::remove_var`, which takes std's environment lock.
-#[cfg(unix)]
-fn scrub_var(name: &str) {
-    // NUL-free by construction: env var names cannot contain NUL.
-    let cname = std::ffi::CString::new(name.to_string()).expect("env name has no NUL");
-    unsafe { libc::unsetenv(cname.as_ptr()) };
-}
-
-#[cfg(not(unix))]
-fn scrub_var(name: &str) {
-    // Non-Unix has no fork/pre_exec path; the std API is fine there.
-    std::env::remove_var(name);
+/// Conservative name match; the scrub drops more than it keeps. Public so
+/// spawners apply the *same* predicate parent-side that the verdict's
+/// guarantees text promises.
+#[must_use]
+pub fn scrub_needle(name: &str) -> bool {
+    const NEEDLES: [&str; 9] = [
+        "KEY", "SECRET", "TOKEN", "PASS", "CRED", "API", "AWS_", "GOOGLE_", "SSH_AUTH",
+    ];
+    let upper = name.to_ascii_uppercase();
+    NEEDLES.iter().any(|n| upper.contains(n))
 }
 
 /// `chdir(2)` to `root` — async-signal-safe, unlike

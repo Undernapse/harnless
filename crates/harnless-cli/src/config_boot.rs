@@ -145,8 +145,8 @@ pub struct CompositionMount {
     pub ctx: Context,
     /// The model composed by the model row, if any.
     pub model: Option<ModelHandle>,
-    /// The spine's registry — dropping it unwinds the spine fiber.
-    _registry: Registry,
+    /// The spine's registry — kept alive so its services stay mounted.
+    _registry: Arc<Registry>,
     /// The mount guard that disposes every row resource.
     _guard: harnless_config::MountGuard,
 }
@@ -438,23 +438,38 @@ impl ConfigComposer {
         subst: Subst,
         home_patch: Option<&str>,
     ) -> Self {
+        let mut home_warning = None;
         let composer = match home_patch {
             Some(text) => match Composer::new(store.clone(), store.clone(), subst.clone())
                 .with_home_patch_text("home", text)
             {
                 Ok(composer) => composer,
                 Err(err) => {
-                    eprintln!("warning: home patch ignored — {}", cli_error(err));
+                    // Routed through the crate's own warning channel — a
+                    // stable code, not prose a shell must pattern-match.
+                    let warning = Warning {
+                        code: "home-patch-ignored",
+                        message: format!(
+                            "home patch ignored; the profile boots without it — {}",
+                            cli_error(err).message
+                        ),
+                    };
+                    eprintln!("warning: {warning}");
+                    home_warning = Some(warning);
                     Composer::new(store.clone(), store, subst)
                 }
             },
             None => Composer::new(store.clone(), store, subst),
         };
+        let mut last_warnings = Vec::new();
+        if let Some(warning) = home_warning {
+            last_warnings.push(warning);
+        }
         Self {
             composer,
             plugins: default_plugins(),
             specs: PluginSpecs::built_in(),
-            last_warnings: parking_lot::Mutex::new(Vec::new()),
+            last_warnings: parking_lot::Mutex::new(last_warnings),
         }
     }
 
@@ -529,8 +544,12 @@ impl ConfigComposer {
     /// Project a composed configuration onto the CLI's mount plan.
     ///
     /// Rows are classified by [`PluginSpecs`], so the plan is a function of
-    /// what the rows *are*, not what they are called.
-    pub fn plan(&self, doc: &ConfigDoc) -> ProfileDoc {
+    /// what the rows *are*, not what they are called. A malformed model
+    /// row is a typed failure here too — `mount_config` refuses the same
+    /// row, and a dump that hid the defect would diverge from what boot
+    /// does with it (dump-equals-mount covers error semantics as well as
+    /// bytes).
+    pub fn plan(&self, doc: &ConfigDoc) -> Result<ProfileDoc, CliError> {
         let mut seams = Vec::new();
         let mut tools = Vec::new();
         let mut model = ModelSpec::None;
@@ -542,19 +561,24 @@ impl ConfigComposer {
                     seams.extend(SPINE_SEAMS.iter().map(|s| s.to_string()));
                 }
                 Seam::Model => {
-                    model = model_spec_from_config(&row.config).unwrap_or(ModelSpec::None);
+                    model = model_spec_from_config(&row.config).map_err(|e| {
+                        CliError::new(
+                            "plugin-build-failed",
+                            format!("model row {:?}: {e}", row.id),
+                        )
+                    })?;
                 }
                 Seam::Tool => tools.push(tool_name(row)),
                 Seam::Unknown => {}
             }
         }
-        ProfileDoc {
+        Ok(ProfileDoc {
             name: doc.name.clone(),
             seams,
             model,
             tools,
             system_prompt: doc.system_prompt.clone().unwrap_or_default(),
-        }
+        })
     }
 
     /// The plugin registry this composer mounts through.
@@ -577,22 +601,37 @@ impl ConfigComposer {
     ///
     /// Rows mount in composition order. If a row fails, the resources built
     /// for earlier rows are disposed (reverse order) before the error is
-    /// returned, so a failed boot leaves no half-mounted service holding a
-    /// context.
+    /// returned — including the spine's fiber, which an explicit unmount
+    /// unwinds (dropping the registry alone does not dispose fibers) — so a
+    /// failed boot leaves no half-mounted service holding a context.
     pub fn mount_config(&self, doc: &ConfigDoc) -> Result<CompositionMount, CliError> {
         let ctx = Context::root();
         let mut guard = harnless_config::MountGuard::new();
-        let mut spine: Option<Registry> = None;
+        let mut spine: Option<Arc<Registry>> = None;
         let mut model: Option<ModelHandle> = None;
         for row in &doc.rows {
             match self.specs.seam(&row.plugin) {
                 Seam::Spine => {
-                    let registry = Registry::new();
-                    registry.mount(&ctx, Arc::new(Spine::new(SessionId(1)))).map_err(|e| {
-                        guard.dispose();
-                        CliError::new("mount-failed", format!("{}: {}", e.code, e.message))
-                    })?;
-                    spine = Some(registry);
+                    let registry = Arc::new(Registry::new());
+                    let fiber = match registry.mount(&ctx, Arc::new(Spine::new(SessionId(1)))) {
+                        Ok(fiber) => fiber,
+                        Err(e) => {
+                            guard.dispose();
+                            return Err(CliError::new(
+                                "mount-failed",
+                                format!("{}: {}", e.code, e.message),
+                            ));
+                        }
+                    };
+                    // The spine's fiber needs an explicit unwind: dropping
+                    // the registry does not dispose mounted fibers, so a
+                    // later row failure must unmount it or the spine's
+                    // services stay live on a context nobody owns.
+                    guard.push(Box::new(SpineUnwind {
+                        registry: Arc::clone(&registry),
+                        fiber: Arc::clone(&fiber),
+                    }));
+                    spine = Some(Arc::clone(&registry));
                 }
                 Seam::Model | Seam::Tool | Seam::Unknown => {
                     match harnless_config::mount(&one_row(doc, row), &self.plugins) {
@@ -624,6 +663,32 @@ impl ConfigComposer {
     }
 }
 
+/// A mounted spine's unwind handle, held as a guard resource.
+///
+/// Dropping a [`Registry`] does not dispose its mounted fibers, so the
+/// composition records the unmount explicitly: a failed boot disposes
+/// this like any other row's resource, and a successful boot leaves it
+/// inert until the mount itself ends.
+struct SpineUnwind {
+    registry: Arc<Registry>,
+    fiber: Arc<harnless_runtime::Fiber>,
+}
+
+impl harnless_config::MountedResource for SpineUnwind {
+    fn id(&self) -> &str {
+        "spine"
+    }
+
+    fn dispose(&mut self) {
+        // Idempotent: unmounting an unknown fiber is a no-op.
+        self.registry.unmount(&self.fiber);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// The tool name a tool row contributes: its config string, else its id.
 fn tool_name(row: &Row) -> String {
     match row.config.as_str() {
@@ -650,7 +715,7 @@ impl BootComposer for ConfigComposer {
     fn compose(&self, name: &str, patch: Option<&str>) -> Result<ProfileDoc, CliError> {
         let overlays = parse_overlays(patch)?;
         let doc = self.compose_config(name, &overlays)?;
-        Ok(self.plan(&doc))
+        Ok(self.plan(&doc)?)
     }
 
     fn dump(&self, doc: &ProfileDoc) -> String {
@@ -660,13 +725,21 @@ impl BootComposer for ConfigComposer {
     fn mount(&self, doc: &ProfileDoc) -> Result<Mounted, CliError> {
         // The mount plan is the projection of a composed configuration, so
         // this is mounting what the dump printed. The spine mounts in its own
-        // fiber, and the composed model handle rides along.
+        // fiber, and the composed model handle rides along. A failure after
+        // the spine mounted must unwind the fiber — a failed boot leaves no
+        // half-mounted service holding a context.
         let ctx = Context::root();
         let registry = Registry::new();
-        registry
+        let spine_fiber = registry
             .mount(&ctx, Arc::new(Spine::new(SessionId(1))))
             .map_err(|e| CliError::new("mount-failed", format!("{}: {}", e.code, e.message)))?;
-        let model = build_adapter(doc)?;
+        let model = match build_adapter(doc) {
+            Ok(model) => model,
+            Err(err) => {
+                registry.unmount(&spine_fiber);
+                return Err(err);
+            }
+        };
         Ok(Mounted {
             ctx,
             _registry: registry,
@@ -939,7 +1012,7 @@ mod tests {
             system_prompt: Some("hi".to_string()),
             model: None,
         };
-        let plan = composer.plan(&doc);
+        let plan = composer.plan(&doc).expect("valid plan");
         assert_eq!(plan.seams, SPINE_SEAMS);
         assert_eq!(plan.tools, vec!["bash"]);
         assert_eq!(plan.system_prompt, "hi");
