@@ -7,14 +7,16 @@
 //! The sandbox hook runs on the *outer* argv — `[/bin/bash, -c, <command>]`
 //! exactly as it is about to be handed to the subprocess provider — so what
 //! the sandbox reports is about the command that actually spawns, not a
-//! paraphrase of it. A refusal is surfaced to the caller as a `SandboxDenied`
-//! seam error carrying the full enforced report; it never degrades into a
-//! silent pass.
+//! paraphrase of it. The seam [`Enforced`] carries the verdict, so the shell
+//! routes on `enforced.allowed`: a refusal is surfaced to the caller as a
+//! `SandboxDenied` seam error whose message carries the enforced mode *and*
+//! the enforced reason. It never degrades into a silent pass, and it never
+//! guesses at the verdict from `confined`/`mode`.
 
 use harnless_seams::error::{ErrorCode, SeamError, Result};
-use harnless_seams::exec::{PolicyHome, Sandbox, Shell, Spawn, Subprocess};
+use harnless_seams::exec::{Enforced, PolicyHome, Sandbox, Shell, Spawn, Subprocess};
 
-use harnless_exec_sandbox::{LocalSandbox, SandboxDecision, SandboxMode};
+use harnless_exec_sandbox::LocalSandbox;
 use harnless_exec_subprocess::SubprocessLocal;
 
 /// The program the shell seam invokes.
@@ -65,20 +67,20 @@ impl BashLocal {
 impl Shell for BashLocal {
     fn exec(&self, command: &str, policy: &PolicyHome) -> Result<String> {
         let argv = self.argv_for(command);
-        // The sandbox sees the exact argv about to spawn. Enforcement is
+        // The sandbox sees the exact argv about to spawn. The verdict is
         // consulted before the subprocess is touched.
         let enforced = self.sandbox.enforce(&argv, policy)?;
-        if refused(&enforced) {
-            // The seam `Enforced` has no verdict field, so the refusal
-            // travels in the error: `SandboxDenied` is distinct from every
-            // kernel/permission failure, and the message carries the mode
-            // that refused. LocalSandbox's full decision (verdict + reason)
-            // is available via `enforce_decision` for auditors.
+        if !enforced.allowed {
+            // The refusal is the seam's own verdict — no heuristic reads it
+            // off `confined`/`mode`. `SandboxDenied` stays distinct from
+            // every kernel/permission failure, and the message carries the
+            // full auditable report: the mode that refused plus the reason
+            // it gave.
             return Err(SeamError::new(
                 ErrorCode::SandboxDenied,
                 format!(
-                    "sandbox denied command: mode={} confined={} argv={argv:?}",
-                    enforced.mode, enforced.confined
+                    "sandbox denied command: mode={} confined={} reason={:?} argv={argv:?}",
+                    enforced.mode, enforced.confined, enforced.reason
                 ),
             ));
         }
@@ -91,24 +93,15 @@ impl Shell for BashLocal {
     }
 }
 
-/// Whether a seam [`Enforced`] reports a refusal.
-///
-/// [`LocalSandbox`] encodes the verdict in the seam struct as
-/// `confined == false` with a confinement mode named on it — the only
-/// combination that cannot be a permitted run (a permitted unconfined run
-/// has mode `unconfined`).
-fn refused(enforced: &harnless_seams::exec::Enforced) -> bool {
-    !enforced.confined && enforced.mode != SandboxMode::Unconfined.as_str()
-}
-
-/// Convenience: run a command and return the full auditable decision the
-/// local sandbox would make, without spawning. Command tools use this to
-/// show users what enforcement a command is about to get.
-pub fn preview_decision(command: &str, policy: &PolicyHome) -> SandboxDecision {
+/// Convenience: run a command and return the full auditable report the
+/// local sandbox would give it, without spawning. Command tools use this to
+/// show users what enforcement — verdict and reason — a command is about to
+/// get.
+pub fn preview_decision(command: &str, policy: &PolicyHome) -> Enforced {
     let argv = vec![
         SHELL_PROGRAM.to_string(),
         "-c".to_string(),
         command.to_string(),
     ];
-    LocalSandbox::new().enforce_decision(&argv, policy)
+    LocalSandbox::new().enforce_verdict(&argv, policy)
 }

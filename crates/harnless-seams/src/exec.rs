@@ -29,13 +29,28 @@ pub struct Spawn {
     pub cwd: Option<String>,
 }
 
-/// What a sandbox actually enforced for a spawned command.
+/// What a sandbox actually enforced for a spawned command: the full
+/// auditable report, verdict included.
+///
+/// A refusal is `confined == false`, `allowed == false`, and a `reason`
+/// that explains the verdict — nothing is inferred from the mode string.
+/// Consumers route on [`Enforced::allowed`] and never on `mode`/`confined`
+/// heuristics, so a provider that reports a refusal honestly can never be
+/// misread as a permitted run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Enforced {
-    /// Whether confinement was applied.
+    /// Whether confinement was applied. A refusal is never confinement:
+    /// the command does not run, so nothing was confined.
     pub confined: bool,
+    /// Whether the command is allowed to spawn. This is the verdict; every
+    /// consumer decision (run, refuse, surface to the user) reads it.
+    pub allowed: bool,
     /// The confinement mode that was enforced.
     pub mode: String,
+    /// Why the verdict is what it is, in human-readable form. Always
+    /// non-empty: an auditor must be able to reconstruct the decision from
+    /// this struct alone.
+    pub reason: String,
 }
 
 /// A running subprocess handle. Cancellation is best-effort.

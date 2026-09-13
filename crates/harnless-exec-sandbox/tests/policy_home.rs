@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use harnless_exec_sandbox::{LocalSandbox, PolicyHomeExt, SandboxDecision, SandboxMode};
+use harnless_exec_sandbox::{LocalSandbox, PolicyHomeExt, SandboxMode};
 use harnless_seams::error::Result;
 use harnless_seams::exec::{Enforced, PolicyHome, Sandbox};
 
@@ -50,8 +50,8 @@ impl FsConfined {
     }
 }
 
-fn decisions(sandbox: &LocalSandbox, policy: &PolicyHome) -> SandboxDecision {
-    sandbox.enforce_decision(["/bin/bash".to_string()].as_slice(), policy)
+fn decisions(sandbox: &LocalSandbox, policy: &PolicyHome) -> Enforced {
+    sandbox.enforce_verdict(["/bin/bash".to_string()].as_slice(), policy)
 }
 
 #[test]
@@ -63,7 +63,7 @@ fn one_policy_home_drives_both_fs_and_exec_providers() {
     // Exec side: the sandbox verdict names *this* root as the pinned cwd.
     let decision = decisions(&LocalSandbox::new(), &policy);
     assert!(decision.allowed);
-    assert_eq!("sandbox-local", decision.enforced.mode);
+    assert_eq!("sandbox-local", decision.mode);
     assert!(
         decision.reason.contains(&root.display().to_string()),
         "exec verdict confined to a different root than the policy declares: {}",
@@ -100,7 +100,7 @@ fn sandbox_local_reports_exactly_what_it_enforced() {
     let policy = PolicyHome::from_root_and_mode(std::env::temp_dir(), SandboxMode::SandboxLocal);
     let decision = decisions(&LocalSandbox::new(), &policy);
     assert!(decision.allowed);
-    assert!(decision.enforced.confined);
+    assert!(decision.confined);
     // Honest reporting: the reason states the best-effort guarantees AND
     // that they are not kernel enforcement.
     assert!(decision.reason.contains("best-effort"));
@@ -108,7 +108,7 @@ fn sandbox_local_reports_exactly_what_it_enforced() {
 }
 
 #[test]
-fn refusal_produces_a_distinguishable_enforced_result_never_a_quiet_pass() {
+fn refusal_is_an_auditable_verdict_on_the_seam_never_a_quiet_pass() {
     // The confined home's boolean cannot name deny-all, so the refusal is
     // produced by an explicit deny-all sandbox over it — the combination a
     // host policy uses when it requires a real sandbox this host lacks.
@@ -118,31 +118,28 @@ fn refusal_produces_a_distinguishable_enforced_result_never_a_quiet_pass() {
         default_confined: false,
     };
     let denied = LocalSandbox::with_mode(SandboxMode::DenyAll)
-        .enforce_decision(["/bin/bash".to_string()].as_slice(), &confined);
+        .enforce_verdict(["/bin/bash".to_string()].as_slice(), &confined);
     let passed = LocalSandbox::new()
-        .enforce_decision(["/bin/bash".to_string()].as_slice(), &unconfined);
+        .enforce_verdict(["/bin/bash".to_string()].as_slice(), &unconfined);
 
-    // The refusal is explicit and auditable.
+    // The refusal is an explicit verdict with an explanation, carried on the
+    // seam struct itself — no side-channel report, no inference from mode.
     assert!(!denied.allowed);
     assert!(!denied.reason.is_empty());
-    // And its seam shape is distinguishable from a permitted run: a
-    // converter that only sees `Enforced` can still tell them apart.
-    let denied_enforced: Enforced = denied.into_enforced();
-    let passed_enforced: Enforced = passed.into_enforced();
-    assert_ne!(denied_enforced, passed_enforced);
-    assert!(!denied_enforced.confined, "a refusal must not look confined");
-    assert_eq!("deny-all", denied_enforced.mode);
+    // And it is never mistakable for a permitted run by anything that just
+    // compares the two reports.
+    assert_ne!(denied, passed);
+    assert!(!denied.confined, "a refusal must not look confined");
+    assert_eq!("deny-all", denied.mode);
+    assert!(passed.allowed);
 }
 
 #[test]
-fn seam_enforce_and_decision_agree() {
-    // The seam conversion is total: enforce() == enforce_decision().into().
+fn seam_enforce_and_verdict_body_agree() {
+    // The seam is total: enforce() reports exactly the verdict body.
     let policy = PolicyHome::from_root_and_mode(std::env::temp_dir(), SandboxMode::SandboxLocal);
     let sandbox = LocalSandbox::new();
     let argv = vec!["/bin/bash".to_string(), "-c".to_string(), "true".to_string()];
     let via_seam: Enforced = sandbox.enforce(&argv, &policy).expect("decide");
-    assert_eq!(
-        via_seam,
-        decisions(&LocalSandbox::new(), &policy).into_enforced()
-    );
+    assert_eq!(via_seam, decisions(&LocalSandbox::new(), &policy));
 }
