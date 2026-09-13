@@ -47,7 +47,7 @@ struct RecordingSandbox {
 impl Sandbox for RecordingSandbox {
     fn enforce(&self, argv: &[String], policy: &PolicyHome) -> Result<Enforced> {
         self.seen.lock().push(argv.to_vec());
-        Ok(self.inner.enforce_decision(argv, policy).into_enforced())
+        Ok(self.inner.enforce_verdict(argv, policy))
     }
 }
 
@@ -116,8 +116,10 @@ fn denied_command_surfaces_an_auditable_enforced_result() {
         )
         .expect_err("refusal must not pass");
     assert_eq!(ErrorCode::SandboxDenied, err.code, "refusal must be sandbox-denied: {err}");
-    // Auditable: the error names the refusing mode.
+    // Auditable: the error names the refusing mode *and* carries the reason
+    // the sandbox gave for the verdict.
     assert!(err.message.contains("mode=sandbox-local"), "unenforceable: {err}");
+    assert!(err.message.contains("cannot be established"), "unexplained refusal: {err}");
     // And nothing was spawned — the refusal happened before the subprocess.
     assert!(spawned.lock().is_empty(), "denied command still spawned");
 }

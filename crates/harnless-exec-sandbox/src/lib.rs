@@ -1,12 +1,13 @@
 //! The sandbox execution-world provider and the shared policy home.
 //!
 //! [`LocalSandbox`] is the [`Sandbox`] seam: it receives the *exact* argv
-//! about to spawn and reports what it enforces. The seam [`Enforced`] is
-//! deliberately small (`confined` + `mode`); the verdict and reason an
-//! auditor needs live on [`SandboxDecision`], the provider-side report that
-//! converts losslessly into the seam struct — a refusal always produces a
-//! distinguishable [`Enforced`] (`confined == false`, mode `deny-all`),
-//! never one that silently looks confined-and-fine.
+//! about to spawn and reports what it enforces. The seam [`Enforced`] **is**
+//! the auditable report — it carries the verdict (`allowed`) and the
+//! human-readable `reason` alongside `confined` and `mode`, so a consumer
+//! routes on `allowed` and an auditor reads the refusal off the same struct
+//! the executor consumed. A refusal is always `confined == false` with a
+//! `reason` that explains the denial, never a report that silently looks
+//! confined-and-fine.
 //!
 //! [`PolicyHomeExt`] is the typed constructor for the seam `PolicyHome`:
 //! one value declares both the workspace root and the default confinement
@@ -100,47 +101,27 @@ impl PolicyHomeExt for PolicyHome {
     }
 }
 
-/// The full auditable report: the seam [`Enforced`] plus verdict + reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxDecision {
-    /// What was enforced, in seam shape.
-    pub enforced: Enforced,
-    /// Whether the command is allowed to spawn.
-    pub allowed: bool,
-    /// Why the verdict is what it is (human-auditable).
-    pub reason: String,
+/// A permitted run, in seam shape.
+fn allowed(mode: SandboxMode, reason: impl Into<String>) -> Enforced {
+    Enforced {
+        confined: !matches!(mode, SandboxMode::Unconfined),
+        allowed: true,
+        mode: mode.as_str().to_string(),
+        reason: reason.into(),
+    }
 }
 
-impl SandboxDecision {
-    /// Convert to the seam struct (total; lossy only in that the verdict
-    /// and reason are not representable there — see module docs).
-    pub fn into_enforced(self) -> Enforced {
-        self.enforced
-    }
-
-    fn allowed(mode: SandboxMode, reason: impl Into<String>) -> Self {
-        Self {
-            enforced: Enforced {
-                confined: !matches!(mode, SandboxMode::Unconfined),
-                mode: mode.as_str().to_string(),
-            },
-            allowed: true,
-            reason: reason.into(),
-        }
-    }
-
-    fn denied(mode: SandboxMode, reason: impl Into<String>) -> Self {
-        Self {
-            enforced: Enforced {
-                // A refusal is *not* confinement — the command never runs.
-                // Reporting `confined: true` here would let a silent pass
-                // masquerade as an enforced sandbox.
-                confined: false,
-                mode: mode.as_str().to_string(),
-            },
-            allowed: false,
-            reason: reason.into(),
-        }
+/// A refusal, in seam shape.
+///
+/// A refusal is *not* confinement — the command never runs. Reporting
+/// `confined: true` here would let a silent pass masquerade as an enforced
+/// sandbox.
+fn denied(mode: SandboxMode, reason: impl Into<String>) -> Enforced {
+    Enforced {
+        confined: false,
+        allowed: false,
+        mode: mode.as_str().to_string(),
+        reason: reason.into(),
     }
 }
 
@@ -174,35 +155,36 @@ impl LocalSandbox {
         })
     }
 
-    /// The full verdict for `argv` under `policy`.
+    /// The full verdict for `argv` under `policy`, in seam shape.
     ///
     /// This is the sandbox seam's decision body; [`LocalSandbox`] implements
-    /// the seam by converting the decision into [`Enforced`].
-    pub fn enforce_decision(&self, argv: &[String], policy: &PolicyHome) -> SandboxDecision {
+    /// the seam by calling it. The returned [`Enforced`] is the complete
+    /// auditable report — verdict and reason included.
+    pub fn enforce_verdict(&self, argv: &[String], policy: &PolicyHome) -> Enforced {
         let mode = self.mode_for(policy);
         match mode {
-            SandboxMode::Unconfined => SandboxDecision::allowed(
+            SandboxMode::Unconfined => allowed(
                 mode,
                 "policy allows unconfined execution; nothing enforced",
             ),
-            SandboxMode::DenyAll => SandboxDecision::denied(
+            SandboxMode::DenyAll => denied(
                 mode,
                 format!(
-                    "policy requires a real sandbox; this host's sandbox-local mode \
-                     cannot confine the requested command ({})",
+                    "policy refuses to run the requested command ({}): a real sandbox is \
+                     required and this host's sandbox-local mode cannot confine it",
                     argv.first().map(String::as_str).unwrap_or("<empty argv>")
                 ),
             ),
             SandboxMode::SandboxLocal => {
                 match best_effort_guarantees(policy.workspace_root.as_ref()) {
-                    Ok(guarantees) => SandboxDecision::allowed(
+                    Ok(guarantees) => allowed(
                         mode,
                         format!(
                             "best-effort local confinement applied: {guarantees}; \
                              NOT kernel-enforced — see harnless-exec-sandbox docs"
                         ),
                     ),
-                    Err(why) => SandboxDecision::denied(
+                    Err(why) => denied(
                         mode,
                         format!(
                             "sandbox-local mode cannot be established: {why}; refusing \
@@ -272,7 +254,7 @@ impl LocalSandbox {
 
 impl Sandbox for LocalSandbox {
     fn enforce(&self, argv: &[String], policy: &PolicyHome) -> Result<Enforced> {
-        Ok(self.enforce_decision(argv, policy).into_enforced())
+        Ok(self.enforce_verdict(argv, policy))
     }
 }
 
