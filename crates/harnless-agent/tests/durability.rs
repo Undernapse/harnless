@@ -174,7 +174,9 @@ impl SessionPersistence for JsonlFileBackend {
                     serde_json::from_str(line).map_err(|e| format!("line {}: {e}", i + 1))?;
                 events.push(event);
             }
-            Ok(Some(LoadedLog { events, seeded: false }))
+            // `seeded` is derived from the events the encoding carries.
+            let seeded = events.iter().any(is_seed_event);
+            Ok(Some(LoadedLog { events, seeded }))
         }
     }
 }
@@ -266,7 +268,9 @@ impl SessionPersistence for CoalescingBackend {
                     }
                 }
             }
-            Ok(Some(LoadedLog { events, seeded: false }))
+            // `seeded` is derived from the events the encoding carries.
+            let seeded = events.iter().any(is_seed_event);
+            Ok(Some(LoadedLog { events, seeded }))
         }
     }
 }
@@ -364,29 +368,17 @@ fn coalesced_chunks_concatenate_to_the_assembled_message() {
 
 /// The seed-boundary marker as a logable event.
 ///
-/// The closed `SessionEvent` vocabulary has no seed-boundary variant (the
-/// type-level violation is pinned by the ignored test
+/// The marker is a member of the closed `SessionEvent` vocabulary
+/// (`SessionEvent::SeedBoundary`, pinned by
 /// `seed_boundary_is_representable_in_the_event_vocabulary`), so the suite
-/// represents the marker with this sentinel message.
+/// uses the real thing rather than a sentinel message: it appends, saves,
+/// loads, and JSON round-trips like any other event.
 fn seed_event() -> SessionEvent {
-    SessionEvent::UserMessage(MessageRecord {
-        id: MessageId(0),
-        blocks: vec![ContentBlock::Text {
-            text: "__harnless_seed_boundary__".into(),
-        }],
-        provider: None,
-        model: None,
-    })
+    SessionEvent::SeedBoundary
 }
 
 fn is_seed_event(event: &SessionEvent) -> bool {
-    matches!(
-        event,
-        SessionEvent::UserMessage(m)
-            if m.id == MessageId(0)
-                && matches!(&m.blocks[..], [ContentBlock::Text { text }]
-                    if text == "__harnless_seed_boundary__")
-    )
+    matches!(event, SessionEvent::SeedBoundary)
 }
 
 // ---------------------------------------------------------------------------
@@ -745,32 +737,36 @@ fn max_tokens_wins_over_later_clean_stop() {
     );
 }
 
-// ISSUE-18: implementation violates the seed-marker contract at the type
-// level. `LoadedLog.seeded` documents that a loaded log "carries a seed
-// boundary (writes from this process)", and `LogRecord::SeedBoundary`
-// exists — but `LogRecord` is not a variant of the closed `SessionEvent`
-// vocabulary, so no backend can persist the marker through `save` and no
-// log can record it through `append`. A conforming backend cannot set
-// `seeded` from anything its encoding can hold. Pinned ignored until
-// `SessionEvent` gains the marker (or `LoadedLog.seeded` is removed).
+// ISSUE-18 (now enforced): the seed-marker contract used to be violated at
+// the type level — `LoadedLog.seeded` documented a seed boundary that only
+// `LogRecord::SeedBoundary` could name, and `LogRecord` is not part of the
+// closed `SessionEvent` vocabulary, so no backend could persist the marker
+// through `save` and no log could record it through `append`. The marker now
+// lives in the core vocabulary as `SessionEvent::SeedBoundary`, and
+// `LoadedLog.seeded` is derived from the persisted events: a backend reports
+// `seeded` iff the log it loads carries the marker.
 #[test]
-#[ignore = "ISSUE-18: SessionEvent cannot carry the seed boundary the persistence contract requires"]
 fn seed_boundary_is_representable_in_the_event_vocabulary() {
     // The contract's own marker type must round-trip as a session event:
-    // append it, save it, load it back. As written this fails at the first
-    // line — the variant does not exist in the closed enum, so the test
-    // body stands in with the documented marker's *name*.
-    let marker: SessionEvent =
-        serde_json::from_str(r#"{"type":"seed_boundary"}"#).expect("seed boundary must be a valid event");
+    // parse it, append it, save it, load it back.
+    let marker: SessionEvent = serde_json::from_str(r#"{"type":"seed_boundary"}"#)
+        .expect("seed boundary must be a valid event");
+    assert_eq!(marker, SessionEvent::SeedBoundary);
+    // It is a structural record: it never projects a message.
+    assert!(!marker.is_message_producing());
     let log = SessionLog::new(SessionId(330));
     assert!(log.append(marker.clone()));
     let dir = tempfile::tempdir().unwrap();
     let session = SessionId(330);
     rt().block_on(async {
         let mut backend = JsonlFileBackend::new(dir.path().to_path_buf());
-        backend.save(&session, &[marker]).await.unwrap();
+        backend.save(&session, &[marker.clone()]).await.unwrap();
         let loaded: LoadedLog = backend.load(&session).await.unwrap().unwrap();
+        // The marker survives the encoding untouched, and `seeded` is
+        // derivable from the events the backend returns.
+        assert_eq!(loaded.events, vec![marker]);
         assert!(loaded.seeded, "a log with the marker must load as seeded");
+        assert!(loaded.events.iter().any(is_seed_event));
     });
 }
 

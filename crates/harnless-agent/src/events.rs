@@ -44,8 +44,14 @@ pub enum TurnEndReason {
     Interrupted,
 }
 
-/// A log-only record: a whole-list snapshot, a request envelope, a route
-/// context, or a seed boundary. These never project a message.
+/// A log-only record: a whole-list snapshot, a request envelope, or a route
+/// context. These never project a message.
+///
+/// The seed boundary is **not** here: it lives in the core vocabulary as
+/// [`SessionEvent::SeedBoundary`], so a persistence backend can carry it
+/// through `save` and a log can record it through `append` like any other
+/// event. `LogRecord` names only the record kinds that never enter the
+/// session log's event stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LogRecord {
@@ -55,8 +61,6 @@ pub enum LogRecord {
     RequestEnvelope,
     /// The route context a request travelled under.
     RouteContext,
-    /// Marks where the current process's writes begin (seed boundary).
-    SeedBoundary,
 }
 
 /// One session event.
@@ -86,6 +90,16 @@ pub enum SessionEvent {
     ToolCall(ToolCallRecord),
     /// A tool result (message-producing in the derived surface).
     ToolResult(ToolResultRecord),
+    /// The seed boundary: marks where the current process's writes begin.
+    ///
+    /// A log-only structural marker — it never produces a message and never
+    /// joins derived history. A forked or resumed log carries it ahead of the
+    /// region inherited from its parent, so a crash-recovery pass can tell an
+    /// inherited open bracket from one this process owns. A persistence
+    /// backend reports the boundary by carrying this event (or its encoding's
+    /// equivalent) in the batch it stores; see
+    /// [`LoadedLog`](crate::persistence::LoadedLog).
+    SeedBoundary,
 }
 
 /// The fields of a message record.

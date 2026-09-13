@@ -107,10 +107,11 @@ impl SessionLog {
 
 /// Whether `event` survives a lossless-JSON round-trip.
 ///
-/// The whole core vocabulary is serde `String`-backed, so this is always
-/// true for the closed enum; the check is the seam's enforcement point for
-/// any event that adds non-JSON-representable data at a later date. It
-/// validates at the append site rather than at flush time.
+/// Every variant of the closed enum — including the unit-shaped
+/// [`SessionEvent::SeedBoundary`] marker — is serde `String`-backed, so this
+/// is always true for the closed vocabulary; the check is the seam's
+/// enforcement point for any event that adds non-JSON-representable data at a
+/// later date. It validates at the append site rather than at flush time.
 fn is_lossless_json(event: &SessionEvent) -> bool {
     match serde_json::to_string(event) {
         Ok(json) => serde_json::from_str::<SessionEvent>(&json)
