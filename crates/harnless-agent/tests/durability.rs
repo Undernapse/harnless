@@ -111,6 +111,10 @@ fn mixed_batch() -> Vec<SessionEvent> {
             },
         },
     ]);
+    // The seed marker rides the mixed batch too: every round-trip pin below
+    // therefore also pins that a backend's encoding carries it (coalescing
+    // included), and that seeding derives from what survived the encoding.
+    events.push(SessionEvent::SeedBoundary);
     events
 }
 
@@ -174,9 +178,7 @@ impl SessionPersistence for JsonlFileBackend {
                     serde_json::from_str(line).map_err(|e| format!("line {}: {e}", i + 1))?;
                 events.push(event);
             }
-            // `seeded` is derived from the events the encoding carries.
-            let seeded = events.iter().any(is_seed_event);
-            Ok(Some(LoadedLog { events, seeded }))
+            Ok(Some(LoadedLog { events }))
         }
     }
 }
@@ -268,9 +270,7 @@ impl SessionPersistence for CoalescingBackend {
                     }
                 }
             }
-            // `seeded` is derived from the events the encoding carries.
-            let seeded = events.iter().any(is_seed_event);
-            Ok(Some(LoadedLog { events, seeded }))
+            Ok(Some(LoadedLog { events }))
         }
     }
 }
@@ -294,6 +294,9 @@ fn round_trip_file_backend_is_byte_for_byte_exact() {
             // Byte-for-byte after the JSON round-trip.
             assert_eq!(json(got), json(want));
         }
+        // Seeding is derived from what the encoding actually carried.
+        assert_eq!(loaded.is_seeded(), batch.iter().any(is_seed_event));
+        assert!(loaded.is_seeded(), "the batch's marker must survive");
     });
 }
 
@@ -313,6 +316,7 @@ fn round_trip_survives_batched_appends_and_reopen() {
         let mut reader = JsonlFileBackend::new(dir.path().to_path_buf());
         let loaded: LoadedLog = reader.load(&session).await.unwrap().unwrap();
         assert_eq!(loaded.events, batch);
+        assert!(loaded.is_seeded(), "marker survived the second batch");
     });
 }
 
@@ -335,6 +339,10 @@ fn round_trip_coalescing_backend_expands_exact_chunks() {
             assert_eq!(got, want);
             assert_eq!(json(got), json(want));
         }
+        // The coalescer must carry the marker through its own encoding too,
+        // and seeding derives from what survived it.
+        assert_eq!(loaded.is_seeded(), batch.iter().any(is_seed_event));
+        assert!(loaded.is_seeded(), "coalescing dropped the marker");
     });
 }
 
@@ -822,9 +830,9 @@ fn max_tokens_displaces_only_clean_closes() {
 // `LogRecord::SeedBoundary` could name, and `LogRecord` is not part of the
 // closed `SessionEvent` vocabulary, so no backend could persist the marker
 // through `save` and no log could record it through `append`. The marker now
-// lives in the core vocabulary as `SessionEvent::SeedBoundary`, and
-// `LoadedLog.seeded` is derived from the persisted events: a backend reports
-// `seeded` iff the log it loads carries the marker.
+// lives in the core vocabulary as `SessionEvent::SeedBoundary`, and seeding
+// is *derived* from the loaded events (`LoadedLog::is_seeded`) — a backend
+// has no independent flag to get out of step with its own encoding.
 #[test]
 fn seed_boundary_is_representable_in_the_event_vocabulary() {
     // The contract's own marker type must round-trip as a session event:
@@ -840,13 +848,12 @@ fn seed_boundary_is_representable_in_the_event_vocabulary() {
     let session = SessionId(330);
     rt().block_on(async {
         let mut backend = JsonlFileBackend::new(dir.path().to_path_buf());
-        backend.save(&session, &[marker.clone()]).await.unwrap();
+        backend.save(&session, std::slice::from_ref(&marker)).await.unwrap();
         let loaded: LoadedLog = backend.load(&session).await.unwrap().unwrap();
-        // The marker survives the encoding untouched, and `seeded` is
-        // derivable from the events the backend returns.
+        // The marker survives the encoding untouched, and seeding is
+        // derived from the events the backend returns.
         assert_eq!(loaded.events, vec![marker]);
-        assert!(loaded.seeded, "a log with the marker must load as seeded");
-        assert!(loaded.events.iter().any(is_seed_event));
+        assert!(loaded.is_seeded(), "a log with the marker must load seeded");
     });
 }
 
@@ -861,7 +868,6 @@ fn reopen(mut backend: impl SessionPersistence, session: &SessionId) -> LoadedLo
         .unwrap()
         .unwrap_or(LoadedLog {
             events: Vec::new(),
-            seeded: false,
         })
 }
 
