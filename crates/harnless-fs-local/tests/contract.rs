@@ -179,7 +179,8 @@ fn create_if_absent_refuses_existing_targets() {
     let err = fs
         .write(&target, b"again", Some(WriteGuard::CreateIfAbsent))
         .unwrap_err();
-    assert_eq!(err.code, ErrorCode::StaleVersion);
+    // The seam contract pins this as not-found (the create cannot happen).
+    assert_eq!(err.code, ErrorCode::NotFound);
 }
 
 #[test]

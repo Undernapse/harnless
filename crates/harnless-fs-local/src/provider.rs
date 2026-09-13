@@ -66,6 +66,14 @@ use harnless_runtime::events::EventRegistry;
 pub struct LocalFileSystem {
     /// The canonical root, kept for display stripping and key hashing.
     root: PathBuf,
+    /// Key → canonical display for every key this instance minted by
+    /// `resolve`. Lets a real key wearing a spoofed display still be
+    /// operated on by its true coordinate.
+    key_registry: parking_lot::Mutex<HashMap<harnless_seams::TargetKey, String>>,
+    /// Every version token this instance ever handed out (stamped form).
+    /// Guards distinguish foreign tokens (never issued → not-observed)
+    /// from stale ones (issued, target moved on → stale-version).
+    issued_tokens: parking_lot::Mutex<std::collections::HashSet<u64>>,
     /// The root opened once; every operation walks from this fd.
     root_fd: RawFd,
     /// Path → current version token, keyed by canonical path. Only a
@@ -135,6 +143,8 @@ impl LocalFileSystem {
         Ok(Self {
             root: canonical,
             root_fd,
+            key_registry: parking_lot::Mutex::new(HashMap::new()),
+            issued_tokens: parking_lot::Mutex::new(std::collections::HashSet::new()),
             versions: parking_lot::Mutex::new(HashMap::new()),
             next_version: AtomicU64::new(1),
             nonce: random_nonce(),
@@ -184,6 +194,10 @@ impl LocalFileSystem {
     /// mixing in the per-instance nonce. Tokens from different provider
     /// another backend is always `not-observed`, never accidentally fresh.
     /// The counter itself is what the version map stores.
+    fn issued(&self, token: u64) -> bool {
+        self.issued_tokens.lock().contains(&token)
+    }
+
     fn stamp(&self, counter: u64) -> u64 {
         fnv1a(&self.nonce.to_le_bytes()) ^ fnv1a(&counter.to_le_bytes())
     }
@@ -196,9 +210,14 @@ impl LocalFileSystem {
     /// convenience); each created directory is itself opened and verified
     /// contained before use.
     fn open_target(&self, target: &Target, create_parents: bool) -> Result<Opened, SeamError> {
+        // Identity is the key. When the display disagrees with the name
+        // the key hashes to (a spoofed or stale hint), operate on the
+        // key's real coordinate — the display is for humans, never an
+        // address.
+        let target = self.resolve_key(target)?;
         if target.display == "." {
             // The root itself: dup the root fd and verify its key.
-            self.verify_key(target, &self.root)?;
+            self.verify_key(&target, &self.root)?;
             let fd = unsafe { libc::dup(self.root_fd) };
             if fd < 0 {
                 return Err(io_error(io::Error::last_os_error()));
@@ -208,16 +227,33 @@ impl LocalFileSystem {
                 canonical: self.root.clone(),
             });
         }
-        let parent = self.open_parent(target, create_parents)?;
-        // rather than followed. ENOENT is not an error here — write creates,
-        // and read/edit surface not-found when they try to use the fd.
-        let fd = unsafe {
+        let parent = self.open_parent(&target, create_parents)?;
+        // Open the final object without following a final symlink.
+        // O_DIRECTORY is NOT used here: it turns a missing final component
+        // into ENOTDIR (indistinguishable from other ENOTDIRs) and breaks
+        // write's create path. Directories open fine with plain O_RDONLY
+        // on macOS via O_EVTONLY; the callers' fstat classifies the kind.
+        let mut fd = unsafe {
             libc::openat(
                 parent.dirfd,
                 parent.name.as_ptr(),
                 libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             )
         };
+        if fd < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EISDIR) {
+                // A directory target: reopen with O_EVTONLY so the caller
+                // can fstat it and report the kind honestly.
+                fd = unsafe {
+                    libc::openat(
+                        parent.dirfd,
+                        parent.name.as_ptr(),
+                        libc::O_EVTONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    )
+                };
+            }
+        }
         let file_fd = if fd >= 0 {
             fd
         } else {
@@ -231,11 +267,33 @@ impl LocalFileSystem {
         };
         let canonical = parent.dir_canonical.join(OsStr::from_bytes(parent.name.as_bytes()));
         unsafe { libc::close(parent.dirfd) };
-        self.verify_key(target, &canonical)?;
+        self.verify_key(&target, &canonical)?;
         Ok(Opened {
             fd: file_fd,
             canonical,
         })
+    }
+
+    /// Re-derive the target's true display from its key.
+    ///
+    /// Keys are minted by `resolve` and registered here with the canonical
+    /// display they were derived from. When a caller presents a real key
+    /// wearing a stale or spoofed display, the key is authoritative: the
+    /// registry supplies the coordinate it actually names. An unknown key
+    /// passes through unchanged — `verify_key` refuses it as not-observed.
+    fn resolve_key(&self, target: &Target) -> Result<Target, SeamError> {
+        // Fast path: the display hashes to the key — nothing to fix.
+        let canonical_guess = self.root.join(Path::new(&target.display));
+        if target.key.0 == fnv1a(canonical_guess.as_os_str().as_bytes()) {
+            return Ok(target.clone());
+        }
+        if let Some(display) = self.key_registry.lock().get(&target.key).cloned() {
+            return Ok(Target {
+                key: target.key,
+                display,
+            });
+        }
+        Ok(target.clone())
     }
 
     /// Walk to the target's parent directory, verifying every hop, and hand
@@ -333,8 +391,11 @@ impl LocalFileSystem {
         if target.key.0 == expected {
             Ok(())
         } else {
+            // A key/display mismatch is not a sandbox escape (containment
+            // was already proven by the fd walk) — it is a handle this
+            // backend does not vouch for: not-observed.
             Err(SeamError::new(
-                ErrorCode::SandboxDenied,
+                ErrorCode::NotObserved,
                 format!(
                     "target key does not match its display {:?}; the handle is stale or tampered",
                     target.display
@@ -412,12 +473,10 @@ impl LocalFileSystem {
         match guard {
             None => Ok(()),
             Some(WriteGuard::CreateIfAbsent) if exists => Err(SeamError::new(
-                // The create you asked for cannot happen: the slot is
-                // taken. The seam's contract test pins this as
-                // stale-version — the state moved past what the guard
-                // asserts.
-                ErrorCode::StaleVersion,
-                format!("target already exists: {}", canonical.display()),
+                // The seam contract (FileSystem::write doc) pins this as
+                // not-found: the create you asked for cannot happen.
+                ErrorCode::NotFound,
+                format!("create-if-absent target already exists: {}", canonical.display()),
             )),
             Some(WriteGuard::CreateIfAbsent) => Ok(()),
             Some(WriteGuard::ReplaceAtVersion(seen)) => {
@@ -433,7 +492,15 @@ impl LocalFileSystem {
                         ),
                     )),
                     Some(v) if self.stamp(v) != seen.0 => Err(SeamError::new(
-                        ErrorCode::StaleVersion,
+                        // A token this instance never issued is foreign →
+                        // not-observed. Only a token it issued (and the
+                        // target outlived) is stale-version. Issued tokens
+                        // are the stamped counter range [1, next_version).
+                        if !self.issued(seen.0) {
+                            ErrorCode::NotObserved
+                        } else {
+                            ErrorCode::StaleVersion
+                        },
                         format!(
                             "target moved past the presented version: {}",
                             canonical.display()
@@ -462,6 +529,7 @@ impl LocalFileSystem {
     ) -> Result<VersionToken, SeamError> {
         let counter = self.next_version.fetch_add(1, Ordering::SeqCst);
         let token = VersionToken(self.stamp(counter));
+        self.issued_tokens.lock().insert(token.0);
         // Globally unique temp name: nonce + counter + thread id, so two
         // instances (or two threads) never collide on a sibling temp.
         let tmp_name = {
@@ -720,10 +788,14 @@ impl FileSystem for LocalFileSystem {
         }
         if components.is_empty() {
             // The root itself is a listable target; "." is its display.
-            return Ok(Target {
+            let target = Target {
                 key: harnless_seams::TargetKey(fnv1a(self.root.as_os_str().as_bytes())),
                 display: ".".to_string(),
-            });
+            };
+            self.key_registry
+                .lock()
+                .insert(target.key, target.display.clone());
+            return Ok(target);
         }
 
         // Walk the chain lexically-normalized. Every hop may be absent —
@@ -785,7 +857,7 @@ impl FileSystem for LocalFileSystem {
                         // The rest of the chain cannot be opened (no dirfd
                         // to walk from); the remaining components are
                         // plain names, so the canonical path is complete.
-                        for rest in &components[i + 1..] {
+                        for rest in &components[i..] {
                             canonical.push(rest);
                         }
                         unsafe { libc::close(dirfd) };
@@ -807,10 +879,14 @@ impl FileSystem for LocalFileSystem {
         } else {
             display
         };
-        Ok(Target {
+        let target = Target {
             key: harnless_seams::TargetKey(fnv1a(canonical.as_os_str().as_bytes())),
             display,
-        })
+        };
+        self.key_registry
+            .lock()
+            .insert(target.key, target.display.clone());
+        Ok(target)
     }
     fn read(&self, target: &Target, max_bytes: usize) -> Result<ReadWindow, SeamError> {
         let opened = self.open_target(target, false)?;

@@ -32,6 +32,11 @@ struct Inner {
     unreadable: HashSet<String>,
     /// Canonical directory paths the provider knows (seeded + created).
     dirs: HashSet<String>,
+    /// Every canonical path ever resolved or written. A resolved path is
+    /// a known *file* coordinate (create-if-absent needs resolvable
+    /// non-existing targets); it is only a directory if something was
+    /// written beneath it.
+    known: HashSet<String>,
     next_key: AtomicU64,
     next_version: AtomicU64,
 }
@@ -110,6 +115,16 @@ impl MemFs {
 
     /// Validate a target's key against the registry: a key this provider
     /// never issued is not observed — never trusted.
+    fn remember_dirs(inner: &mut Inner, path: &str) {
+        // Materialize ancestor directories on first write through them,
+        // mirroring a real backend's create-parents behavior.
+        let mut parent = Self::parent(path);
+        while !parent.is_empty() && !inner.dirs.contains(&parent) {
+            inner.dirs.insert(parent.clone());
+            parent = Self::parent(&parent);
+        }
+    }
+
     fn path_of(&self, inner: &Inner, target: &Target) -> Result<String> {
         inner.key_to_path.get(&target.key).cloned().ok_or_else(|| {
             SeamError::new(
@@ -148,6 +163,7 @@ impl FileSystem for MemFs {
                 format!("`{path}` does not exist"),
             ));
         }
+        inner.known.insert(canon.clone());
         let key = self.key_for(&mut inner, &canon);
         Ok(Target {
             key,
@@ -211,6 +227,7 @@ impl FileSystem for MemFs {
         let exists = inner.files.contains_key(&path);
         let version = match guard {
             None => {
+                Self::remember_dirs(&mut inner, &path);
                 let v = Self::next_version(&mut inner);
                 inner.files.insert(
                     path,
@@ -228,6 +245,7 @@ impl FileSystem for MemFs {
                         format!("`{path}` already exists"),
                     ));
                 }
+                Self::remember_dirs(&mut inner, &path);
                 let v = Self::next_version(&mut inner);
                 inner.files.insert(
                     path,
@@ -255,6 +273,7 @@ impl FileSystem for MemFs {
                         format!("`{path}` moved past the guarded version"),
                     ));
                 }
+                Self::remember_dirs(&mut inner, &path);
                 let v = Self::next_version(&mut inner);
                 inner.files.insert(
                     path,

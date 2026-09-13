@@ -63,13 +63,32 @@ pub use types::Violation;
 /// the violation details, or with a note that the provider panicked — a
 /// panic is a contract violation too (misbehaving input must surface as a
 /// [`Violation`], never a crash).
+///
+/// Each expansion is wrapped in an inherent `const _` block, so the case
+/// names become the `#[test]` function names (hyphens/underscores as
+/// written) and never collide with sibling instantiations; the test binary
+/// reports them as `<module>::{case}`.
+/// Internal shim: re-export of [`paste::paste`] so the exported suite macro
+/// expands through `$crate` and downstream instantiations never need a
+/// direct `paste` dependency.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __paste {
+    ($($t:tt)*) => {
+        $crate::__paste_reexport! { $($t)* }
+    };
+}
+
+#[doc(hidden)]
+pub use paste::paste as __paste_reexport;
+
 #[macro_export]
 macro_rules! conformance_tests_fs {
     ($name:ident, $factory:expr, $($case:literal),+ $(,)?) => {
-        ::paste::paste! {
+        $crate::__paste! {
             $(
                 #[test]
-                fn [<conformance_ $name _ $case>]() {
+                    fn [<conformance_ $name _ $case>]() {
                     let factory: fn() -> _ = $factory;
                     let provider = factory();
                     let outcome = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {

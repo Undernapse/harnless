@@ -291,6 +291,7 @@ dependencies = [
 name = "harnless-fs-local"
 version = "0.1.0"
 dependencies = [
+ "harnless-conformance",
  "harnless-runtime",
  "harnless-seams",
  "libc",
