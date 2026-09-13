@@ -372,6 +372,8 @@ dependencies = [
 name = "harnless-agent"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "harnless-llm-replay",
  "harnless-runtime",
  "harnless-seams",
  "parking_lot",

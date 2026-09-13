@@ -1,0 +1,55 @@
+{
+  "frames": [
+    {
+      "type": "block_start",
+      "index": 0,
+      "kind": "text"
+    },
+    {
+      "type": "text_delta",
+      "index": 0,
+      "text": "Hel"
+    },
+    {
+      "type": "text_delta",
+      "index": 0,
+      "text": "lo"
+    },
+    {
+      "type": "text_delta",
+      "index": 0,
+      "text": " there"
+    },
+    {
+      "type": "block_end",
+      "index": 0,
+      "assembled": {
+        "kind": "text",
+        "text": "Hello there"
+      }
+    },
+    {
+      "type": "usage",
+      "usage": {
+        "uncached_input": 3,
+        "cached_reads": 0,
+        "cached_writes": 0,
+        "output": 1,
+        "reasoning": 0
+      }
+    },
+    {
+      "type": "finish"
+    }
+  ],
+  "response": {
+    "__harnless_provider": "replay",
+    "id": "resp-golden"
+  },
+  "blocks": [
+    {
+      "i": 0
+    }
+  ],
+  "tool_calls": []
+}
