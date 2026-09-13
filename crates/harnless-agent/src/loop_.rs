@@ -52,22 +52,12 @@ pub struct AgentLoop {
     log: Arc<SessionLog>,
     events: EventRegistry,
     fiber: Arc<Fiber>,
-    /// Sticky flag for the documented precedence "MaxTokens wins over a
-    /// later clean stop": set once any turn of this loop has closed with
-    /// [`TurnEndReason::MaxTokens`], so a later clean (`Completed`) close
-    /// is displaced to MaxTokens in the log.
-    closed_max_tokens: parking_lot::Mutex<bool>,
 }
 
 impl AgentLoop {
     /// Create a loop bound to `log` and `fiber` (which owns its effects).
     pub fn new(log: Arc<SessionLog>, events: EventRegistry, fiber: Arc<Fiber>) -> Self {
-        Self {
-            log,
-            events,
-            fiber,
-            closed_max_tokens: parking_lot::Mutex::new(false),
-        }
+        Self { log, events, fiber }
     }
 
     /// The session log this loop drives.
@@ -101,16 +91,14 @@ impl AgentLoop {
     }
 
     /// Drive one turn with `driver`, appending the event sequence to the log.
-    ///
-    /// Opens the turn, runs steps until the driver stops or finishes, then
-    /// closes the turn with the resulting [`TurnEndReason`].
-    ///
-    /// Close precedence: once a turn of this loop has closed with
+    /// Close precedence: once the log holds a turn close with
     /// [`TurnEndReason::MaxTokens`], no later turn may close with a clean
     /// reason — a `Completed` close is displaced to MaxTokens in the log
     /// (and [`DerivedTurn::reason`] reports the reason actually logged).
     /// Non-clean closes (Aborted/Blocked/Error/Interrupted) are never
-    /// displaced.
+    /// displaced. The sticky fact is read from the shared log, not from
+    /// loop-instance state, so it holds across loop instances over one log
+    /// and across save/load of the session.
     pub fn run_turn(&self, driver: Driver) -> DerivedTurn {
         self.log.append(SessionEvent::TurnOpen);
         self.log.append(SessionEvent::StepOpen);
@@ -139,18 +127,17 @@ impl AgentLoop {
             DriverOutcome::Stop(reason) => reason,
         };
 
-        // Precedence guard: a budget-exhausted close is sticky, so a later
-        // clean close is displaced to MaxTokens; non-clean closes stand.
-        let final_reason = {
-            let mut sticky = self.closed_max_tokens.lock();
-            if *sticky && final_reason == TurnEndReason::Completed {
-                TurnEndReason::MaxTokens
-            } else {
-                if final_reason == TurnEndReason::MaxTokens {
-                    *sticky = true;
-                }
-                final_reason
-            }
+        // Precedence guard: a budget-exhausted close is sticky *in the log*,
+        // so a later clean close is displaced to MaxTokens; non-clean closes
+        // stand. Deriving stickiness from the log's own TurnClose records —
+        // rather than a per-loop flag — keeps the rule true for every writer
+        // over the shared log, including a resumed process.
+        let final_reason = if final_reason == TurnEndReason::Completed
+            && self.log.has_closed_max_tokens()
+        {
+            TurnEndReason::MaxTokens
+        } else {
+            final_reason
         };
 
         self.log.append(SessionEvent::StepClose);

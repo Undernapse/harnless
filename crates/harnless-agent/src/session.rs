@@ -95,6 +95,23 @@ impl SessionLog {
         self.inner.lock().get(position).cloned()
     }
 
+    /// Whether the log holds a turn close with
+    /// [`TurnEndReason::MaxTokens`](crate::events::TurnEndReason::MaxTokens).
+    ///
+    /// This is the precedence rule's sticky fact: the loop consults it so a
+    /// clean close never follows a budget-exhausted one, for any writer over
+    /// this log and across save/load (the marker is a persisted record).
+    pub fn has_closed_max_tokens(&self) -> bool {
+        self.inner.lock().iter().any(|r| {
+            matches!(
+                &r.event,
+                SessionEvent::TurnClose {
+                    reason: crate::events::TurnEndReason::MaxTokens
+                }
+            )
+        })
+    }
+
     /// Commit exactly the records whose position is at or after `from`.
     ///
     /// Returns a durability barrier: awaiting it ensures appended records are
