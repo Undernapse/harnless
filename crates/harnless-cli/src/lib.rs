@@ -12,6 +12,7 @@
 //! dump-equals-mount property structural rather than aspirational.
 
 pub mod boot;
+pub mod config_boot;
 pub mod model;
 pub mod profile;
 pub mod repl;

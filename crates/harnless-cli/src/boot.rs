@@ -1,18 +1,18 @@
-//! Boot composition: the seam between the CLI and the (not-yet-landed)
-//! config-boot crate.
+//! Boot composition: the seam between the CLI and the config-boot crate.
 //!
 //! The contract is deliberately thin: a [`BootComposer`] turns a profile
 //! name into a [`ProfileDoc`] and mounts that document onto a live runtime
 //! [`Context`]. The dump and the mount read the *same* document —
 //! `--dump-config` prints exactly what `mount` would compose — so the
-//! dump-equals-mount property holds structurally, before real composition
-//! lands.
+//! dump-equals-mount property is structural rather than aspirational.
 //!
-//! `DefaultComposer` is the only composer today: it knows the built-in
-//! profiles and mounts what is constructible on main (the agent spine plus a
-//! network-free replay model). When `harnless-config` lands, the parent
-//! replaces the composer at the single wire point below; nothing else in the
-//! CLI changes.
+//! [`crate::config_boot::ConfigComposer`] is the wired implementation: it
+//! composes through `harnless-config`'s layered fold (bundles → profile patch
+//! → home patch → per-run overlays), expands `${env:}` / `${home}`
+//! expressions, and mounts rows through a plugin registry that disposes
+//! partial state on failure. [`DefaultComposer`] remains as the minimal
+//! reference composer — the shape a composer must satisfy, and the fixture
+//! the seam's own tests pin.
 
 use std::sync::Arc;
 
@@ -95,9 +95,9 @@ impl BootComposer for DefaultComposer {
     }
 
     fn mount(&self, doc: &ProfileDoc) -> Result<Mounted, CliError> {
-        // PARENT-WIRE: replace DefaultComposer with the harnless-config boot
-        // (compose/dump from ConfigTree) once that crate lands; this mount
-        // body then becomes the config-driven plugin loader.
+        // The binary's composition root wires ConfigComposer (see
+        // `crate::config_boot`); this body is the minimal reference mount the
+        // seam's tests pin.
         let ctx = Context::root();
         let registry = Registry::new();
         registry

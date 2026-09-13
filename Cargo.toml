@@ -15,6 +15,7 @@ members = [
     "crates/harnless-settings-file",
     "crates/harnless-credentials-local",
     "crates/harnless-storage-jsonl",
+    "crates/harnless-config",
 ]
 
 [workspace.package]
