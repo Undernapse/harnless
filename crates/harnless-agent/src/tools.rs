@@ -59,6 +59,14 @@ impl ToolRegistry {
         }
     }
 
+    /// Remove a tool by name, returning whether it was present.
+    ///
+    /// The reversible half of [`Tools::register`]: a plugin fiber's unload
+    /// path uses this so unmounting unwinds exactly its registrations.
+    pub fn remove(&self, name: &str) -> bool {
+        self.tools.write().remove(name).is_some()
+    }
+
     /// Register a monotonic guard under `name`.
     ///
     /// Guards run after the pre-execute waterfall and cannot be reordered

@@ -1,0 +1,21 @@
+[package]
+name = "harnless-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The dynamic WASM plugin surface: wasmtime component-model loader, per-plugin fiber, capability sandbox, panic isolation, transactional reload"
+
+[dependencies]
+harnless-runtime = { path = "../harnless-runtime" }
+harnless-seams = { path = "../harnless-seams" }
+harnless-agent = { path = "../harnless-agent" }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasmtime = { version = "=46.0.1", default-features = false, features = ["component-model", "runtime", "cranelift", "std", "wat"] }
+wasmtime-wasi = { version = "=46.0.1", default-features = false, features = ["p2"] }
+wasm-encoder = { version = "0.251", default-features = false, features = ["component-model"] }
+
+[dev-dependencies]
+tempfile = "3"
