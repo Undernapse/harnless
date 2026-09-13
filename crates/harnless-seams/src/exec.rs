@@ -21,13 +21,71 @@ pub struct PolicyHome {
 }
 
 /// Spawn coordinates for a subprocess.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Construct with the field shorthand (`Spawn { argv, cwd, ..Default::default() }`):
+/// [`Spawn::confine`] is an additive hint that plain constructors leave
+/// `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Spawn {
     /// The program to run.
     pub argv: Vec<String>,
     /// The working directory for the subprocess.
     pub cwd: Option<String>,
+    /// The confinement a sandbox verdict asks a confinement-capable
+    /// spawner to apply to this spawn (env scrub + cwd pin + rlimit,
+    /// applied in the forked child).
+    ///
+    /// The hint is deliberately an opaque, provider-supplied payload: the
+    /// seam vocabulary stays dependency-free, and only the exec providers
+    /// that understand confinement construct or read it. A [`Subprocess`]
+    /// that ignores the field spawns exactly the coordinates it always
+    /// did — the field is additive, never a behaviour change for plain
+    /// providers.
+    pub confine: Option<ConfineHint>,
 }
+
+/// An opaque, provider-supplied confinement payload carried on [`Spawn`].
+///
+/// The seams crate never interprets it; the exec providers define the
+/// concrete shape (see `harnless_exec_bash::Confinement`) and share it
+/// here, so the spawn coordinates can carry a sandbox verdict through any
+/// [`Subprocess`] without the seam vocabulary gaining dependencies.
+/// Cloning a hint shares the description — it is immutable once the
+/// verdict fixed it.
+#[derive(Clone)]
+pub struct ConfineHint {
+    /// The provider-specific confinement description.
+    pub inner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl ConfineHint {
+    /// Wrap a provider's confinement description.
+    pub fn new<T: std::any::Any + Send + Sync>(confine: T) -> Self {
+        Self {
+            inner: std::sync::Arc::new(confine),
+        }
+    }
+
+    /// Downcast to the provider's concrete description, when it matches.
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> {
+        self.inner.downcast_ref::<T>()
+    }
+}
+
+impl std::fmt::Debug for ConfineHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfineHint").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ConfineHint {
+    /// Hints compare by identity: they are shared, immutable descriptions.
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Eq for ConfineHint {}
 
 /// What a sandbox actually enforced for a spawned command: the full
 /// auditable report, verdict included.

@@ -426,7 +426,9 @@ dependencies = [
  "harnless-exec-sandbox",
  "harnless-exec-subprocess",
  "harnless-seams",
+ "libc",
  "parking_lot",
+ "tokio",
 ]
 
 [[package]]
@@ -434,6 +436,7 @@ name = "harnless-exec-sandbox"
 version = "0.1.0"
 dependencies = [
  "harnless-seams",
+ "libc",
 ]
 
 [[package]]
