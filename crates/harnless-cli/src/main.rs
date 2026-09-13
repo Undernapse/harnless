@@ -8,16 +8,24 @@
 //!   document through the boot serializer;
 //! * `hrls profile list` — show available profiles.
 //!
+//! Composition is the layered model in `harnless-config`: the profile's
+//! bundles, its own patch, the home-level patch, and any `--patch` overlays
+//! fold in that precedence order, and `--dump-config` prints the result of the
+//! same fold boot mounts. `--config` points at a directory of `profiles/` and
+//! `bundles/` documents; `--home-patch` supplies the home-level layer.
+//!
 //! Argument errors are clap's machine-readable defaults (nonzero exit,
-//! `error:`-prefixed stderr). Runtime failures print `code: message` and
-//! exit nonzero with a stable code.
+//! `error:`-prefixed stderr). Runtime failures print `code: message` and exit
+//! nonzero with a stable code. Composition warnings (a patch naming an absent
+//! row, an ignored malformed home patch) print to stderr and never fail a run.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use harnless_cli::boot::{BootComposer, DefaultComposer};
+use harnless_cli::boot::BootComposer;
+use harnless_cli::config_boot::ConfigComposer;
 use harnless_cli::{repl, run, CliError};
 
 /// The harnless agent harness.
@@ -32,6 +40,15 @@ struct Cli {
     #[arg(long)]
     dump_config: bool,
 
+    /// Directory holding `profiles/` and `bundles/` YAML documents.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    /// YAML patch file applied above the profile and home patches. Repeatable;
+    /// later overlays outrank earlier ones.
+    #[arg(long, global = true)]
+    patch: Vec<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -40,9 +57,6 @@ struct Cli {
 enum Command {
     /// Run one headless agent turn and print the answer.
     Run {
-        /// Optional YAML patch merged over the composed profile.
-        #[arg(long)]
-        patch: Option<PathBuf>,
         /// The prompt (everything after `--`).
         #[arg(last = true, required = true)]
         prompt: Vec<String>,
@@ -72,8 +86,29 @@ fn main() -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Build the composer for this invocation.
+///
+/// The one composition root: a `--config` directory layers over the built-in
+/// profiles, and `HARNESS_HOME_PATCH` supplies the home-level layer (the
+/// `~/.config/harnless/patch.yml` analog, read by whoever assembles the
+/// environment so the CLI stays free of home-directory policy).
+fn composer(cli: &Cli) -> ConfigComposer {
+    let home_patch = std::env::var("HARNESS_HOME_PATCH").ok();
+    match &cli.config {
+        Some(dir) => ConfigComposer::with_dir(dir.clone(), home_patch.as_deref()),
+        None => match home_patch {
+            Some(patch) => ConfigComposer::built_in_with_home_patch(Some(&patch)),
+            None => ConfigComposer::built_in(),
+        },
+    }
+}
+
 fn dispatch(cli: &Cli) -> Result<(), CliError> {
-    let composer = DefaultComposer;
+    let composer = composer(cli);
+    // Repeated `--patch` files concatenate into one overlay document: each
+    // file is a YAML document, and the fold order is the flag order.
+    let patch = read_patches(&cli.patch)?;
+    let patch = patch.as_deref();
     match &cli.command {
         Some(Command::Profile { action }) => match action {
             ProfileAction::List => {
@@ -83,16 +118,28 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                 Ok(())
             }
         },
-        Some(Command::Run { patch, prompt }) => {
-            let patch = read_patch(patch.as_deref())?;
-            let text = run::run_once(&composer, &cli.profile, patch.as_deref(), &prompt.join(" "))?;
+        Some(Command::Run { prompt }) => {
+            let text = run::run_once(
+                &composer,
+                &cli.profile,
+                patch.as_deref(),
+                &prompt.join(" "),
+            )?;
+            report(&composer);
             println!("{text}");
             Ok(())
         }
-        Some(Command::Interactive) => repl::interactive(&cli.profile),
+        Some(Command::Interactive) => {
+            let doc = composer.compose(&cli.profile, None)?;
+            report(&composer);
+            let mounted = composer.mount(&doc)?;
+            let stdin = std::io::stdin();
+            repl::repl(&mounted, stdin.lock(), std::io::stdout())
+        }
         None => {
             if cli.dump_config {
-                let doc = composer.compose(&cli.profile, None)?;
+                let doc = composer.compose(&cli.profile, patch.as_deref())?;
+                report(&composer);
                 print!("{}", composer.dump(&doc));
                 Ok(())
             } else {
@@ -108,12 +155,25 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
     }
 }
 
-/// Read the optional patch file.
-fn read_patch(path: Option<&std::path::Path>) -> Result<Option<String>, CliError> {
-    match path {
-        None => Ok(None),
-        Some(path) => std::fs::read_to_string(path)
-            .map(Some)
-            .map_err(|e| CliError::new("bad-patch", format!("cannot read patch: {e}"))),
+/// Print the composition's warnings to stderr.
+fn report(composer: &ConfigComposer) {
+    harnless_cli::config_boot::report_warnings(&composer.warnings(), std::io::stderr());
+}
+
+/// Read the optional patch files, joined as one overlay document.
+///
+/// YAML documents concatenate with `---`, so N `--patch` flags fold as N
+/// layers in flag order without a bespoke merge.
+fn read_patches(paths: &[PathBuf]) -> Result<Option<String>, CliError> {
+    if paths.is_empty() {
+        return Ok(None);
     }
+    let mut texts = Vec::with_capacity(paths.len());
+    for path in paths {
+        texts.push(
+            std::fs::read_to_string(path)
+                .map_err(|e| CliError::new("bad-patch", format!("cannot read patch: {e}")))?,
+        );
+    }
+    Ok(Some(texts.join("\n---\n")))
 }

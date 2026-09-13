@@ -388,12 +388,25 @@ dependencies = [
  "clap",
  "futures",
  "harnless-agent",
+ "harnless-config",
  "harnless-llm-replay",
  "harnless-runtime",
  "harnless-seams",
+ "parking_lot",
  "serde",
  "serde_json",
  "serde_yaml",
+]
+
+[[package]]
+name = "harnless-config"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
 ]
 
 [[package]]

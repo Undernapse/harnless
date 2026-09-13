@@ -1,0 +1,16 @@
+[package]
+name = "harnless-config"
+description = "Layered config/boot composition for harnless: YAML plugin rows, bundles, id-targeted patches, home and per-run overlays, ${env:}/${home} substitution, and the offline dump."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+parking_lot = "0.12"
+tempfile = "3"
