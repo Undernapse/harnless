@@ -1,0 +1,34 @@
+[package]
+name = "harnless-mcp"
+description = "MCP client seam and tools-only bridge for harnless: consumes external MCP servers (stdio + streamable HTTP) and registers their tools on ctx.tools under namespaced public names."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harnless-runtime = { path = "../harnless-runtime" }
+harnless-seams = { path = "../harnless-seams" }
+futures = "0.3"
+parking_lot = "0.12"
+rmcp = { version = "2.2", features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+http = "1"
+tokio-util = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+
+[features]
+test-support = []
+
+[[test]]
+name = "primary_seam"
+required-features = ["test-support"]
