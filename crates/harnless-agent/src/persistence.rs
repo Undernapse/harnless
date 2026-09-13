@@ -14,24 +14,30 @@ use harnless_seams::SessionId;
 
 use crate::events::SessionEvent;
 
-/// A loaded session log: the exact appended events plus the seed boundary
-/// marker, so reopening an untouched session does not grow its log.
+/// A loaded session log: the exact appended events, from which the seed
+/// boundary is derived, so reopening an untouched session does not grow its
+/// log.
 ///
-/// `seeded` is **derivable from `events`**, not an independent fact: a
-/// backend sets it to `true` iff the batch it stores contains
-/// [`SessionEvent::SeedBoundary`] (or its encoding carries the equivalent
-/// marker). The marker is a member of the core vocabulary precisely so a
-/// backend can persist it through `save` and recover it through `load`; a
-/// `LoadedLog` whose `seeded` disagrees with its own events is a
-/// non-conforming backend.
+/// The seed boundary is **derivable from `events`**, never an independent
+/// fact: a log is seeded iff its events contain
+/// [`SessionEvent::SeedBoundary`]. The marker is a member of the core
+/// vocabulary precisely so a backend can persist it through `save` and
+/// recover it through `load` — there is no separate flag a backend could
+/// set out of step with what its encoding actually carries.
 #[derive(Debug, Clone)]
 pub struct LoadedLog {
     /// The exact events, in position order.
     pub events: Vec<SessionEvent>,
-    /// Whether this log carries a seed boundary (writes from this process).
-    ///
+}
+
+impl LoadedLog {
+    /// Whether this log carries a seed boundary (writes from this process):
     /// `true` iff `events` contains [`SessionEvent::SeedBoundary`].
-    pub seeded: bool,
+    pub fn is_seeded(&self) -> bool {
+        self.events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::SeedBoundary))
+    }
 }
 
 /// The session-persistence seam.
@@ -79,10 +85,10 @@ mod tests {
             &mut self,
             session: &SessionId,
         ) -> std::result::Result<Option<LoadedLog>, String> {
-            Ok(self.stored.get(&session.0).map(|e| LoadedLog {
-                events: e.clone(),
-                seeded: false,
-            }))
+            Ok(self
+                .stored
+                .get(&session.0)
+                .map(|e| LoadedLog { events: e.clone() }))
         }
     }
 

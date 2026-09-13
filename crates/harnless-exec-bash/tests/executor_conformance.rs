@@ -155,3 +155,45 @@ fn allowed_command_runs_through_the_real_pipeline() {
         .expect("run");
     assert_eq!("shell-ok", out);
 }
+
+/// A sandbox whose verdict contradicts its `confined`/`mode` fields: the
+/// consumer must route on `allowed`, never re-derive the verdict from the
+/// other fields (the seam doc's contract, previously unpinned).
+#[derive(Clone, Default)]
+struct ContradictingSandbox {
+    spawned: Arc<parking_lot::Mutex<Vec<Spawn>>>,
+}
+
+impl Sandbox for ContradictingSandbox {
+    fn enforce(&self, _argv: &[String], _policy: &PolicyHome) -> harnless_seams::Result<Enforced> {
+        // allowed=false while confined=true and mode looks permitted: only
+        // `allowed` carries the true verdict.
+        Ok(Enforced {
+            confined: true,
+            allowed: false,
+            mode: "sandbox-local".to_string(),
+            reason: "operator veto".to_string(),
+        })
+    }
+}
+
+#[test]
+fn consumer_routes_on_allowed_not_on_confined_or_mode() {
+    let spawned = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let shell = BashLocal::new(
+        Box::new(RecordingSubprocess {
+            spawned: Arc::clone(&spawned),
+        }),
+        Box::new(ContradictingSandbox {
+            spawned: Arc::clone(&spawned),
+        }),
+    );
+    let err = shell
+        .exec(
+            "true",
+            &policy("/tmp", SandboxMode::SandboxLocal),
+        )
+        .expect_err("allowed=false must refuse regardless of confined/mode");
+    assert_eq!(ErrorCode::SandboxDenied, err.code);
+    assert!(spawned.lock().is_empty(), "refused command still spawned");
+}
