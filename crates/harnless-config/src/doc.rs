@@ -26,6 +26,25 @@ use serde_yaml::Value;
 /// convention every profile in this ecosystem follows for its model row.
 pub const MODEL_ROW_KEY: &str = "model";
 
+/// The row id a field-wise `system_prompt` patch writes to.
+///
+/// The composition model has one kind of content — plugin rows — so a
+/// document-level field restated by a patch becomes a dedicated row under
+/// this id, carrying the value as its config. The CLI's plan projection
+/// reads these rows back onto the plan's fields; nothing mounts them.
+pub const SYSTEM_PROMPT_ROW_KEY: &str = "system_prompt";
+
+/// The row id a field-wise `tools` patch writes its tool list to.
+pub const TOOLS_ROW_KEY: &str = "tools";
+
+/// The plugin name of the synthetic rows carrying field-wise document
+/// fields ([`SYSTEM_PROMPT_ROW_KEY`], [`TOOLS_ROW_KEY]).
+///
+/// The `doc:` prefix keeps the namespace away from real plugins, and the
+/// CLI's seam table classifies it as document content, never a mountable
+/// service.
+pub const DOC_PLUGIN_PREFIX: &str = "doc:";
+
 /// One plugin row: an id, the plugin implementation to instantiate, and the
 /// opaque config handed to it.
 ///
@@ -152,6 +171,7 @@ impl Layer {
     /// Build a layer from an already-parsed YAML value.
     pub fn from_value(value: Value) -> crate::error::Result<Self> {
         use crate::error::{ConfigError, Stage};
+        reject_tags(&value, false, "<root>", Stage::Patch)?;
         match value {
             Value::Null => Ok(Layer {
                 name: String::new(),
@@ -184,13 +204,21 @@ impl Layer {
                     return Ok(Layer::patch(String::new(), vec![op]));
                 }
                 if let Some(layer) = decode::<Layer>(value.clone()).ok() {
-                    return Ok(layer);
+                    // `name` defaults, so `name: x` alone decodes as a
+                    // contentless layer. An overlay that contributes nothing
+                    // is a typo, not a no-op — reject it so the caller's
+                    // discard-by-emptiness never sees it.
+                    if !layer.rows.is_empty() || !layer.patch.is_empty() {
+                        return Ok(layer);
+                    }
                 }
                 if let Some(row) = decode::<Row>(value.clone()).ok() {
                     return Ok(Layer::rows(String::new(), vec![row]));
                 }
-                if let Some(patch) = field_patch(&value) {
-                    return Ok(Layer::patch(String::new(), patch));
+                if let Some((rows, patch)) = field_patch(&value) {
+                    let mut layer = Layer::patch(String::new(), patch);
+                    layer.rows = rows;
+                    return Ok(layer);
                 }
                 Err(ConfigError::new(
                     Stage::Patch,
@@ -204,7 +232,10 @@ impl Layer {
             other => Err(ConfigError::new(
                 Stage::Patch,
                 "bad-patch",
-                format!("layer must be a mapping or sequence, got {}", kind_of(&other)),
+                format!(
+                    "layer must be a mapping or sequence, got {}",
+                    kind_of(&other)
+                ),
             )),
         }
     }
@@ -362,39 +393,111 @@ fn decode<T: serde::de::DeserializeOwned>(value: Value) -> serde_yaml::Result<T>
     serde_yaml::from_value(value)
 }
 
+/// Reject YAML tags outside a row's opaque `config`, which is plugin-owned
+/// data and may carry anything (as values only — tagged keys are rejected
+/// everywhere; see the mapping arm).
+///
+/// `in_row_config` flips once inside a row mapping's `config` key and stays
+/// set below it; everything above that level is composition vocabulary,
+/// where a tag is an authoring error, not data. `stage` names the loading
+/// document's step (`Compose` for bundle/profile/config files, `Patch` for
+/// overlay layers) so the error reports the file kind that actually broke.
+fn reject_tags(
+    value: &Value,
+    in_row_config: bool,
+    path: &str,
+    stage: crate::error::Stage,
+) -> crate::error::Result<()> {
+    match value {
+        Value::Tagged(tagged) => {
+            if !in_row_config {
+                return Err(crate::error::ConfigError::new(
+                    stage,
+                    "bad-tag",
+                    format!(
+                        "YAML tag {:?} at {path} is not allowed; only a row's \
+                         opaque config may carry tags",
+                        tagged.tag
+                    ),
+                ));
+            }
+            reject_tags(&tagged.value, true, path, stage)?;
+        }
+        Value::Sequence(items) => {
+            for (i, item) in items.iter().enumerate() {
+                reject_tags(item, in_row_config, &format!("{path}[{i}]"), stage)?;
+            }
+        }
+        Value::Mapping(map) => {
+            let row = is_row_mapping(map);
+            for (key, val) in map {
+                // A tagged key is rejected everywhere — even inside a row's
+                // opaque config — because a YAML emitter cannot represent
+                // one: accepting it would let a composed document panic
+                // `dump()`, breaking "a document that composes can dump".
+                if matches!(key, Value::Tagged(_)) {
+                    return Err(crate::error::ConfigError::new(
+                        stage,
+                        "bad-tag",
+                        format!("YAML tag on a mapping key at {path} is not representable"),
+                    ));
+                }
+                let key_name = key.as_str().unwrap_or("");
+                let child_in_config = in_row_config || (row && key_name == "config");
+                reject_tags(val, child_in_config, &format!("{path}.{key_name}"), stage)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Whether a mapping is row-shaped (`id` + `plugin` keys), the only place
+/// an opaque `config` value legitimately appears.
+fn is_row_mapping(map: &serde_yaml::Mapping) -> bool {
+    map.contains_key(&Value::String("id".into()))
+        && map.contains_key(&Value::String("plugin".into()))
+}
+
 /// Parse a plain-data YAML document, with an empty file mapped to `null` so
 /// callers can share one decode path.
 ///
 /// A syntax error is returned as-is — misdiagnosing a stray tab as a shape
 /// problem ("invalid type: unit") sends users hunting the wrong file
-/// feature.
+/// feature. A YAML tag outside a row's opaque config is rejected here:
+/// serde_yaml keeps it as `Value::Tagged` but then silently untags it when
+/// decoding a struct field, so a tagged document would otherwise compose
+/// into a different, valid-looking value than its bytes say.
 fn parse(yaml: &str) -> crate::error::Result<Value> {
     let text = yaml.trim();
     if text.is_empty() {
         return Ok(Value::Null);
     }
-    serde_yaml::from_str(text).map_err(|e| {
-        crate::error::ConfigError::new(
-            crate::error::Stage::Compose,
-            "bad-yaml",
-            e.to_string(),
-        )
-    })
+    let value = serde_yaml::from_str::<Value>(text).map_err(|e| {
+        crate::error::ConfigError::new(crate::error::Stage::Compose, "bad-yaml", e.to_string())
+    })?;
+    reject_tags(&value, false, "<root>", crate::error::Stage::Compose)?;
+    Ok(value)
 }
 
-/// Recognise a field-wise profile patch and translate it to row operations.
+/// Recognise a field-wise profile patch and translate it to row content.
 ///
-/// The only field-wise patch vocabulary is `model`: the model field is a
-/// row in the composition (`MODEL_ROW_KEY`), so a `model:` key translates
-/// to a whole-config `set` on that row — restating is still required and
-/// the composition stays readable. Document-level fields (`system_prompt`,
-/// `tools`, `seams`, `name`) are not rows and have no row-level patch
-/// spelling; a layer carrying any of them is not a field-wise patch and
-/// returns `None`, so it surfaces through the normal layer classification
-/// (a typed `bad-patch` naming the shape) rather than silently applying a
-/// partial profile rewrite.
-fn field_patch(value: &Value) -> Option<Vec<PatchOp>> {
+/// The field-wise patch vocabulary is the legacy `--patch` shape: `model`,
+/// `system_prompt`, and `tools`. `model` is a row in the composition
+/// ([`MODEL_ROW_KEY`]), so a `model:` key translates to a whole-config `set`
+/// on that row — restating is still required and the composition stays
+/// readable. `system_prompt` and `tools` are document-level fields; the
+/// composition has one kind of content (rows), so they ride as dedicated
+/// rows ([`SYSTEM_PROMPT_ROW_KEY`], [`TOOLS_ROW_KEY`]) under
+/// [`DOC_PLUGIN_PREFIX`], which the CLI's plan projection reads back onto
+/// the plan's fields. `name` and `seams` are identity and mount-plan
+/// projection, not patchable content: a layer carrying them alongside
+/// patchable fields is not a field-wise patch and returns `None`, so it
+/// surfaces through the normal layer classification (a typed `bad-patch`
+/// naming the shape) rather than silently rewriting profile identity.
+fn field_patch(value: &Value) -> Option<(Vec<Row>, Vec<PatchOp>)> {
     let map = value.as_mapping()?;
+    let mut rows = Vec::new();
     let mut ops = Vec::new();
     for (key, val) in map {
         let field = key.as_str()?;
@@ -403,15 +506,21 @@ fn field_patch(value: &Value) -> Option<Vec<PatchOp>> {
                 id: MODEL_ROW_KEY.to_string(),
                 config: val.clone(),
             }),
-            "system_prompt" | "tools" | "seams" | "name" => {
-                // Document-level fields ride as a whole-document override:
-                // they are not rows, so they cannot be a `set` on one.
-                return None;
-            }
+            "system_prompt" => rows.push(Row {
+                id: SYSTEM_PROMPT_ROW_KEY.to_string(),
+                plugin: format!("{DOC_PLUGIN_PREFIX}system-prompt"),
+                config: val.clone(),
+            }),
+            "tools" => rows.push(Row {
+                id: TOOLS_ROW_KEY.to_string(),
+                plugin: format!("{DOC_PLUGIN_PREFIX}tools"),
+                config: val.clone(),
+            }),
+            "seams" | "name" => return None,
             _ => return None,
         }
     }
-    (!ops.is_empty()).then_some(ops)
+    (!rows.is_empty() || !ops.is_empty()).then_some((rows, ops))
 }
 
 /// The first decode error for a mapping layer, for the `bad-patch` message.
@@ -514,5 +623,89 @@ mod tests {
             "a syntax error must not be re-reported as a shape error: {}",
             err.message
         );
+    }
+
+    /// The legacy `--patch` vocabulary is field-wise: `model`,
+    /// `system_prompt`, and `tools` must all parse as a patch layer, with
+    /// the document-level fields riding as dedicated rows (not vanishing).
+    #[test]
+    fn a_field_wise_patch_accepts_model_system_prompt_and_tools() {
+        let layer = Layer::load("system_prompt: be terse\ntools:\n- bash\n- read\n").unwrap();
+        assert_eq!(layer.rows.len(), 2, "doc fields become rows");
+        assert!(layer.patch.is_empty());
+        let ids: Vec<&str> = layer.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec![SYSTEM_PROMPT_ROW_KEY, TOOLS_ROW_KEY]);
+        assert!(layer
+            .rows
+            .iter()
+            .all(|r| r.plugin.starts_with(DOC_PLUGIN_PREFIX)));
+        // A mixed patch (model + doc fields) parses too.
+        let mixed = Layer::load("model:\n  kind: none\nsystem_prompt: terse\n").unwrap();
+        assert_eq!(mixed.patch.len(), 1);
+        assert_eq!(mixed.rows.len(), 1);
+        // `seams` is mount-plan projection, never patch content; and a
+        // field-wise patch may not smuggle profile `name` alongside content.
+        assert!(Layer::load("seams:\n- spine\n").is_err());
+        assert!(Layer::load("name: sneaky\nsystem_prompt: terse\n").is_err());
+    }
+
+    /// A YAML tag outside a row's opaque config must be a typed error.
+    /// serde_yaml keeps `Value::Tagged` for non-standard tags — and then
+    /// silently untags it when decoding a struct field (`!mytag` on a row's
+    /// `plugin` composes to a row named `""`), so the compose stage must
+    /// refuse the tag, not normalise it.
+    #[test]
+    fn a_tagged_typed_scalar_is_a_typed_error() {
+        let err = Layer::load("rows:\n- id: a\n  plugin: !mytag\n").unwrap_err();
+        assert_eq!(err.code, "bad-tag");
+        assert_eq!(err.stage, crate::error::Stage::Patch);
+        let err = BundleDoc::load("name: b\nrows:\n- id: a\n  plugin: !mytag\n").unwrap_err();
+        assert_eq!(err.code, "bad-tag");
+        // A tag inside a row's opaque config is plugin-owned data: legal.
+        assert!(Layer::load("rows:\n- id: a\n  plugin: p\n  config: !mytag\n").is_ok());
+    }
+
+    /// A tagged mapping key is unrepresentable in a YAML dump (the emitter
+    /// rejects it), so accepting one inside a row's opaque config would
+    /// let a composed document panic `dump()`. Tags are legal only as
+    /// values, never as keys.
+    #[test]
+    fn a_tagged_mapping_key_is_a_typed_error() {
+        let err = ConfigDoc::load(
+            "name: d\nrows:\n- id: a\n  plugin: p\n  config:\n    ? !mytag k\n    : v\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad-tag");
+        // Outside config a tagged key is rejected too, as bad-tag not a
+        // later shape error.
+        let err = ConfigDoc::load("name: d\n? !mytag rows\n: []\n").unwrap_err();
+        assert_eq!(err.code, "bad-tag");
+    }
+
+    /// The stage names which step of booting broke: a tag in a bundle or
+    /// profile document is a compose-stage failure, not a patch failure —
+    /// every other failure from those loaders reports `Compose`.
+    #[test]
+    fn a_tag_reports_the_loading_documents_stage() {
+        let err = BundleDoc::load("name: b\nrows:\n- id: a\n  plugin: !mytag\n").unwrap_err();
+        assert_eq!(err.code, "bad-tag");
+        assert_eq!(err.stage, crate::error::Stage::Compose);
+        let err = ProfileSpec::load("name: p\nrows:\n- id: a\n  plugin: !mytag\n").unwrap_err();
+        assert_eq!(err.code, "bad-tag");
+        assert_eq!(err.stage, crate::error::Stage::Compose);
+        let err = Layer::load("rows:\n- id: a\n  plugin: !mytag\n").unwrap_err();
+        assert_eq!(err.code, "bad-tag");
+        assert_eq!(err.stage, crate::error::Stage::Patch);
+    }
+
+    /// A `--patch name: typo` overlay must not silently do nothing: `name`
+    /// is profile identity, never patch content, so it is a typed error —
+    /// matching the neighbouring `name` + content case.
+    #[test]
+    fn a_name_only_overlay_is_a_typed_error() {
+        assert!(Layer::load("name: x\n").is_err());
+        // A real layer document (with rows or patch) keeps its name.
+        let layer = Layer::load("name: real\nrows:\n- id: a\n  plugin: p\n").unwrap();
+        assert_eq!(layer.name, "real");
     }
 }

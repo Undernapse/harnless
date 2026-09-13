@@ -221,7 +221,12 @@ impl FileSystem for MemFs {
         })
     }
 
-    fn write(&self, target: &Target, contents: &[u8], guard: Option<WriteGuard>) -> Result<MutationResult> {
+    fn write(
+        &self,
+        target: &Target,
+        contents: &[u8],
+        guard: Option<WriteGuard>,
+    ) -> Result<MutationResult> {
         let mut inner = self.lock();
         let path = self.path_of(&inner, target)?;
         let exists = inner.files.contains_key(&path);
@@ -289,7 +294,12 @@ impl FileSystem for MemFs {
         Ok(MutationResult { version })
     }
 
-    fn edit(&self, target: &Target, edit: &Edit, guard: Option<WriteGuard>) -> Result<MutationResult> {
+    fn edit(
+        &self,
+        target: &Target,
+        edit: &Edit,
+        guard: Option<WriteGuard>,
+    ) -> Result<MutationResult> {
         let mut inner = self.lock();
         let path = self.path_of(&inner, target)?;
         if let Some(WriteGuard::ReplaceAtVersion(token)) = &guard {
@@ -471,7 +481,9 @@ mod negative {
     use super::MemFs;
     use harnless_conformance::check_file_system;
     use harnless_seams::error::{ErrorCode, SeamError};
-    use harnless_seams::fs::{Edit, Entry, FileSystem, MutationResult, ReadWindow, Target, WriteGuard};
+    use harnless_seams::fs::{
+        Edit, Entry, FileSystem, MutationResult, ReadWindow, Target, WriteGuard,
+    };
     use harnless_seams::ids::VersionToken;
 
     /// A shared reference provider whose guarded writes silently drop the
@@ -484,10 +496,20 @@ mod negative {
         fn read(&self, t: &Target, n: usize) -> harnless_seams::error::Result<ReadWindow> {
             self.0.read(t, n)
         }
-        fn write(&self, t: &Target, c: &[u8], _g: Option<WriteGuard>) -> harnless_seams::error::Result<MutationResult> {
+        fn write(
+            &self,
+            t: &Target,
+            c: &[u8],
+            _g: Option<WriteGuard>,
+        ) -> harnless_seams::error::Result<MutationResult> {
             self.0.write(t, c, None)
         }
-        fn edit(&self, t: &Target, e: &Edit, _g: Option<WriteGuard>) -> harnless_seams::error::Result<MutationResult> {
+        fn edit(
+            &self,
+            t: &Target,
+            e: &Edit,
+            _g: Option<WriteGuard>,
+        ) -> harnless_seams::error::Result<MutationResult> {
             self.0.edit(t, e, None)
         }
         fn list(&self, t: &Target) -> harnless_seams::error::Result<Vec<Entry>> {
@@ -516,7 +538,12 @@ mod negative {
         fn read(&self, t: &Target, n: usize) -> harnless_seams::error::Result<ReadWindow> {
             self.0.read(t, n)
         }
-        fn write(&self, t: &Target, c: &[u8], g: Option<WriteGuard>) -> harnless_seams::error::Result<MutationResult> {
+        fn write(
+            &self,
+            t: &Target,
+            c: &[u8],
+            g: Option<WriteGuard>,
+        ) -> harnless_seams::error::Result<MutationResult> {
             match g {
                 // Refuse the guarded write the suite makes with the *fresh*
                 // token from the preceding mutation: a current token must
@@ -527,7 +554,12 @@ mod negative {
                 _ => self.0.write(t, c, g),
             }
         }
-        fn edit(&self, t: &Target, e: &Edit, g: Option<WriteGuard>) -> harnless_seams::error::Result<MutationResult> {
+        fn edit(
+            &self,
+            t: &Target,
+            e: &Edit,
+            g: Option<WriteGuard>,
+        ) -> harnless_seams::error::Result<MutationResult> {
             self.0.edit(t, e, g)
         }
         fn list(&self, t: &Target) -> harnless_seams::error::Result<Vec<Entry>> {
@@ -556,10 +588,20 @@ mod negative {
             w.total_lines = w.total_lines.min(1);
             Ok(w)
         }
-        fn write(&self, t: &Target, c: &[u8], g: Option<WriteGuard>) -> harnless_seams::error::Result<MutationResult> {
+        fn write(
+            &self,
+            t: &Target,
+            c: &[u8],
+            g: Option<WriteGuard>,
+        ) -> harnless_seams::error::Result<MutationResult> {
             self.0.write(t, c, g)
         }
-        fn edit(&self, t: &Target, e: &Edit, g: Option<WriteGuard>) -> harnless_seams::error::Result<MutationResult> {
+        fn edit(
+            &self,
+            t: &Target,
+            e: &Edit,
+            g: Option<WriteGuard>,
+        ) -> harnless_seams::error::Result<MutationResult> {
             self.0.edit(t, e, g)
         }
         fn list(&self, t: &Target) -> harnless_seams::error::Result<Vec<Entry>> {
@@ -588,10 +630,20 @@ mod negative {
                 self.0.read(&real, n)
             })
         }
-        fn write(&self, t: &Target, c: &[u8], g: Option<WriteGuard>) -> harnless_seams::error::Result<MutationResult> {
+        fn write(
+            &self,
+            t: &Target,
+            c: &[u8],
+            g: Option<WriteGuard>,
+        ) -> harnless_seams::error::Result<MutationResult> {
             self.0.write(t, c, g)
         }
-        fn edit(&self, t: &Target, e: &Edit, g: Option<WriteGuard>) -> harnless_seams::error::Result<MutationResult> {
+        fn edit(
+            &self,
+            t: &Target,
+            e: &Edit,
+            g: Option<WriteGuard>,
+        ) -> harnless_seams::error::Result<MutationResult> {
             self.0.edit(t, e, g)
         }
         fn list(&self, t: &Target) -> harnless_seams::error::Result<Vec<Entry>> {
@@ -624,10 +676,20 @@ mod negative {
                 }
             })
         }
-        fn write(&self, t: &Target, c: &[u8], g: Option<WriteGuard>) -> harnless_seams::error::Result<MutationResult> {
+        fn write(
+            &self,
+            t: &Target,
+            c: &[u8],
+            g: Option<WriteGuard>,
+        ) -> harnless_seams::error::Result<MutationResult> {
             self.0.write(t, c, g)
         }
-        fn edit(&self, t: &Target, e: &Edit, g: Option<WriteGuard>) -> harnless_seams::error::Result<MutationResult> {
+        fn edit(
+            &self,
+            t: &Target,
+            e: &Edit,
+            g: Option<WriteGuard>,
+        ) -> harnless_seams::error::Result<MutationResult> {
             self.0.edit(t, e, g)
         }
         fn list(&self, t: &Target) -> harnless_seams::error::Result<Vec<Entry>> {

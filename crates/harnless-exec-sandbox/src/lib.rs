@@ -33,7 +33,7 @@
 
 use std::path::Path;
 
-use harnless_seams::error::{ErrorCode, SeamError, Result};
+use harnless_seams::error::{ErrorCode, Result, SeamError};
 use harnless_seams::exec::{Enforced, PolicyHome, Sandbox};
 
 /// The confinement mode a [`LocalSandbox`] enforces.
@@ -163,10 +163,9 @@ impl LocalSandbox {
     pub fn enforce_verdict(&self, argv: &[String], policy: &PolicyHome) -> Enforced {
         let mode = self.mode_for(policy);
         match mode {
-            SandboxMode::Unconfined => allowed(
-                mode,
-                "policy allows unconfined execution; nothing enforced",
-            ),
+            SandboxMode::Unconfined => {
+                allowed(mode, "policy allows unconfined execution; nothing enforced")
+            }
             SandboxMode::DenyAll => denied(
                 mode,
                 format!(
@@ -285,7 +284,9 @@ impl Sandbox for LocalSandbox {
 fn best_effort_guarantees(workspace_root: &str) -> std::result::Result<String, String> {
     let root = Path::new(workspace_root);
     if !root.is_dir() {
-        return Err(format!("workspace root {workspace_root:?} is not a directory"));
+        return Err(format!(
+            "workspace root {workspace_root:?} is not a directory"
+        ));
     }
     let canonical = root
         .canonicalize()
@@ -341,11 +342,17 @@ fn apply_rlimit_as(bytes: u64) -> Result<()> {
         fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
     }
     const RLIMIT_AS: i32 = 3; // correct on Linux; other Unix differ.
-    let lim = RLimit { cur: bytes, max: bytes };
+    let lim = RLimit {
+        cur: bytes,
+        max: bytes,
+    };
     if unsafe { setrlimit(RLIMIT_AS, &lim) } != 0 {
         return Err(SeamError::new(
             ErrorCode::SandboxDenied,
-            format!("setrlimit(RLIMIT_AS) failed: {}", std::io::Error::last_os_error()),
+            format!(
+                "setrlimit(RLIMIT_AS) failed: {}",
+                std::io::Error::last_os_error()
+            ),
         ));
     }
     Ok(())

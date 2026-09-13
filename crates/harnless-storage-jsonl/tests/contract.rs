@@ -36,8 +36,12 @@ impl NotesDomain {
         let value = serde_json::to_value(note).expect("Note serializes");
         let unit = self.envelope.encode(value).expect("encode");
         // The hub stores the opaque unit as a JSON string value.
-        hub.set(backend, &note.id, Value::String(String::from_utf8(unit.0).expect("base64 is utf8")))
-            .expect("hub set");
+        hub.set(
+            backend,
+            &note.id,
+            Value::String(String::from_utf8(unit.0).expect("base64 is utf8")),
+        )
+        .expect("hub set");
     }
 
     fn get(&self, hub: &dyn Storage, backend: &BackendName, id: &str) -> Option<Note> {
@@ -54,14 +58,23 @@ fn typed_domain_over_hub_end_to_end() {
     // opaque bytes in between, persistence across restart.
     let dir = tempfile::tempdir().unwrap();
     let hub = hub_in(dir.path());
-    let domain = NotesDomain { envelope: JsonlDomain::new() };
+    let domain = NotesDomain {
+        envelope: JsonlDomain::new(),
+    };
     let notes = backend("notes");
-    let note = Note { id: "n1".into(), body: "buy milk".into(), pinned: true };
+    let note = Note {
+        id: "n1".into(),
+        body: "buy milk".into(),
+        pinned: true,
+    };
     domain.put(&hub, &notes, &note);
 
     // On disk it is opaque: the raw file carries no field names.
     let raw = std::fs::read_to_string(dir.path().join("notes.jsonl")).unwrap();
-    assert!(!raw.contains("buy milk"), "the hub must not store the domain's plaintext");
+    assert!(
+        !raw.contains("buy milk"),
+        "the hub must not store the domain's plaintext"
+    );
     assert!(!raw.contains("\"body\""), "opaque means opaque: {raw}");
 
     assert_eq!(domain.get(&hub, &notes, "n1").as_ref(), Some(&note));
@@ -83,13 +96,39 @@ fn domain_units_are_hub_transparent() {
     let envelope = JsonlDomain::new();
     let a = envelope.encode(json!({"a": 1})).unwrap();
     let b = envelope.encode(json!("string payload")).unwrap();
-    hub.set(&backend("mixed"), "a", Value::String(String::from_utf8(a.0).unwrap())).unwrap();
-    hub.set(&backend("mixed"), "b", Value::String(String::from_utf8(b.0).unwrap())).unwrap();
+    hub.set(
+        &backend("mixed"),
+        "a",
+        Value::String(String::from_utf8(a.0).unwrap()),
+    )
+    .unwrap();
+    hub.set(
+        &backend("mixed"),
+        "b",
+        Value::String(String::from_utf8(b.0).unwrap()),
+    )
+    .unwrap();
     let back_a = envelope
-        .decode(&OpaqueUnit(hub.get(&backend("mixed"), "a").unwrap().unwrap().as_str().unwrap().as_bytes().to_vec()))
+        .decode(&OpaqueUnit(
+            hub.get(&backend("mixed"), "a")
+                .unwrap()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+        ))
         .unwrap();
     let back_b = envelope
-        .decode(&OpaqueUnit(hub.get(&backend("mixed"), "b").unwrap().unwrap().as_str().unwrap().as_bytes().to_vec()))
+        .decode(&OpaqueUnit(
+            hub.get(&backend("mixed"), "b")
+                .unwrap()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+        ))
         .unwrap();
     assert_eq!(back_a, json!({"a": 1}));
     assert_eq!(back_b, json!("string payload"));
@@ -125,12 +164,19 @@ fn value_types_roundtrip_exactly() {
         json!({"nested": {"deep": [1, 2, 3]}}),
     ];
     for (i, value) in cases.iter().enumerate() {
-        hub.set(&backend("types"), &format!("k{i}"), value.clone()).unwrap();
+        hub.set(&backend("types"), &format!("k{i}"), value.clone())
+            .unwrap();
     }
     // Replay from a fresh provider, not a memory echo.
     let reopened = hub_in(dir.path());
     for (i, value) in cases.iter().enumerate() {
-        assert_eq!(&reopened.get(&backend("types"), &format!("k{i}")).unwrap().unwrap(), value);
+        assert_eq!(
+            &reopened
+                .get(&backend("types"), &format!("k{i}"))
+                .unwrap()
+                .unwrap(),
+            value
+        );
     }
 }
 
@@ -144,8 +190,12 @@ fn concurrent_appenders_all_replay() {
         let hub = hub.clone();
         handles.push(std::thread::spawn(move || {
             for i in 0..10 {
-                hub.set(&backend("race"), &format!("w{writer}k{i}"), json!(writer * 100 + i))
-                    .unwrap();
+                hub.set(
+                    &backend("race"),
+                    &format!("w{writer}k{i}"),
+                    json!(writer * 100 + i),
+                )
+                .unwrap();
             }
         }));
     }
@@ -156,7 +206,9 @@ fn concurrent_appenders_all_replay() {
     for writer in 0..4 {
         for i in 0..10 {
             assert_eq!(
-                reopened.get(&backend("race"), &format!("w{writer}k{i}")).unwrap(),
+                reopened
+                    .get(&backend("race"), &format!("w{writer}k{i}"))
+                    .unwrap(),
                 Some(json!(writer * 100 + i))
             );
         }

@@ -80,7 +80,10 @@ fn bundle_layers_compose_in_profile_order() {
     let out = hrls_in(&dir, &["--profile", "p", "--dump-config"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     // The later bundle outranks the earlier one.
-    assert_eq!(dumped_provider(&stdout(&out)).as_deref(), Some("from-override"));
+    assert_eq!(
+        dumped_provider(&stdout(&out)).as_deref(),
+        Some("from-override")
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -98,7 +101,10 @@ fn profile_patch_beats_bundles_and_home_patch_beats_it() {
         "name: p\nbundles:\n- b\npatch:\n- op: set\n  id: model\n  config:\n    kind: replay\n    provider: from-profile-patch\n",
     );
     let out = hrls_in(&dir, &["--profile", "p", "--dump-config"]);
-    assert_eq!(dumped_provider(&stdout(&out)).as_deref(), Some("from-profile-patch"));
+    assert_eq!(
+        dumped_provider(&stdout(&out)).as_deref(),
+        Some("from-profile-patch")
+    );
 
     // The home patch outranks the profile patch…
     let home = "op: set\nid: model\nconfig:\n  kind: replay\n  provider: from-home\n";
@@ -109,7 +115,11 @@ fn profile_patch_beats_bundles_and_home_patch_beats_it() {
         "--profile",
         "p",
     ]);
-    assert!(without_home.status.success(), "stderr: {}", stderr(&without_home));
+    assert!(
+        without_home.status.success(),
+        "stderr: {}",
+        stderr(&without_home)
+    );
     assert_eq!(
         dumped_provider(&stdout(&without_home)).as_deref(),
         Some("from-profile-patch"),
@@ -196,7 +206,13 @@ fn a_patch_on_an_absent_id_warns_and_still_runs() {
     write(&overlay, "op: set\nid: ghost\nconfig:\n  a: 1\n");
     let out = hrls_in(
         &dir,
-        &["--profile", "p", "--patch", overlay.to_str().unwrap(), "--dump-config"],
+        &[
+            "--profile",
+            "p",
+            "--patch",
+            overlay.to_str().unwrap(),
+            "--dump-config",
+        ],
     );
     assert!(out.status.success(), "must not fail: {}", stderr(&out));
     assert!(
@@ -242,7 +258,13 @@ fn a_malformed_patch_reports_bad_patch_and_leaves_the_profile_runnable() {
     write(&broken, "op: set\nid: model\nthis is not: valid yaml: [");
     let bad = hrls_in(
         &dir,
-        &["--profile", "p", "--patch", broken.to_str().unwrap(), "--dump-config"],
+        &[
+            "--profile",
+            "p",
+            "--patch",
+            broken.to_str().unwrap(),
+            "--dump-config",
+        ],
     );
     assert!(!bad.status.success());
     assert!(
@@ -276,7 +298,13 @@ fn a_per_run_overlay_swaps_one_entry_without_touching_stored_profiles() {
     );
     let out = hrls_in(
         &dir,
-        &["--profile", "p", "--patch", overlay.to_str().unwrap(), "--dump-config"],
+        &[
+            "--profile",
+            "p",
+            "--patch",
+            overlay.to_str().unwrap(),
+            "--dump-config",
+        ],
     );
     assert_eq!(dumped_provider(&stdout(&out)).as_deref(), Some("per-run"));
 
@@ -352,7 +380,10 @@ fn home_expansion_reaches_a_composed_row() {
         dumped.contains(&format!("{home}/state")),
         "the composed dump must carry the expanded home path: {dumped}"
     );
-    assert!(!dumped.contains("${home}"), "unexpanded expression leaked: {dumped}");
+    assert!(
+        !dumped.contains("${home}"),
+        "unexpanded expression leaked: {dumped}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

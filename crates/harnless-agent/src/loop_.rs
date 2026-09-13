@@ -132,13 +132,12 @@ impl AgentLoop {
         // stand. Deriving stickiness from the log's own TurnClose records —
         // rather than a per-loop flag — keeps the rule true for every writer
         // over the shared log, including a resumed process.
-        let final_reason = if final_reason == TurnEndReason::Completed
-            && self.log.has_closed_max_tokens()
-        {
-            TurnEndReason::MaxTokens
-        } else {
-            final_reason
-        };
+        let final_reason =
+            if final_reason == TurnEndReason::Completed && self.log.has_closed_max_tokens() {
+                TurnEndReason::MaxTokens
+            } else {
+                final_reason
+            };
 
         self.log.append(SessionEvent::StepClose);
         self.log.append(SessionEvent::TurnClose {

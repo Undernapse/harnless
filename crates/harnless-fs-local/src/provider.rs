@@ -50,8 +50,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use harnless_seams::{
-    Edit, Entry, ErrorCode, FileSystem, MutationResult, ReadWindow, SeamError, Target, VersionToken,
-    WriteGuard,
+    Edit, Entry, ErrorCode, FileSystem, MutationResult, ReadWindow, SeamError, Target,
+    VersionToken, WriteGuard,
 };
 
 use crate::events::{FsEditIntent, FsObserved, FsWriteIntent, Intent};
@@ -265,7 +265,9 @@ impl LocalFileSystem {
                 return Err(openat_error(e));
             }
         };
-        let canonical = parent.dir_canonical.join(OsStr::from_bytes(parent.name.as_bytes()));
+        let canonical = parent
+            .dir_canonical
+            .join(OsStr::from_bytes(parent.name.as_bytes()));
         unsafe { libc::close(parent.dirfd) };
         self.verify_key(&target, &canonical)?;
         Ok(Opened {
@@ -298,7 +300,11 @@ impl LocalFileSystem {
 
     /// Walk to the target's parent directory, verifying every hop, and hand
     /// back the verified dirfd plus the final component name.
-    fn open_parent(&self, target: &Target, create_parents: bool) -> Result<ParentAndName, SeamError> {
+    fn open_parent(
+        &self,
+        target: &Target,
+        create_parents: bool,
+    ) -> Result<ParentAndName, SeamError> {
         // The display is root-relative (resolve guarantees it); the fd walk
         // below only accepts plain component names.
         let rel = Path::new(&target.display);
@@ -455,9 +461,8 @@ impl LocalFileSystem {
                 truncated: window.truncated,
             };
             let events = mount.events.clone();
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                events.emit(event)
-            }));
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || events.emit(event)));
         }
     }
 
@@ -476,7 +481,10 @@ impl LocalFileSystem {
                 // The seam contract (FileSystem::write doc) pins this as
                 // not-found: the create you asked for cannot happen.
                 ErrorCode::NotFound,
-                format!("create-if-absent target already exists: {}", canonical.display()),
+                format!(
+                    "create-if-absent target already exists: {}",
+                    canonical.display()
+                ),
             )),
             Some(WriteGuard::CreateIfAbsent) => Ok(()),
             Some(WriteGuard::ReplaceAtVersion(seen)) => {
@@ -563,14 +571,11 @@ impl LocalFileSystem {
             let mut writer = std::io::BufWriter::new(opened_file);
             io::Write::write_all(&mut writer, contents).map_err(io_error)?;
             io::Write::flush(&mut writer).map_err(io_error)?;
-            let opened_file = writer
-                .into_inner()
-                .map_err(|e| io_error(e.into_error()))?;
+            let opened_file = writer.into_inner().map_err(|e| io_error(e.into_error()))?;
             opened_file.sync_all().map_err(io_error)?;
             // renameat through the verified parent fds: the destination is
             // the component we walked to, never a re-resolved string.
-            let renamed =
-                unsafe { libc::renameat(dirfd, tmp_c.as_ptr(), dirfd, name.as_ptr()) };
+            let renamed = unsafe { libc::renameat(dirfd, tmp_c.as_ptr(), dirfd, name.as_ptr()) };
             if renamed < 0 {
                 return Err(io_error(io::Error::last_os_error()));
             }
@@ -588,9 +593,10 @@ impl LocalFileSystem {
         }
         // The map stores the raw instance-local counter; tokens handed out
         // and compared are the stamped (globally unique) form.
-        self.versions
-            .lock()
-            .insert(dir_canonical.join(OsStr::from_bytes(name.as_bytes())), counter);
+        self.versions.lock().insert(
+            dir_canonical.join(OsStr::from_bytes(name.as_bytes())),
+            counter,
+        );
         Ok(token)
     }
 }
@@ -849,8 +855,7 @@ impl FileSystem for LocalFileSystem {
                         // A missing (or not-yet-a-directory) ancestor is
                         // fine at resolve time: the write path materializes
                         // it. A symlink hop is still refused.
-                        if !matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR))
-                        {
+                        if !matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR)) {
                             unsafe { libc::close(dirfd) };
                             return Err(openat_error(e));
                         }
@@ -985,12 +990,8 @@ impl FileSystem for LocalFileSystem {
         // hop is O_NOFOLLOW and the walk is repeated here).
         let parent = self.open_parent(target, true)?;
         unsafe { libc::close(opened.fd) };
-        let version = self.commit_atomic(
-            parent.dirfd,
-            &parent.dir_canonical,
-            &parent.name,
-            contents,
-        )?;
+        let version =
+            self.commit_atomic(parent.dirfd, &parent.dir_canonical, &parent.name, contents)?;
         unsafe { libc::close(parent.dirfd) };
         Ok(MutationResult { version })
     }

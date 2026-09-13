@@ -57,7 +57,11 @@ pub trait PluginFactory: Send + Sync {
     ///
     /// The `id` is the row identity, for the resource's own diagnostics and
     /// for [`MountedResource::id`].
-    fn build(&self, id: &str, config: &serde_yaml::Value) -> std::result::Result<Box<dyn MountedResource>, String>;
+    fn build(
+        &self,
+        id: &str,
+        config: &serde_yaml::Value,
+    ) -> std::result::Result<Box<dyn MountedResource>, String>;
 }
 
 /// A factory backed by a closure — the shape most plugins need.
@@ -95,7 +99,11 @@ where
         &self.plugin
     }
 
-    fn build(&self, id: &str, config: &serde_yaml::Value) -> std::result::Result<Box<dyn MountedResource>, String> {
+    fn build(
+        &self,
+        id: &str,
+        config: &serde_yaml::Value,
+    ) -> std::result::Result<Box<dyn MountedResource>, String> {
         (self.build)(id, config).map(|resource| Box::new(resource) as Box<dyn MountedResource>)
     }
 }
@@ -115,8 +123,7 @@ impl PluginRegistry {
     /// Register `factory` under its own plugin name, replacing any previous
     /// registration.
     pub fn register(&mut self, factory: std::sync::Arc<dyn PluginFactory>) -> &mut Self {
-        self.factories
-            .insert(factory.plugin().to_string(), factory);
+        self.factories.insert(factory.plugin().to_string(), factory);
         self
     }
 
@@ -166,7 +173,18 @@ impl MountGuard {
     }
 
     /// Take ownership of a mounted resource.
-    pub fn push(&mut self, resource: Box<dyn MountedResource>) {
+    ///
+    /// A disposed guard is inert — its `Drop` never runs teardown again —
+    /// so pushing onto one would leak a live resource. The push itself
+    /// disposes instead, keeping "every resource is disposed exactly once"
+    /// true for any call order.
+    pub fn push(&mut self, mut resource: Box<dyn MountedResource>) {
+        if self.disposed {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resource.dispose();
+            }));
+            return;
+        }
         self.resources.push(resource);
     }
 
@@ -269,7 +287,10 @@ pub fn mount(doc: &ConfigDoc, registry: &PluginRegistry) -> Result<MountGuard> {
                     Stage::Mount,
                     "plugin-build-failed",
                     row.id.clone(),
-                    format!("plugin {:?} failed to mount row {:?}: {message}", row.plugin, row.id),
+                    format!(
+                        "plugin {:?} failed to mount row {:?}: {message}",
+                        row.plugin, row.id
+                    ),
                 ));
             }
         }
@@ -334,10 +355,7 @@ mod tests {
     fn doc(rows: Vec<&str>) -> ConfigDoc {
         ConfigDoc {
             name: "t".to_string(),
-            rows: rows
-                .iter()
-                .map(|id| Row::new(*id, "probe"))
-                .collect(),
+            rows: rows.iter().map(|id| Row::new(*id, "probe")).collect(),
             system_prompt: None,
             model: None,
         }
@@ -394,5 +412,27 @@ mod tests {
         guard.dispose();
         drop(guard);
         assert_eq!(log.events(), vec!["dispose:a"]);
+    }
+
+    /// A `push` after `dispose` would otherwise sit on an already-flushed
+    /// guard: the flag says "disposed", `Drop` short-circuits, and the
+    /// resource's teardown never runs. A disposed guard is inert, so the
+    /// push itself must dispose the resource.
+    #[test]
+    fn pushing_after_dispose_disposes_the_resource() {
+        let log = Log::default();
+        let mut guard = MountGuard::new();
+        guard.dispose();
+        guard.push(Box::new(Probe {
+            id: "late".to_string(),
+            log: log.clone(),
+        }));
+        assert_eq!(log.events(), vec!["dispose:late"]);
+        drop(guard);
+        assert_eq!(
+            log.events(),
+            vec!["dispose:late"],
+            "the resource is disposed exactly once"
+        );
     }
 }

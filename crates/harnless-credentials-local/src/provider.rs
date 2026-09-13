@@ -20,12 +20,12 @@
 //!   registry never inspects how, and the record is written through the
 //!   provider's own [`LocalCredentials::store`].
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
 use harnless_seams::credentials::{CredentialKind, CredentialRef, Credentials};
 use harnless_seams::error::{ErrorCode, SeamError};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 
 /// One stored credential record: the kind plus the secret value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,7 +101,11 @@ impl FileLock {
         if !flock_exclusive(&file) {
             return Err(SeamError::new(
                 ErrorCode::IoError,
-                format!("locking {}: {}", lock_path.display(), std::io::Error::last_os_error()),
+                format!(
+                    "locking {}: {}",
+                    lock_path.display(),
+                    std::io::Error::last_os_error()
+                ),
             ));
         }
         Ok(Self { file })
@@ -211,7 +215,9 @@ struct Inner {
 
 impl std::fmt::Debug for LocalCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LocalCredentials").field("path", &self.inner.path).finish_non_exhaustive()
+        f.debug_struct("LocalCredentials")
+            .field("path", &self.inner.path)
+            .finish_non_exhaustive()
     }
 }
 
@@ -258,7 +264,9 @@ impl LocalCredentialsBuilder {
 
     /// Finish the build.
     pub fn build(self) -> LocalCredentials {
-        let path = self.path.expect("LocalCredentials requires a record-store path");
+        let path = self
+            .path
+            .expect("LocalCredentials requires a record-store path");
         let mut flows: [Option<SharedFlow>; 3] = Default::default();
         for (kind, flow) in self.flows {
             flows[kind_index(kind)] = Some(flow);
@@ -303,13 +311,19 @@ impl LocalCredentials {
             Ok(text) => serde_json::from_str(&text).map_err(|e| {
                 SeamError::new(
                     ErrorCode::IoError,
-                    format!("credential store {} is corrupt: {e}", self.inner.path.display()),
+                    format!(
+                        "credential store {} is corrupt: {e}",
+                        self.inner.path.display()
+                    ),
                 )
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
             Err(e) => Err(SeamError::new(
                 ErrorCode::IoError,
-                format!("reading credential store {}: {e}", self.inner.path.display()),
+                format!(
+                    "reading credential store {}: {e}",
+                    self.inner.path.display()
+                ),
             )),
         }
     }
@@ -336,7 +350,10 @@ impl LocalCredentials {
         let mut all = self.read_all()?;
         f(&mut all);
         let serialized = serde_json::to_vec_pretty(&all).map_err(|e| {
-            SeamError::new(ErrorCode::IoError, format!("serializing credential store: {e}"))
+            SeamError::new(
+                ErrorCode::IoError,
+                format!("serializing credential store: {e}"),
+            )
         })?;
         let tmp = {
             let mut s = self.inner.path.as_os_str().to_os_string();
@@ -352,7 +369,10 @@ impl LocalCredentials {
         std::fs::rename(&tmp, &self.inner.path).map_err(|e| {
             SeamError::new(
                 ErrorCode::IoError,
-                format!("publishing credential store {}: {e}", self.inner.path.display()),
+                format!(
+                    "publishing credential store {}: {e}",
+                    self.inner.path.display()
+                ),
             )
         })
     }
@@ -393,7 +413,9 @@ impl LocalCredentials {
     /// Register a flow object implementing [`AuthorizationFlow`].
     pub fn register_flow_impl(&self, kind: CredentialKind, flow: impl AuthorizationFlow) {
         self.inner.registry.lock().flows[kind_index(kind)] =
-            Some(Arc::new(move |reference: &CredentialRef| flow.authorize(reference)));
+            Some(Arc::new(move |reference: &CredentialRef| {
+                flow.authorize(reference)
+            }));
     }
 
     /// Run (or join) the authorization dance for `reference` of `kind`.
@@ -414,7 +436,10 @@ impl LocalCredentials {
         let flow = flow.ok_or_else(|| {
             SeamError::new(
                 ErrorCode::ToolDenied,
-                format!("no authorization flow registered for kind {}", kind_spelling(kind)),
+                format!(
+                    "no authorization flow registered for kind {}",
+                    kind_spelling(kind)
+                ),
             )
         })?;
 
@@ -479,18 +504,19 @@ impl LocalCredentials {
             // record is written through the provider's own store path.
             let provider = self.clone();
             let for_task = reference.clone();
-            let outcome = tokio::task::spawn_blocking(move || -> harnless_seams::error::Result<String> {
-                let secret = flow(&for_task)?;
-                provider.store(&for_task, kind, &secret)?;
-                Ok(secret)
-            })
-            .await
-            .unwrap_or_else(|e| {
-                Err(SeamError::new(
-                    ErrorCode::IoError,
-                    format!("authorization flow task failed: {e}"),
-                ))
-            });
+            let outcome =
+                tokio::task::spawn_blocking(move || -> harnless_seams::error::Result<String> {
+                    let secret = flow(&for_task)?;
+                    provider.store(&for_task, kind, &secret)?;
+                    Ok(secret)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    Err(SeamError::new(
+                        ErrorCode::IoError,
+                        format!("authorization flow task failed: {e}"),
+                    ))
+                });
             guard.outcome = Some(outcome.clone());
             drop(guard);
             outcome.map(|secret| (secret, AuthorizeState::Authorized))
@@ -499,7 +525,9 @@ impl LocalCredentials {
                 let notified = self.inner.notifier.notified();
                 let done = {
                     let guard = slot.lock();
-                    guard.done.then(|| guard.result.clone().expect("result set with done"))
+                    guard
+                        .done
+                        .then(|| guard.result.clone().expect("result set with done"))
                 };
                 if let Some(outcome) = done {
                     return outcome.map(|secret| (secret, AuthorizeState::Joined));
@@ -580,9 +608,17 @@ mod tests {
     fn store_resolve_kind_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let creds = LocalCredentials::new(store_in(dir.path()));
-        creds.store(&cred("openai"), CredentialKind::ApiKey, "sk-1").unwrap();
-        assert_eq!(creds.resolve(&cred("openai")).unwrap().as_deref(), Some("sk-1"));
-        assert_eq!(creds.kind(&cred("openai")).unwrap(), Some(CredentialKind::ApiKey));
+        creds
+            .store(&cred("openai"), CredentialKind::ApiKey, "sk-1")
+            .unwrap();
+        assert_eq!(
+            creds.resolve(&cred("openai")).unwrap().as_deref(),
+            Some("sk-1")
+        );
+        assert_eq!(
+            creds.kind(&cred("openai")).unwrap(),
+            Some(CredentialKind::ApiKey)
+        );
     }
 
     #[test]
@@ -591,8 +627,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = store_in(dir.path());
         let creds = LocalCredentials::new(&path);
-        creds.store(&cred("oauth"), CredentialKind::OAuth2, "old-token").unwrap();
-        assert_eq!(creds.resolve(&cred("oauth")).unwrap().as_deref(), Some("old-token"));
+        creds
+            .store(&cred("oauth"), CredentialKind::OAuth2, "old-token")
+            .unwrap();
+        assert_eq!(
+            creds.resolve(&cred("oauth")).unwrap().as_deref(),
+            Some("old-token")
+        );
         // Out-of-band rotation: an operator (or flow) rewrites the file.
         std::fs::write(&path, r#"{"oauth":{"kind":"oauth2","value":"new-token"}}"#).unwrap();
         assert_eq!(
@@ -606,7 +647,9 @@ mod tests {
     fn forget_removes_record() {
         let dir = tempfile::tempdir().unwrap();
         let creds = LocalCredentials::new(store_in(dir.path()));
-        creds.store(&cred("a"), CredentialKind::Bearer, "t").unwrap();
+        creds
+            .store(&cred("a"), CredentialKind::Bearer, "t")
+            .unwrap();
         creds.forget(&cred("a")).unwrap();
         assert_eq!(creds.resolve(&cred("a")).unwrap(), None);
         creds.forget(&cred("a")).unwrap(); // absent delete is not an error
@@ -624,7 +667,11 @@ mod tests {
 
     #[test]
     fn kind_spelling_roundtrips() {
-        for kind in [CredentialKind::Bearer, CredentialKind::OAuth2, CredentialKind::ApiKey] {
+        for kind in [
+            CredentialKind::Bearer,
+            CredentialKind::OAuth2,
+            CredentialKind::ApiKey,
+        ] {
             assert_eq!(kind_from_spelling(kind_spelling(kind)), Some(kind));
         }
         assert_eq!(kind_from_spelling("nonsense"), None);
@@ -641,14 +688,16 @@ mod tests {
         let (ta, tb) = (a.clone(), b.clone());
         std::thread::spawn(move || {
             for i in 0..20 {
-                ta.store(&cred(&format!("a{i}")), CredentialKind::ApiKey, "v").unwrap();
+                ta.store(&cred(&format!("a{i}")), CredentialKind::ApiKey, "v")
+                    .unwrap();
             }
         })
         .join()
         .unwrap();
         std::thread::spawn(move || {
             for i in 0..20 {
-                tb.store(&cred(&format!("b{i}")), CredentialKind::ApiKey, "v").unwrap();
+                tb.store(&cred(&format!("b{i}")), CredentialKind::ApiKey, "v")
+                    .unwrap();
             }
         })
         .join()

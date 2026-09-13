@@ -495,7 +495,9 @@ fn fork_child_records_parentage_seed_len_and_working_dir() {
     });
     parent.append(SessionEvent::UserMessage(MessageRecord {
         id: MessageId(5),
-        blocks: vec![ContentBlock::Text { text: "next".into() }],
+        blocks: vec![ContentBlock::Text {
+            text: "next".into(),
+        }],
         provider: None,
         model: None,
     }));
@@ -771,7 +773,10 @@ fn max_tokens_precedence_holds_across_loop_instances() {
                 }
             )
         });
-    assert!(!clean_after, "no TurnClose(Completed) after the MaxTokens close");
+    assert!(
+        !clean_after,
+        "no TurnClose(Completed) after the MaxTokens close"
+    );
 }
 
 // The documented non-displacement half of the rule, pinned: the sticky
@@ -848,7 +853,10 @@ fn seed_boundary_is_representable_in_the_event_vocabulary() {
     let session = SessionId(330);
     rt().block_on(async {
         let mut backend = JsonlFileBackend::new(dir.path().to_path_buf());
-        backend.save(&session, std::slice::from_ref(&marker)).await.unwrap();
+        backend
+            .save(&session, std::slice::from_ref(&marker))
+            .await
+            .unwrap();
         let loaded: LoadedLog = backend.load(&session).await.unwrap().unwrap();
         // The marker survives the encoding untouched, and seeding is
         // derived from the events the backend returns.
@@ -863,12 +871,9 @@ fn seed_boundary_is_representable_in_the_event_vocabulary() {
 
 /// Reopen a persisted log the way a fresh process would: load only.
 fn reopen(mut backend: impl SessionPersistence, session: &SessionId) -> LoadedLog {
-    rt()
-        .block_on(backend.load(session))
+    rt().block_on(backend.load(session))
         .unwrap()
-        .unwrap_or(LoadedLog {
-            events: Vec::new(),
-        })
+        .unwrap_or(LoadedLog { events: Vec::new() })
 }
 
 #[test]
@@ -984,11 +989,13 @@ fn load_fixture(name: &str) -> (Option<ForkMeta>, Vec<SessionEvent>) {
         match line_obj.event {
             Some(e) => events.push(e),
             // A header line is the one carrying a parent_session field.
-            None if line_obj.parent_session.is_some() => header = Some(ForkMeta {
-                parent_session: line_obj.parent_session.expect("header fields"),
-                seed_len: line_obj.seed_len.expect("header fields"),
-                working_dir: line_obj.working_dir.expect("header fields"),
-            }),
+            None if line_obj.parent_session.is_some() => {
+                header = Some(ForkMeta {
+                    parent_session: line_obj.parent_session.expect("header fields"),
+                    seed_len: line_obj.seed_len.expect("header fields"),
+                    working_dir: line_obj.working_dir.expect("header fields"),
+                })
+            }
             None => {}
         }
     }
@@ -1083,8 +1090,7 @@ fn golden_forked_fixture_matches_the_fork_contract() {
     }
     // Forking the full parent log yields exactly the fixture's child body,
     // with the header's metadata.
-    let (child, child_meta) =
-        fork(&parent, parent.len(), SessionId(8), &meta.working_dir).unwrap();
+    let (child, child_meta) = fork(&parent, parent.len(), SessionId(8), &meta.working_dir).unwrap();
     assert_eq!(child_meta, meta);
     let body: Vec<SessionEvent> = child
         .snapshot()

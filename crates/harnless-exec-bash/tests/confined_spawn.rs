@@ -189,7 +189,10 @@ fn unconfined_path_never_touches_the_confined_spawner() {
         Box::new(LocalSandbox::default()),
     );
     let out = shell
-        .exec("printf plain", &PolicyHome::from_root_and_mode(".", SandboxMode::Unconfined))
+        .exec(
+            "printf plain",
+            &PolicyHome::from_root_and_mode(".", SandboxMode::Unconfined),
+        )
         .expect("run");
     assert_eq!("plain", out);
     // The confined spawner delegated to the plain subprocess (the unconfined
@@ -212,7 +215,10 @@ fn unconfined_path_never_touches_the_confined_spawner() {
     assert_eq!(Some(".".to_string()), spawn.cwd);
     // And the confined hint is absent — the spawn is byte-for-byte what the
     // pre-#36 pipeline produced.
-    assert!(spawn.confine.is_none(), "unconfined spawn carried a confine hint");
+    assert!(
+        spawn.confine.is_none(),
+        "unconfined spawn carried a confine hint"
+    );
 }
 
 /// The audit story is unchanged: a confined refusal is still `SandboxDenied`
@@ -330,9 +336,7 @@ fn confined_spawn_refuses_unreadable_hint() {
         ],
         cwd: Some(root.display().to_string()),
         // A confined verdict, but the payload is not a Confinement.
-        confine: Some(harnless_seams::exec::ConfineHint::new(
-            "not-a-confinement",
-        )),
+        confine: Some(harnless_seams::exec::ConfineHint::new("not-a-confinement")),
     };
     let spawner = ConfinedSpawner::new();
     let err = match spawner.spawn(&spawn) {
@@ -340,7 +344,8 @@ fn confined_spawn_refuses_unreadable_hint() {
         Err(err) => err,
     };
     assert_eq!(
-        ErrorCode::SandboxDenied, err.code,
+        ErrorCode::SandboxDenied,
+        err.code,
         "unreadable hint must refuse, not degrade to the plain path: {err}"
     );
 }

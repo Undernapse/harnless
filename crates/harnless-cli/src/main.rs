@@ -124,12 +124,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             }
         },
         Some(Command::Run { prompt }) => {
-            let text = run::run_once(
-                &composer,
-                &cli.profile,
-                patch.as_deref(),
-                &prompt.join(" "),
-            )?;
+            let text = run::run_once(&composer, &cli.profile, patch.as_deref(), &prompt.join(" "))?;
             report(&composer);
             println!("{text}");
             Ok(())
