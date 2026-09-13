@@ -1,0 +1,12 @@
+[package]
+name = "harnless-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Parameterized seam-contract conformance suites for harnless providers"
+
+[dependencies]
+serde_json = "1"
+harnless-seams = { path = "../harnless-seams" }
+paste = "1"
