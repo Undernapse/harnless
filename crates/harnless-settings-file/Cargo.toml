@@ -1,0 +1,17 @@
+[package]
+name = "harnless-settings-file"
+description = "File-backed Settings provider for harnless: namespaces of declared schemas with layered resolution (shipped base beneath the user layer) and redacted, value-free descriptors."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harnless-seams = { path = "../harnless-seams" }
+parking_lot = "0.12"
+serde_json = "1"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+harnless-conformance = { path = "../harnless-conformance" }
