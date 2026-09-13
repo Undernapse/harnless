@@ -205,7 +205,21 @@ impl BundleStore for DirStore {
     fn load(&self, name: &str) -> Result<Option<BundleDoc>> {
         match self.read("bundles", name, "bundle")? {
             None => Ok(None),
-            Some(text) => BundleDoc::load(&text).map(Some),
+            Some(text) => {
+                let doc = BundleDoc::load(&text)?;
+                if doc.name != name {
+                    return Err(ConfigError::new(
+                        Stage::Compose,
+                        "bad-bundle",
+                        format!(
+                            "bundle file {name:?} declares name {:?}; a document's name must \
+                             match the file it lives in",
+                            doc.name
+                        ),
+                    ));
+                }
+                Ok(Some(doc))
+            }
         }
     }
 
@@ -218,7 +232,21 @@ impl ProfileStore for DirStore {
     fn load(&self, name: &str) -> Result<Option<ProfileSpec>> {
         match self.read("profiles", name, "profile")? {
             None => Ok(None),
-            Some(text) => ProfileSpec::load(&text).map(Some),
+            Some(text) => {
+                let doc = ProfileSpec::load(&text)?;
+                if doc.name != name {
+                    return Err(ConfigError::new(
+                        Stage::Compose,
+                        "bad-profile",
+                        format!(
+                            "profile file {name:?} declares name {:?}; a document's name must \
+                             match the file it lives in",
+                            doc.name
+                        ),
+                    ));
+                }
+                Ok(Some(doc))
+            }
         }
     }
 

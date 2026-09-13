@@ -13,13 +13,16 @@
 //! the enforced reason. It never degrades into a silent pass, and it never
 //! guesses at the verdict from `confined`/`mode`.
 //!
-//! # Confinement is applied, not just decided
-//!
 //! A `sandbox-local` verdict means the command must run with its environment
-//! scrubbed and its cwd pinned. That application lives in
-//! [`LocalSandbox::prepare`], which is only safe to call in a forked child
-//! (it is not async-signal-safe). [`ConfinedSpawner`] is the boundary that
-//! makes this work under a multi-threaded tokio runtime: confined spawns are
+//! scrubbed and its cwd pinned. The env scrub is applied **parent-side**:
+//! [`ConfinedSpawner`] builds the child's environment explicitly
+//! (`Command::env_clear` + the surviving variables) before the fork, so the
+//! child never calls a non-async-signal-safe environment mutator
+//! (`setenv`/`unsetenv` take an environment lock on macOS and are **not**
+//! async-signal-safe there). The cwd pin and rlimit steps run in the child
+//! via `chdir(2)`/`setrlimit(2)` — both true async-signal-safe syscalls —
+//! inside a `pre_exec` hook. [`ConfinedSpawner`] is the boundary that makes
+//! this work under a multi-threaded tokio runtime: confined spawns are
 //! funnelled onto a dedicated single-threaded spawner thread, so the fork
 //! happens where `pre_exec` is sound no matter how many worker threads the
 //! caller runs. Unconfined spawns never touch that thread — they go straight
@@ -55,9 +58,11 @@ pub struct Confinement {
     pub rlimit_as_bytes: Option<u64>,
     /// Extra variables injected into the child's environment *before* the
     /// scrub runs, so they are subject to it. Test/diagnostics-facing: it
-    /// lets a test prove a variable was present in the child at fork time
+    /// lets a test prove a variable was present in the child at spawn time
     /// and then observe the scrub remove it, without mutating the test
     /// process's own environment.
+    ///
+    /// Entries with an empty name or an embedded NUL are ignored.
     pub extra_env: Vec<(String, String)>,
 }
 
@@ -158,18 +163,23 @@ type Job = (Spawn, Confinement, mpsc::Sender<Result<Box<dyn SpawnHandle>>>);
 ///
 /// # The decision
 ///
-/// [`LocalSandbox::prepare`] (env scrub + cwd pin + rlimit) is the
-/// confinement application, and it is only sound inside a `pre_exec` hook
-/// while the forking process is single-threaded at the fork point — the
-/// hook body itself is async-signal-safe (`prepare` uses `unsetenv`/`chdir`
-/// /`setrlimit`, all POSIX async-signal-safe), but the fork can happen
-/// while another thread holds a std lock the child's code would
-/// re-enter. Tokio's multi-threaded runtime violates that on every worker
-/// thread. The shipped boundary: confined commands are funnelled over a
-/// channel onto one dedicated thread created per [`ConfinedSpawner`] —
-/// the only thread that forks confined children — and the fork happens
-/// there, so the constraint holds by construction no matter how many
-/// threads the caller's runtime has.
+/// Confinement has two halves. The **env scrub** is applied parent-side,
+/// before the fork: [`LocalSandbox::prepare_scrubbed_env`] snapshots the
+/// environment, filters credential-shaped names, and the child's
+/// environment is rebuilt from it via `env_clear` + `envs`. This matters
+/// because `setenv`/`unsetenv` are **not** async-signal-safe on macOS
+/// (Apple's libsystem takes an environment lock; a signal landing inside
+/// it aborts), so a child-side scrub is unsound under any multi-threaded
+/// forker. The **cwd pin + rlimit** half runs in the child inside a
+/// `pre_exec` hook ([`LocalSandbox::prepare`], `chdir(2)`/`setrlimit(2)` —
+/// true async-signal-safe syscalls), and the hook is only sound while the
+/// forking process is single-threaded at the fork point. Tokio's
+/// multi-threaded runtime violates that on every worker thread. The
+/// shipped boundary: confined commands are funnelled over a channel onto
+/// one dedicated thread created per [`ConfinedSpawner`] — the only thread
+/// that forks confined children — and the fork happens there, so the
+/// constraint holds by construction no matter how many threads the
+/// caller's runtime has.
 ///
 /// Rejected alternatives:
 ///
@@ -203,11 +213,11 @@ type Job = (Spawn, Confinement, mpsc::Sender<Result<Box<dyn SpawnHandle>>>);
 /// confinement holds or the command does not run.
 pub struct ConfinedSpawner {
     inner: Arc<dyn Subprocess>,
-    /// Mailbox to the spawner thread. The spawner — not the job — holds
-    /// the thread's sender clone: a forked child must never inherit an
-    /// open job-channel handle, or the thread could never observe channel
-    /// close and the process would keep a live thread forever.
+    /// Mailbox to the spawner thread. Dropping the last clone closes the
+    /// channel and the thread exits; `Drop` joins it.
     queue: mpsc::Sender<Job>,
+    /// The spawner thread, taken and joined on drop.
+    thread: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Env attached to every confined spawn from this spawner (see
     /// [`Confinement::extra_env`]).
     extra: parking_lot::Mutex<Vec<(String, String)>>,
@@ -237,15 +247,16 @@ impl ConfinedSpawner {
     pub fn with_subprocess(inner: Box<dyn Subprocess>) -> Self {
         let (queue, receive) = mpsc::channel::<Job>();
         // The one thread of this process that ever forks for confined
-        // work. It lives while jobs keep coming and exits when every
-        // spawner handle drops (channel close).
-        std::thread::Builder::new()
+        // work. It lives while jobs keep coming and exits when the last
+        // spawner handle drops (see `Drop`, which also joins it).
+        let thread = std::thread::Builder::new()
             .name("harnless-confined-spawner".to_string())
             .spawn(move || spawner_loop(receive))
             .expect("spawn confined spawner thread");
         Self {
             inner: Arc::from(inner),
             queue,
+            thread: parking_lot::Mutex::new(Some(thread)),
             extra: parking_lot::Mutex::new(Vec::new()),
         }
     }
@@ -258,20 +269,42 @@ impl ConfinedSpawner {
         self.extra.lock().push((name.into(), value.into()));
         self
     }
+}
 
+impl Drop for ConfinedSpawner {
+    fn drop(&mut self) {
+        // Release the queue so the spawner thread sees the channel close
+        // and exits, then join it. Without the join, a leaked or cyclic
+        // spawner handle keeps a Sender alive and the parked thread blocks
+        // process teardown forever.
+        // Swap in a sender to a channel nobody receives on: the previous
+        // clone drops, the thread sees the channel close, and it exits.
+        let (dead, _guard) = mpsc::channel();
+        let _ = std::mem::replace(&mut self.queue, dead);
+        if let Some(thread) = self.thread.lock().take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Subprocess for ConfinedSpawner {
     fn spawn(&self, spawn: &Spawn) -> Result<Box<dyn SpawnHandle>> {
-        let confine = match spawn
-            .confine
-            .as_ref()
-            .and_then(|hint| hint.downcast_ref::<Confinement>())
-        {
-            // The plain path: no confined hint — same provider, same
-            // thread, same everything as before this boundary existed.
+        let confine = match spawn.confine.as_ref() {
+            // The plain path: no confined hint at all — same provider,
+            // same thread, same everything as before this boundary existed.
             None => return self.inner.spawn(spawn),
-            Some(confine) => confine,
+            Some(hint) => match hint.downcast_ref::<Confinement>() {
+                Some(confine) => confine,
+                // A confined verdict whose hint we cannot read must never
+                // degrade to the plain path: fail closed, not unconfined.
+                None => {
+                    return Err(SeamError::new(
+                        ErrorCode::SandboxDenied,
+                        "confined spawn carries an unreadable confinement hint; \
+                         refusing rather than running a confined verdict unconfined",
+                    ))
+                }
+            },
         };
         // Spawner-level extra env is injected before (and therefore subject
         // to) the scrub, then per-request extras win.
@@ -304,10 +337,14 @@ fn spawner_loop(receive: mpsc::Receiver<Job>) {
     }
 }
 
-/// Fork+exec `spawn` with `prepare` applied in the child.
+/// Fork+exec `spawn` with confinement applied.
 ///
-/// Runs only on the spawner thread — the sole fork site for confined work,
-/// which is what makes the non-async-signal-safe hook body sound.
+/// Runs only on the spawner thread — the sole fork site for confined work.
+/// The env scrub happens **here, in the parent**, before the fork: the
+/// child's environment is rebuilt from the scrubbed snapshot via
+/// `env_clear` + `envs`, so the child never touches `setenv`/`unsetenv`
+/// (environment-locked, not async-signal-safe on macOS). The child's hook
+/// runs only `setsid`/`chdir`/`setrlimit`/`kill` — all async-signal-safe.
 #[cfg(unix)]
 fn confined_spawn(spawn: &Spawn, confinement: &Confinement) -> Result<Box<dyn SpawnHandle>> {
     use std::os::unix::process::CommandExt;
@@ -324,42 +361,32 @@ fn confined_spawn(spawn: &Spawn, confinement: &Confinement) -> Result<Box<dyn Sp
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    // NB: `extra_env` is *not* injected with `Command::env` — that would
-    // install the values after the scrub and defeat it. The hook injects
-    // them (see below) so they exist at fork time and the scrub sees them.
+    // The env scrub, applied parent-side via the sandbox crate's own
+    // predicate — the same one the verdict's guarantees text promises.
+    // `std::env::vars()` snapshots the environment into owned strings, so
+    // the collect-then-filter pass has none of the live-array hazards a
+    // child-side scrub would; extras are merged before the filter, so a
+    // credential-shaped extra is scrubbed exactly like an inherited
+    // variable (proof-by-injection stays sound).
+    let scrubbed =
+        LocalSandbox::new().prepare_scrubbed_env(confinement.extra_env.iter().cloned());
+    command.env_clear();
+    command.envs(scrubbed);
     // Same process-group policy as the plain provider, so cancel() reaches
-    // the child's descendants too. One hook does setsid *then* confinement:
-    // a confined child is a process-group leader, and a later hook would
-    // run after the child may already have been signalled.
-    //
-    // Sound here: this fork happens on the dedicated single-threaded
-    // spawner. The hook body itself is async-signal-safe (setsid, kill);
-    // the non-async-signal-safe `prepare` runs in the *child*, which is
-    // single-threaded by fork semantics — exactly why the fork lives on
-    // the spawner thread at all.
+    // the child's descendants too. The hook runs only async-signal-safe
+    // calls: `setsid`, then the cwd pin and rlimit (true syscalls), and on
+    // failure the child kills itself — `pre_exec` cannot report an error
+    // across the fork boundary, and a confined command must never exec
+    // without its confinement.
     let sandbox = LocalSandbox::new();
     let policy = confinement.policy.clone();
     let rlimit = confinement.rlimit_as_bytes;
-    let extra = confinement.extra_env.clone();
     unsafe {
         command.pre_exec(move || {
             // A failed setsid must not kill the spawn (same policy as the
             // plain subprocess provider): the group falls back to the
             // parent's and cancel degrades to a direct-child kill.
             let _ = setsid();
-            // Prove-injection first: the extras exist in the child's
-            // environment before `prepare` scrubs, so a surviving
-            // credential-shaped name is a scrub bug, not an artifact of
-            // never having been set. `setenv(3)` is async-signal-safe
-            // (POSIX), unlike `std::env::set_var`.
-            for (name, value) in &extra {
-                let cname = std::ffi::CString::new(name.as_str()).expect("env name has no NUL");
-                let cvalue = std::ffi::CString::new(value.as_str()).expect("env value has no NUL");
-                libc::setenv(cname.as_ptr(), cvalue.as_ptr(), 1);
-            }
-            // The hook runs in the forked child. On failure the child must
-            // die itself — the hook cannot return an error across the fork
-            // boundary — so a confined command never runs unconfined.
             if sandbox.prepare(&policy, rlimit).is_err() {
                 harnless_exec_subprocess::kill_process(
                     std::process::id(),
@@ -516,4 +543,30 @@ pub fn preview_decision(command: &str, policy: &PolicyHome) -> Enforced {
         command.to_string(),
     ];
     LocalSandbox::new().enforce_verdict(&argv, policy)
+}
+
+#[cfg(test)]
+mod confinement_unit_tests {
+    use super::*;
+
+    /// The env scrub is a pure parent-side filter: extras merged before the
+    /// needle check are scrubbed, safe names survive, and the sandbox
+    /// crate's own predicate is the single source of truth.
+    #[test]
+    fn prepare_scrubbed_env_filters_extras_by_needle() {
+        let scrubbed = LocalSandbox::new().prepare_scrubbed_env([
+            ("HARNLESS_TEST_FAKE_TOKEN".to_string(), "hunter2".to_string()),
+            ("HARNLESS_TEST_SAFE_VAR".to_string(), "keepme".to_string()),
+        ]);
+        assert!(
+            !scrubbed.iter().any(|(n, _)| n == "HARNLESS_TEST_FAKE_TOKEN"),
+            "credential-shaped extra survived the scrub"
+        );
+        assert!(
+            scrubbed
+                .iter()
+                .any(|(n, v)| n == "HARNLESS_TEST_SAFE_VAR" && v == "keepme"),
+            "safe extra was dropped"
+        );
+    }
 }

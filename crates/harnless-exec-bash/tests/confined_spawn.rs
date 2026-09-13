@@ -314,3 +314,71 @@ fn confined_spawn_fails_closed_when_root_vanishes_after_verdict() {
         "the command ran despite confinement failing to apply: {err}"
     );
 }
+
+/// A confined spawn whose hint cannot be read (wrong payload type) must be
+/// refused, never silently routed to the plain unconfined path.
+#[test]
+fn confined_spawn_refuses_unreadable_hint() {
+    let root = std::env::temp_dir().join("harnless-36-bad-hint");
+    std::fs::create_dir_all(&root).expect("create root");
+    let policy = PolicyHome::from_root_and_mode(&root, SandboxMode::SandboxLocal);
+    let spawn = Spawn {
+        argv: vec![
+            harnless_exec_bash::SHELL_PROGRAM.to_string(),
+            "-c".to_string(),
+            "printf should-not-run".to_string(),
+        ],
+        cwd: Some(root.display().to_string()),
+        // A confined verdict, but the payload is not a Confinement.
+        confine: Some(harnless_seams::exec::ConfineHint::new(
+            "not-a-confinement",
+        )),
+    };
+    let spawner = ConfinedSpawner::new();
+    let err = match spawner.spawn(&spawn) {
+        Ok(_) => panic!("an unreadable confinement hint must refuse the spawn"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        ErrorCode::SandboxDenied, err.code,
+        "unreadable hint must refuse, not degrade to the plain path: {err}"
+    );
+}
+
+/// The rlimit half of `prepare` is applied where the OS supports it and
+/// honestly not-applied on macOS. Linux-only pin: the confined child must
+/// observe the `RLIMIT_AS` the confinement asked for.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn confined_child_observes_rlimit_where_supported() {
+    let root = std::env::temp_dir().join("harnless-36-rlimit");
+    std::fs::create_dir_all(&root).expect("create root");
+    let policy = PolicyHome::from_root_and_mode(&root, SandboxMode::SandboxLocal);
+    let spawn = Spawn {
+        argv: vec![
+            harnless_exec_bash::SHELL_PROGRAM.to_string(),
+            "-c".to_string(),
+            "ulimit -t 5; ulimit -v".to_string(),
+        ],
+        cwd: Some(root.display().to_string()),
+        confine: Some(harnless_seams::exec::ConfineHint::new(
+            harnless_exec_bash::Confinement {
+                policy: policy.clone(),
+                // 512 MiB, in bytes; `ulimit -v` reports KiB.
+                rlimit_as_bytes: Some(512 * 1024 * 1024),
+                extra_env: Vec::new(),
+            },
+        )),
+    };
+    let spawner = ConfinedSpawner::new();
+    let out = spawner
+        .spawn(&spawn)
+        .expect("spawn")
+        .output()
+        .expect("confined command must run");
+    assert_eq!(
+        (512 * 1024).to_string(),
+        out.trim(),
+        "confined child did not observe the requested RLIMIT_AS"
+    );
+}

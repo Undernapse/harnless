@@ -201,7 +201,7 @@ pub struct LocalCredentials {
 struct Inner {
     path: PathBuf,
     /// Registry of flows and in-flight dances.
-    registry: parking_lot::Mutex<FlowRegistry>,
+    registry: Arc<parking_lot::Mutex<FlowRegistry>>,
     /// Broadcast of in-flight outcomes so joiners await rather than poll.
     /// Outcomes are published under this lock's ordering: the runner sets
     /// `done` before notifying, and a joiner registers its `notified()`
@@ -266,10 +266,10 @@ impl LocalCredentialsBuilder {
         LocalCredentials {
             inner: Arc::new(Inner {
                 path,
-                registry: parking_lot::Mutex::new(FlowRegistry {
+                registry: Arc::new(parking_lot::Mutex::new(FlowRegistry {
                     flows,
                     in_flight: HashMap::new(),
-                }),
+                })),
                 notifier: Arc::new(tokio::sync::Notify::new()),
             }),
         }
@@ -437,6 +437,44 @@ impl LocalCredentials {
 
         if is_runner {
             let reference = reference.clone();
+            // Completion is unconditional: the guard publishes the outcome
+            // and frees the key on **every** exit of this future — normal
+            // completion, caller cancellation at the await, or panic.
+            // Without it, a cancelled runner strands the slot forever and
+            // every later joiner parks on a completion that never comes.
+            struct RunnerGuard {
+                slot: Arc<parking_lot::Mutex<InFlight>>,
+                registry: Arc<parking_lot::Mutex<FlowRegistry>>,
+                notifier: Arc<tokio::sync::Notify>,
+                reference: Option<CredentialRef>,
+                outcome: Option<harnless_seams::error::Result<String>>,
+            }
+            impl Drop for RunnerGuard {
+                fn drop(&mut self) {
+                    let outcome = self.outcome.clone().unwrap_or_else(|| {
+                        Err(SeamError::new(
+                            ErrorCode::IoError,
+                            "authorization flow was cancelled before completing",
+                        ))
+                    });
+                    {
+                        let mut guard = self.slot.lock();
+                        guard.result = Some(outcome);
+                        guard.done = true;
+                    }
+                    if let Some(reference) = self.reference.take() {
+                        self.registry.lock().in_flight.remove(&reference);
+                    }
+                    self.notifier.notify_waiters();
+                }
+            }
+            let mut guard = RunnerGuard {
+                slot,
+                registry: self.inner.registry.clone(),
+                notifier: self.inner.notifier.clone(),
+                reference: Some(reference.clone()),
+                outcome: None,
+            };
             // The dance runs off the async executor (it may block); the
             // record is written through the provider's own store path.
             let provider = self.clone();
@@ -453,20 +491,10 @@ impl LocalCredentials {
                     format!("authorization flow task failed: {e}"),
                 ))
             });
-            {
-                let mut guard = slot.lock();
-                guard.result = Some(outcome.clone());
-                guard.done = true;
-            }
-            // Free the key so a later attempt may run again, then wake
-            // joiners.
-            self.inner.registry.lock().in_flight.remove(&reference);
-            self.inner.notifier.notify_waiters();
+            guard.outcome = Some(outcome.clone());
+            drop(guard);
             outcome.map(|secret| (secret, AuthorizeState::Authorized))
         } else {
-            // Await the runner's outcome without spinning: register the
-            // notification *before* re-checking done, so a completion that
-            // races this loop still wakes us.
             loop {
                 let notified = self.inner.notifier.notified();
                 let done = {
@@ -490,13 +518,26 @@ impl LocalCredentials {
 
 /// Process-wide writer locks keyed by store path, so two
 /// `LocalCredentials` instances on one path in one process also serialize.
+///
+/// Entries are held weakly and pruned on every insert: a long-lived
+/// process touching many store paths never accumulates a mutex per path
+/// forever.
 fn shared_write_lock(path: &Path) -> Arc<parking_lot::Mutex<()>> {
-    static LOCKS: LazyLock<parking_lot::Mutex<HashMap<PathBuf, Arc<parking_lot::Mutex<()>>>>> =
-        LazyLock::new(parking_lot::Mutex::default);
+    static LOCKS: LazyLock<
+        parking_lot::Mutex<HashMap<PathBuf, std::sync::Weak<parking_lot::Mutex<()>>>>,
+    > = LazyLock::new(parking_lot::Mutex::default);
     let mut map = LOCKS.lock();
-    map.entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
-        .clone()
+    if let Some(weak) = map.get(path) {
+        if let Some(strong) = weak.upgrade() {
+            return strong;
+        }
+    }
+    // Prune entries whose store is gone before inserting, so the map
+    // cannot grow monotonically.
+    map.retain(|_, weak| weak.strong_count() > 0);
+    let fresh = Arc::new(parking_lot::Mutex::new(()));
+    map.insert(path.to_path_buf(), Arc::downgrade(&fresh));
+    fresh
 }
 
 impl Credentials for LocalCredentials {

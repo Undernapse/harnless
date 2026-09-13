@@ -194,6 +194,9 @@ impl JsonlStorage {
     fn append(&self, backend: &BackendName, entry: &Entry) -> harnless_seams::error::Result<()> {
         let path = self.path_for(backend)?;
         let line = entry.to_line()?;
+        // The same lock serializes compaction's publish window, so an
+        // append can never land between the compaction tail read and the
+        // rename (which would drop it).
         let _guard = self.lock.lock();
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -219,10 +222,11 @@ impl JsonlStorage {
 
     /// Rewrite a backend's log as one snapshot of its live keys.
     ///
-    /// Racing appends are not lost: after building the snapshot, the file's
-    /// current length is compared to the snapshot point and any bytes
-    /// written in the meantime are re-appended to the compacted file
-    /// before the rename publishes.
+    /// Racing appends are not lost: the whole read-publish window runs
+    /// under the hub's writer lock — the same lock every `set`/`delete`
+    /// append takes — so no append can land between the tail read and the
+    /// rename. Tail-read errors are propagated, never swallowed: a
+    /// partially read tail would silently drop acknowledged entries.
     pub fn compact(&self, backend: &BackendName) -> harnless_seams::error::Result<()> {
         let path = self.path_for(backend)?;
         let _guard = self.lock.lock();
@@ -237,12 +241,24 @@ impl JsonlStorage {
             );
             snapshot.push('\n');
         }
-        // Anything appended since `before` must survive compaction.
+        // Anything appended since `before` must survive compaction. The
+        // window is append-free (writer lock held), but a read error still
+        // means a possibly-incomplete tail — refuse, don't publish.
         let mut tail = Vec::new();
-        if let Ok(mut file) = std::fs::File::open(&path) {
-            if file.seek(SeekFrom::Start(before)).is_ok() {
-                let _ = file.read_to_end(&mut tail);
-            }
+        {
+            let mut file = std::fs::File::open(&path).map_err(|e| {
+                SeamError::new(
+                    ErrorCode::IoError,
+                    format!("compaction tail read {}: {e}", backend.0),
+                )
+            })?;
+            file.seek(SeekFrom::Start(before)).and_then(|_| file.read_to_end(&mut tail))
+                .map_err(|e| {
+                    SeamError::new(
+                        ErrorCode::IoError,
+                        format!("compaction tail read {}: {e}", backend.0),
+                    )
+                })?;
         }
         let tmp = {
             let mut s = path.as_os_str().to_os_string();
@@ -362,6 +378,7 @@ impl StorageDomain for JsonlDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use serde_json::json;
 
     fn backend(name: &str) -> BackendName {
@@ -444,8 +461,31 @@ mod tests {
         assert_eq!(hub.get(&backend("c"), "old").unwrap(), Some(json!(9)));
         assert_eq!(hub.get(&backend("c"), "keep").unwrap(), Some(json!("live")));
         assert_eq!(hub.get(&backend("c"), "gone").unwrap(), None);
+        // A real race: append concurrently with compaction from another
+        // thread sharing the hub. The writer lock serializes the publish
+        // window, so the concurrent append must survive — before the fix,
+        // an append landing between the tail read and the rename vanished.
+        let shared = Arc::new(hub_in(dir.path()));
+        let racer = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                for i in 0..50 {
+                    shared.set(&backend("c"), "racer", json!(i)).unwrap();
+                }
+            })
+        };
+        for _ in 0..20 {
+            shared.compact(&backend("c")).unwrap();
+        }
+        racer.join().unwrap();
+        assert_eq!(
+            shared.get(&backend("c"), "racer").unwrap(),
+            Some(json!(49)),
+            "an append racing compaction was lost"
+        );
+        assert_eq!(shared.get(&backend("c"), "keep").unwrap(), Some(json!("live")));
         // Writes after compaction still work and replay.
-        hub.set(&backend("c"), "after", json!("post-compact")).unwrap();
+        shared.set(&backend("c"), "after", json!("post-compact")).unwrap();
         assert_eq!(hub_in(dir.path()).get(&backend("c"), "after").unwrap(), Some(json!("post-compact")));
     }
 

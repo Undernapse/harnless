@@ -134,6 +134,51 @@ async fn joiner_adopts_failure() {
     assert_eq!(creds.resolve(&cred("doomed")).unwrap(), None, "failed dance stores nothing");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_runner_frees_key_and_wakes_joiners() {
+    // A cancelled runner must not poison the key: the completion guard
+    // publishes a typed failure and frees the slot on every exit, so a
+    // joiner adopts the cancellation error and a later attempt may run.
+    let dir = tempfile::tempdir().unwrap();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let starts2 = starts.clone();
+    let creds = LocalCredentials::builder()
+        .path(dir.path().join("credentials.json"))
+        .flow(CredentialKind::OAuth2, move |_reference| {
+            starts2.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok("late".to_string())
+        })
+        .build();
+    let key = cred("cancelled");
+    let runner = tokio::spawn({
+        let creds = creds.clone();
+        let key = key.clone();
+        async move { creds.authorize(&key, CredentialKind::OAuth2).await }
+    });
+    // Let the runner claim the key, then a joiner parks on it.
+    while !creds.authorize_in_flight(&key) {
+        tokio::task::yield_now().await;
+    }
+    let joiner = tokio::spawn({
+        let creds = creds.clone();
+        let key = key.clone();
+        async move { creds.authorize(&key, CredentialKind::OAuth2).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    runner.abort();
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(5), joiner)
+        .await
+        .expect("joiner must wake after the runner is cancelled, not park forever")
+        .expect("joiner task");
+    assert_eq!(joined.unwrap_err().code, ErrorCode::IoError);
+    assert!(!creds.authorize_in_flight(&key), "cancelled runner frees the key");
+    // A later attempt may run again (exactly one dance started so far).
+    let (secret, state) = creds.authorize(&key, CredentialKind::OAuth2).await.unwrap();
+    assert_eq!(secret, "late");
+    assert_eq!(state, AuthorizeState::Authorized);
+}
+
 struct PromptFlow;
 
 impl AuthorizationFlow for PromptFlow {

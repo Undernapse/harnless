@@ -227,9 +227,11 @@ impl Settings for SettingsFile {
             .map(|l| self.layer_doc(l))
             .collect::<harnless_seams::error::Result<Vec<Value>>>()
         else {
-            // A corrupt layer cannot prove a namespace absent; report
-            // absent rather than panic — the error surfaces through get.
-            return false;
+            // Fail closed: a corrupt layer cannot prove a namespace
+            // ABSENT, and reporting absent would claim an absence the
+            // damage cannot rule out. Report present (the real error
+            // surfaces through `get`/`describe`, which propagate it).
+            return true;
         };
         self.namespace_declared(&docs, ns)
     }
@@ -316,6 +318,21 @@ mod tests {
         let settings = SettingsFile::new(vec![LayerSource::file(&path)]);
         let err = settings.get(&ns("app"), "theme").unwrap_err();
         assert_eq!(err.code, ErrorCode::IoError);
+    }
+
+    #[test]
+    fn corrupt_layer_fails_has_namespace_closed() {
+        // A damaged layer cannot prove a namespace absent: has_namespace
+        // must report present (fail closed) rather than claim an absence
+        // the damage cannot rule out. The real error surfaces through get.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.yml");
+        std::fs::write(&path, "\t: : [unclosed").unwrap();
+        let settings = SettingsFile::new(vec![LayerSource::file(&path)]);
+        assert!(
+            settings.has_namespace(&ns("anything")),
+            "a corrupt layer must not report any namespace absent"
+        );
     }
 
     #[test]

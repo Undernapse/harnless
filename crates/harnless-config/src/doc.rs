@@ -237,7 +237,7 @@ pub struct BundleDoc {
 impl BundleDoc {
     /// Parse a bundle from YAML.
     pub fn load(yaml: &str) -> crate::error::Result<Self> {
-        decode(parse(yaml)).map_err(|e| {
+        decode(parse(yaml)?).map_err(|e| {
             crate::error::ConfigError::new(
                 crate::error::Stage::Compose,
                 "bad-bundle",
@@ -291,7 +291,7 @@ pub struct ProfileSpec {
 impl ProfileSpec {
     /// Parse a profile from YAML.
     pub fn load(yaml: &str) -> crate::error::Result<Self> {
-        decode(parse(yaml)).map_err(|e| {
+        decode(parse(yaml)?).map_err(|e| {
             crate::error::ConfigError::new(
                 crate::error::Stage::Compose,
                 "bad-profile",
@@ -346,7 +346,7 @@ impl ConfigDoc {
     /// Parse a composed document from YAML, rejecting unknown fields so a
     /// dump from a newer build fails loudly instead of mounting silently.
     pub fn load(yaml: &str) -> crate::error::Result<Self> {
-        decode(parse(yaml)).map_err(|e| {
+        decode(parse(yaml)?).map_err(|e| {
             crate::error::ConfigError::new(
                 crate::error::Stage::Compose,
                 "bad-config",
@@ -364,31 +364,35 @@ fn decode<T: serde::de::DeserializeOwned>(value: Value) -> serde_yaml::Result<T>
 
 /// Parse a plain-data YAML document, with an empty file mapped to `null` so
 /// callers can share one decode path.
-fn parse(yaml: &str) -> Value {
+///
+/// A syntax error is returned as-is — misdiagnosing a stray tab as a shape
+/// problem ("invalid type: unit") sends users hunting the wrong file
+/// feature.
+fn parse(yaml: &str) -> crate::error::Result<Value> {
     let text = yaml.trim();
     if text.is_empty() {
-        return Value::Null;
+        return Ok(Value::Null);
     }
-    serde_yaml::from_str(text).unwrap_or_else(|e| {
-        // A document that fails to parse is reported by the caller's typed
-        // error; surface it as a null value so the decode error names the
-        // shape problem rather than panicking here.
-        let _ = e;
-        Value::Null
+    serde_yaml::from_str(text).map_err(|e| {
+        crate::error::ConfigError::new(
+            crate::error::Stage::Compose,
+            "bad-yaml",
+            e.to_string(),
+        )
     })
 }
 
 /// Recognise a field-wise profile patch and translate it to row operations.
 ///
-/// A patch document whose keys are profile fields (`model`, `system_prompt`,
-/// `tools`, `seams`, `name`) is the shape a user writes when they think in
-/// profile terms rather than row terms. Translating it here — rather than
-/// deep-merging it later — keeps one patch algorithm: each named field becomes
-/// a whole-config `set` on the row that carries that field, so restating is
-/// still required and the composition stays readable.
-///
-/// Returns `None` when any key is not a known profile field, so a typo'd key
-/// still surfaces as a typed `bad-patch` error instead of a silent no-op.
+/// The only field-wise patch vocabulary is `model`: the model field is a
+/// row in the composition (`MODEL_ROW_KEY`), so a `model:` key translates
+/// to a whole-config `set` on that row — restating is still required and
+/// the composition stays readable. Document-level fields (`system_prompt`,
+/// `tools`, `seams`, `name`) are not rows and have no row-level patch
+/// spelling; a layer carrying any of them is not a field-wise patch and
+/// returns `None`, so it surfaces through the normal layer classification
+/// (a typed `bad-patch` naming the shape) rather than silently applying a
+/// partial profile rewrite.
 fn field_patch(value: &Value) -> Option<Vec<PatchOp>> {
     let map = value.as_mapping()?;
     let mut ops = Vec::new();
@@ -497,5 +501,18 @@ mod tests {
         let err = Layer::load("[1, 2, this is not a row").unwrap_err();
         assert_eq!(err.code, "bad-patch");
         assert_eq!(err.stage, crate::error::Stage::Patch);
+    }
+
+    /// A YAML syntax error must surface as itself, not as a type error
+    /// from decoding a null placeholder.
+    #[test]
+    fn a_syntax_error_names_the_syntax_problem() {
+        let err = ProfileSpec::load("\t: : [unclosed").unwrap_err();
+        assert_eq!(err.code, "bad-yaml");
+        assert!(
+            !err.message.contains("invalid type"),
+            "a syntax error must not be re-reported as a shape error: {}",
+            err.message
+        );
     }
 }

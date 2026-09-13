@@ -209,13 +209,19 @@ impl MountGuard {
     }
 
     /// Dispose every resource in reverse mount order, exactly once.
+    ///
+    /// A panicking disposer never breaks teardown: every remaining
+    /// resource is still disposed, matching the runtime's fiber-teardown
+    /// discipline ("one broken disposer never breaks teardown").
     pub fn dispose(&mut self) {
         if self.disposed {
             return;
         }
         self.disposed = true;
         for resource in self.resources.iter_mut().rev() {
-            resource.dispose();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resource.dispose();
+            }));
         }
         self.resources.clear();
     }

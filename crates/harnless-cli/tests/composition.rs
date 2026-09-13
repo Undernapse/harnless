@@ -102,14 +102,19 @@ fn profile_patch_beats_bundles_and_home_patch_beats_it() {
 
     // The home patch outranks the profile patch…
     let home = "op: set\nid: model\nconfig:\n  kind: replay\n  provider: from-home\n";
-    let out = hrls(&[
+    let without_home = hrls(&[
         "--config",
         dir.to_str().unwrap(),
         "--dump-config",
         "--profile",
         "p",
     ]);
-    let _ = &out;
+    assert!(without_home.status.success(), "stderr: {}", stderr(&without_home));
+    assert_eq!(
+        dumped_provider(&stdout(&without_home)).as_deref(),
+        Some("from-profile-patch"),
+        "without HARNESS_HOME_PATCH the profile patch must still win"
+    );
     let out = hrls_home(&dir, "p", Some(home), &[]);
     assert_eq!(dumped_provider(&stdout(&out)).as_deref(), Some("from-home"));
 
@@ -336,10 +341,18 @@ fn home_expansion_reaches_a_composed_row() {
         "name: b\nrows:\n- id: spine\n  plugin: spine\n- id: store\n  plugin: storage-jsonl\n  config:\n    dir: ${home}/state\n",
     );
     profile(&dir, "p", "name: p\nbundles:\n- b\n");
-    let out = hrls_in(&dir, &["--profile", "p", "--dump-config"]);
-    // The plan projects only known seams, so assert via the full config path:
-    // the composition must not error on `${home}` when HOME is set.
+    // A bad expression fails the run (see the substitution test above), so
+    // a successful composed dump proves `${home}` expanded rather than
+    // passed through unexpanded — asserted on the dump's own bytes.
+    let out = hrls_in(&dir, &["--profile", "p", "--dump-full-config"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let home = std::env::var("HOME").expect("HOME set for the test run");
+    let dumped = stdout(&out);
+    assert!(
+        dumped.contains(&format!("{home}/state")),
+        "the composed dump must carry the expanded home path: {dumped}"
+    );
+    assert!(!dumped.contains("${home}"), "unexpanded expression leaked: {dumped}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
