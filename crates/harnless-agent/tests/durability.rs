@@ -709,19 +709,7 @@ fn max_tokens_wins_over_later_clean_stop() {
     let _ = loop_.run_turn(Box::new(|| DriverOutcome::Stop(TurnEndReason::Completed)));
     let snap = loop_.log().snapshot();
     // The rule's observable form: once a turn closed MaxTokens, no later
-    // event may rewrite that close to a clean reason.
-    let closed_max = snap.records.iter().any(|r| {
-        matches!(
-            &r.event,
-            SessionEvent::TurnClose {
-                reason: TurnEndReason::MaxTokens
-            }
-        )
-    });
-    assert!(closed_max, "a MaxTokens stop must survive to the log");
-    // And the implementation as written rewrites it: the second turn's
-    // Completed close follows the MaxTokens close with no guard, which the
-    // contract says must not happen for the budget-exhausted turn.
+    // close may be a clean reason.
     let reasons: Vec<_> = snap
         .records
         .iter()
@@ -734,6 +722,98 @@ fn max_tokens_wins_over_later_clean_stop() {
         reasons,
         vec![TurnEndReason::MaxTokens, TurnEndReason::MaxTokens],
         "the later clean stop must not displace MaxTokens"
+    );
+}
+
+// The precedence is a property of the log, not of one loop instance: a
+// second loop mounted on the same log — or a resumed process replaying a
+// saved session — must not log a clean close after the MaxTokens close.
+#[test]
+fn max_tokens_precedence_holds_across_loop_instances() {
+    let log = std::sync::Arc::new(SessionLog::new(SessionId(321)));
+    let first = AgentLoop::new(log.clone(), EventRegistry::new(), Fiber::active());
+    let _ = first.run_turn(Box::new(|| DriverOutcome::Stop(TurnEndReason::MaxTokens)));
+    // A fresh loop over the same log (the re-mount / resume shape).
+    let second = AgentLoop::new(log.clone(), EventRegistry::new(), Fiber::active());
+    let turn = second.run_turn(Box::new(|| DriverOutcome::Stop(TurnEndReason::Completed)));
+    assert_eq!(
+        turn.reason,
+        TurnEndReason::MaxTokens,
+        "a new loop instance must not log a clean close after MaxTokens"
+    );
+    assert!(log.has_closed_max_tokens());
+    let clean_after = log
+        .snapshot()
+        .records
+        .iter()
+        .skip_while(|r| {
+            !matches!(
+                &r.event,
+                SessionEvent::TurnClose {
+                    reason: TurnEndReason::MaxTokens
+                }
+            )
+        })
+        .skip(1)
+        .any(|r| {
+            matches!(
+                &r.event,
+                SessionEvent::TurnClose {
+                    reason: TurnEndReason::Completed
+                }
+            )
+        });
+    assert!(!clean_after, "no TurnClose(Completed) after the MaxTokens close");
+}
+
+// The documented non-displacement half of the rule, pinned: the sticky
+// MaxTokens close displaces only clean closes.
+#[test]
+fn max_tokens_displaces_only_clean_closes() {
+    let loop_ = AgentLoop::new(
+        std::sync::Arc::new(SessionLog::new(SessionId(322))),
+        EventRegistry::new(),
+        Fiber::active(),
+    );
+    let _ = loop_.run_turn(Box::new(|| DriverOutcome::Stop(TurnEndReason::MaxTokens)));
+    let _ = loop_.run_turn(Box::new(|| {
+        DriverOutcome::Stop(TurnEndReason::Aborted {
+            cause: "user".to_string(),
+        })
+    }));
+    let _ = loop_.run_turn(Box::new(|| DriverOutcome::Stop(TurnEndReason::Blocked)));
+    let _ = loop_.run_turn(Box::new(|| {
+        DriverOutcome::Stop(TurnEndReason::Error {
+            code: "e".to_string(),
+            message: "m".to_string(),
+        })
+    }));
+    let _ = loop_.run_turn(Box::new(|| DriverOutcome::Stop(TurnEndReason::Completed)));
+    let reasons: Vec<_> = loop_
+        .log()
+        .snapshot()
+        .records
+        .iter()
+        .filter_map(|r| match &r.event {
+            SessionEvent::TurnClose { reason } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            TurnEndReason::MaxTokens,
+            TurnEndReason::Aborted {
+                cause: "user".to_string()
+            },
+            TurnEndReason::Blocked,
+            TurnEndReason::Error {
+                code: "e".to_string(),
+                message: "m".to_string()
+            },
+            TurnEndReason::MaxTokens,
+        ],
+        "non-clean closes stand verbatim; only the trailing clean close is displaced"
     );
 }
 
