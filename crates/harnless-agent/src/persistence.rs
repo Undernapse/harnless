@@ -16,11 +16,21 @@ use crate::events::SessionEvent;
 
 /// A loaded session log: the exact appended events plus the seed boundary
 /// marker, so reopening an untouched session does not grow its log.
+///
+/// `seeded` is **derivable from `events`**, not an independent fact: a
+/// backend sets it to `true` iff the batch it stores contains
+/// [`SessionEvent::SeedBoundary`] (or its encoding carries the equivalent
+/// marker). The marker is a member of the core vocabulary precisely so a
+/// backend can persist it through `save` and recover it through `load`; a
+/// `LoadedLog` whose `seeded` disagrees with its own events is a
+/// non-conforming backend.
 #[derive(Debug, Clone)]
 pub struct LoadedLog {
     /// The exact events, in position order.
     pub events: Vec<SessionEvent>,
     /// Whether this log carries a seed boundary (writes from this process).
+    ///
+    /// `true` iff `events` contains [`SessionEvent::SeedBoundary`].
     pub seeded: bool,
 }
 

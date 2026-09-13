@@ -1,5 +1,5 @@
 {"parent_session":"sessionid-7","seed_len":8,"working_dir":"/work/repo"}
-{"event":{"type":"user_message","id":1,"blocks":[{"kind":"text","text":"__harnless_seed_boundary__"}],"provider":null,"model":null}}
+{"event":{"type":"seed_boundary"}}
 {"event":{"type":"user_message","id":1,"blocks":[{"kind":"text","text":"list the files"}],"provider":null,"model":null}}
 {"event":{"type":"turn_open"}}
 {"event":{"type":"step_open"}}
