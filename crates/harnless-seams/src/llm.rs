@@ -31,6 +31,31 @@ pub enum BlockKind {
     ToolResult,
 }
 
+impl BlockKind {
+    /// The stable string spelling a recording names this kind with.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BlockKind::Text => "text",
+            BlockKind::Reasoning => "reasoning",
+            BlockKind::Image => "image",
+            BlockKind::ToolCall => "tool_call",
+            BlockKind::ToolResult => "tool_result",
+        }
+    }
+
+    /// Parse a kind from its [`BlockKind::as_str`] spelling.
+    pub fn parse(kind: &str) -> Option<Self> {
+        match kind {
+            "text" => Some(BlockKind::Text),
+            "reasoning" => Some(BlockKind::Reasoning),
+            "image" => Some(BlockKind::Image),
+            "tool_call" => Some(BlockKind::ToolCall),
+            "tool_result" => Some(BlockKind::ToolResult),
+            _ => None,
+        }
+    }
+}
+
 /// A single content block.
 ///
 /// Tool arguments are **raw JSON strings end to end** — never parsed or
@@ -73,11 +98,7 @@ pub struct ToolSchema {
 
 impl ToolSchema {
     /// Build a tool schema from the required fields; `strict` defaults off.
-    pub fn new(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        parameters: Value,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
@@ -170,7 +191,10 @@ impl Usage {
 
 /// The single provider-neutral failure shape both sanctioned failure paths
 /// normalize to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable so a recorded failure can live in a golden file: the replay
+/// adapter reproduces it in-band exactly as the live stream ended with it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderFailure {
     /// Canonical code.
     pub code: ErrorCode,
@@ -199,11 +223,15 @@ pub enum StreamEvent {
 
 /// Replay state is adapter-owned but its shape is shared: response-level
 /// metadata plus per-block entries aligned to emitted blocks.
+///
+/// The `blocks` Vec is in emission order: providers append each entry when
+/// the block's metadata becomes available (at its `BlockEnd`), so alignment
+/// consumes emission order, never index order.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReplayState {
     /// Response-level metadata.
     pub response: Option<Value>,
-    /// Per-block entries aligned to emitted blocks, in order.
+    /// Per-block entries aligned to emitted blocks, in emission order.
     pub blocks: Vec<Value>,
 }
 
@@ -219,7 +247,7 @@ pub struct ReplayState {
 /// stored metadata always describes stored content.
 #[derive(Debug, Default)]
 pub struct BlockAssembler {
-    /// Completely assembled blocks in index order.
+    /// Completely assembled blocks in emission order.
     completed: Vec<(usize, ContentBlock)>,
     /// Blocks started but not yet ended, keyed by index.
     open: Vec<usize>,
@@ -259,15 +287,15 @@ impl BlockAssembler {
     /// The completed content blocks, in index order, with keep-or-drop
     /// applied: on a truncated finish, tool-call blocks are dropped.
     pub fn blocks(&self) -> Vec<ContentBlock> {
-        // Sort by index to keep interleaved blocks deterministic.
+        // Sort by index to keep interleaved blocks deterministic; the sort
+        // is for message assembly only — replay alignment consumes emission
+        // order (see [`ReplayState`]).
         let mut completed = self.completed.clone();
         completed.sort_by_key(|(index, _)| *index);
         completed
             .into_iter()
             .map(|(_, block)| block)
-            .filter(|block| {
-                !(self.truncated && block.kind == BlockKind::ToolCall)
-            })
+            .filter(|block| !(self.truncated && block.kind == BlockKind::ToolCall))
             .collect()
     }
 
@@ -281,17 +309,18 @@ impl BlockAssembler {
         self.usage
     }
 
-    /// emitted blocks in index order. Dropped blocks (from a truncated
+    /// Align provider replay state with the assembled blocks:
+    /// `replay.blocks[i]` is the entry the provider appended at emission
+    /// slot `i`, so entries are paired with blocks in emission order —
+    /// never index order, which would mispair metadata whenever providers
+    /// interleave blocks. Dropped blocks (from a truncated
     /// finish) have their entries pruned so stored metadata always describes
     /// stored content.
     pub fn align_replay(&self, replay: ReplayState) -> ReplayState {
-        // All emitted blocks in index order; the drop filter decides which
-        // survive. `replay.blocks[i]` aligns to emitted block `i`.
-        let mut emitted = self.completed.clone();
-        emitted.sort_by_key(|(index, _)| *index);
-
-        let mut blocks = Vec::with_capacity(emitted.len());
-        for (i, (_, block)) in emitted.iter().enumerate() {
+        // All emitted blocks in emission order; the drop filter decides
+        // which survive. `replay.blocks[i]` aligns to emitted block `i`.
+        let mut blocks = Vec::with_capacity(self.completed.len());
+        for (i, (_, block)) in self.completed.iter().enumerate() {
             let kept = !(self.truncated && block.kind == BlockKind::ToolCall);
             if kept {
                 if let Some(entry) = replay.blocks.get(i) {
@@ -388,9 +417,18 @@ mod tests {
     fn assembler_keeps_completed_blocks_in_index_order() {
         let mut a = BlockAssembler::new();
         // Interleaved indexes: text block 0, tool block 1, text block 2.
-        a.push(&StreamFrame::BlockStart { index: 0, kind: BlockKind::Text });
-        a.push(&StreamFrame::BlockStart { index: 1, kind: BlockKind::ToolCall });
-        a.push(&StreamFrame::BlockStart { index: 2, kind: BlockKind::Text });
+        a.push(&StreamFrame::BlockStart {
+            index: 0,
+            kind: BlockKind::Text,
+        });
+        a.push(&StreamFrame::BlockStart {
+            index: 1,
+            kind: BlockKind::ToolCall,
+        });
+        a.push(&StreamFrame::BlockStart {
+            index: 2,
+            kind: BlockKind::Text,
+        });
         a.push(&text_block(2, "world"));
         a.push(&tool_block(1, 7));
         a.push(&text_block(0, "hello"));
@@ -407,9 +445,15 @@ mod tests {
     #[test]
     fn truncated_finish_drops_tool_call_blocks() {
         let mut a = BlockAssembler::new();
-        a.push(&StreamFrame::BlockStart { index: 0, kind: BlockKind::Text });
+        a.push(&StreamFrame::BlockStart {
+            index: 0,
+            kind: BlockKind::Text,
+        });
         // Tool block completes but a later block is still open at Finish.
-        a.push(&StreamFrame::BlockStart { index: 1, kind: BlockKind::ToolCall });
+        a.push(&StreamFrame::BlockStart {
+            index: 1,
+            kind: BlockKind::ToolCall,
+        });
         a.push(&StreamFrame::BlockEnd {
             index: 1,
             assembled: ContentBlock {
@@ -419,7 +463,10 @@ mod tests {
         });
         a.push(&text_block(0, "hello"));
         // Block 2 opened but never ended -> truncation.
-        a.push(&StreamFrame::BlockStart { index: 2, kind: BlockKind::Text });
+        a.push(&StreamFrame::BlockStart {
+            index: 2,
+            kind: BlockKind::Text,
+        });
         a.push(&StreamFrame::Finish);
 
         assert!(a.truncated());
@@ -432,18 +479,29 @@ mod tests {
     #[test]
     fn align_replay_prunes_in_lockstep_with_dropped_blocks() {
         let mut a = BlockAssembler::new();
-        a.push(&StreamFrame::BlockStart { index: 0, kind: BlockKind::Text });
-        a.push(&StreamFrame::BlockStart { index: 1, kind: BlockKind::ToolCall });
+        a.push(&StreamFrame::BlockStart {
+            index: 0,
+            kind: BlockKind::Text,
+        });
+        a.push(&StreamFrame::BlockStart {
+            index: 1,
+            kind: BlockKind::ToolCall,
+        });
         a.push(&tool_block(1, 7));
         a.push(&text_block(0, "hello"));
-        a.push(&StreamFrame::BlockStart { index: 2, kind: BlockKind::Text });
+        a.push(&StreamFrame::BlockStart {
+            index: 2,
+            kind: BlockKind::Text,
+        });
         a.push(&StreamFrame::Finish);
 
         let replay = ReplayState {
             response: Some(serde_json::json!({"id": "r1"})),
+            // Entries are appended in emission order: the tool (index 1)
+            // ended first, so its entry sits at slot 0.
             blocks: vec![
-                serde_json::json!({"index": 0}),
                 serde_json::json!({"index": 1}),
+                serde_json::json!({"index": 0}),
                 // Emitted block 2 was opened but never completed and is not
                 // in `completed`; the provider supplied no entry for it.
             ],
@@ -454,5 +512,74 @@ mod tests {
         assert_eq!(aligned.blocks.len(), 1);
         assert_eq!(aligned.blocks[0], serde_json::json!({"index": 0}));
     }
-}
 
+    #[test]
+    fn error_codes_serialize_as_their_stable_spellings() {
+        // The golden-file format stores failures by their router-facing
+        // spelling; serde must agree with as_str for every code.
+        let codes = [
+            ErrorCode::ProviderFailure,
+            ErrorCode::StreamTerminated,
+            ErrorCode::EmptyCompletion,
+            ErrorCode::ContextOverflow,
+            ErrorCode::NotFound,
+            ErrorCode::ExecCancelled,
+        ];
+        for code in codes {
+            let json = serde_json::to_string(&code).unwrap();
+            assert_eq!(json, format!("\"{}\"", code.as_str()));
+            let back: ErrorCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, code);
+        }
+        assert!(serde_json::from_str::<ErrorCode>("\"bogus\"").is_err());
+    }
+
+    #[test]
+    fn block_kinds_round_trip_through_their_spellings() {
+        for kind in [
+            BlockKind::Text,
+            BlockKind::Reasoning,
+            BlockKind::Image,
+            BlockKind::ToolCall,
+            BlockKind::ToolResult,
+        ] {
+            assert_eq!(BlockKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(BlockKind::parse("smell"), None);
+    }
+
+    #[test]
+    fn align_replay_pairs_metadata_by_emission_order() {
+        // Providers append per-block metadata in emission order: the entry
+        // appended at slot `i` describes the block that ended at slot `i`,
+        // regardless of correlating index.
+        let mut a = BlockAssembler::new();
+        a.push(&StreamFrame::BlockStart {
+            index: 0,
+            kind: BlockKind::Text,
+        });
+        a.push(&StreamFrame::BlockStart {
+            index: 1,
+            kind: BlockKind::ToolCall,
+        });
+        // Emission order: tool (index 1) ends first, text (index 0) second.
+        a.push(&tool_block(1, 7));
+        a.push(&text_block(0, "hello"));
+        a.push(&StreamFrame::Finish);
+
+        let replay = ReplayState {
+            response: None,
+            blocks: vec![
+                serde_json::json!({"tool": 1}),
+                serde_json::json!({"text": "hello"}),
+            ],
+        };
+        let aligned = a.align_replay(replay.clone());
+        // Message assembly keeps index order: text (index 0) first.
+        assert_eq!(a.blocks()[0].kind, BlockKind::Text);
+        // No truncation: both blocks are kept, each paired with the entry
+        // appended at ITS emission slot — the tool's metadata stays on the
+        // tool entry and never leaks onto the text block's entry.
+        assert_eq!(aligned.blocks, replay.blocks);
+    }
+}

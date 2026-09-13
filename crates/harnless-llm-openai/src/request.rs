@@ -112,8 +112,16 @@ fn content_value(parts: Vec<Value>) -> Value {
 /// verbatim as the string the provider produced, never re-serialized.
 fn tool_call(block: &ContentBlock) -> Value {
     let raw: Value = serde_json::from_str(&block.text).unwrap_or_else(|_| json!({}));
-    let id = raw.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let name = raw.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let id = raw
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let name = raw
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     // `arguments` may already be a string; otherwise serialize the object
     // once to recover the raw form.
     let arguments = match raw.get("arguments") {
@@ -188,7 +196,10 @@ mod tests {
     fn plain_text_user_is_a_string_content() {
         let m = msg(
             Role::User,
-            vec![ContentBlock { kind: BlockKind::Text, text: "hi".into() }],
+            vec![ContentBlock {
+                kind: BlockKind::Text,
+                text: "hi".into(),
+            }],
         );
         let wire = message(&m);
         assert_eq!(wire["role"], "user");
@@ -235,8 +246,8 @@ mod tests {
 
     #[test]
     fn tool_schema_emits_function_definition() {
-        let schema = ToolSchema::new("search", "Find things", json!({"type":"object"}))
-            .strict(true);
+        let schema =
+            ToolSchema::new("search", "Find things", json!({"type":"object"})).strict(true);
         let built = tools(&[schema]).unwrap();
         assert_eq!(built[0]["type"], "function");
         assert_eq!(built[0]["function"]["name"], "search");

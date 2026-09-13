@@ -125,11 +125,17 @@ impl SseDecoder {
                     let index = self.next_index;
                     self.next_index += 1;
                     self.text_index = Some(index);
-                    frames.push(StreamFrame::BlockStart { index, kind: BlockKind::Text });
+                    frames.push(StreamFrame::BlockStart {
+                        index,
+                        kind: BlockKind::Text,
+                    });
                 }
                 let index = self.text_index.unwrap();
                 self.text.push_str(text);
-                frames.push(StreamFrame::TextDelta { index, text: text.to_string() });
+                frames.push(StreamFrame::TextDelta {
+                    index,
+                    text: text.to_string(),
+                });
             }
         }
 
@@ -274,8 +280,14 @@ fn assembled_tool_json(id: &str, name: &str, arguments: &str) -> String {
 /// read from the nested `completion_tokens_details.reasoning_tokens` with
 /// a flat-key fallback.
 pub fn usage_from_value(usage: &Value) -> Option<Usage> {
-    let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let completion = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let prompt = usage
+        .get("prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let completion = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let hit = usage
         .get("prompt_cache_hit_tokens")
         .and_then(|v| v.as_u64())
@@ -329,15 +341,33 @@ mod tests {
         })));
         assert_eq!(
             frames[0],
-            StreamFrame::BlockStart { index: 0, kind: BlockKind::Text }
+            StreamFrame::BlockStart {
+                index: 0,
+                kind: BlockKind::Text
+            }
         );
-        assert_eq!(frames[1], StreamFrame::TextDelta { index: 0, text: "hel".into() });
-        assert_eq!(frames[2], StreamFrame::TextDelta { index: 0, text: "lo".into() });
+        assert_eq!(
+            frames[1],
+            StreamFrame::TextDelta {
+                index: 0,
+                text: "hel".into()
+            }
+        );
+        assert_eq!(
+            frames[2],
+            StreamFrame::TextDelta {
+                index: 0,
+                text: "lo".into()
+            }
+        );
         assert_eq!(
             frames[3],
             StreamFrame::BlockEnd {
                 index: 0,
-                assembled: ContentBlock { kind: BlockKind::Text, text: "hello".into() },
+                assembled: ContentBlock {
+                    kind: BlockKind::Text,
+                    text: "hello".into()
+                },
             }
         );
     }
@@ -408,11 +438,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         // Text at 0, tool call a at 1, tool call b at 2.
-        assert_eq!(starts, vec![
-            (0, BlockKind::Text),
-            (1, BlockKind::ToolCall),
-            (2, BlockKind::ToolCall),
-        ]);
+        assert_eq!(
+            starts,
+            vec![
+                (0, BlockKind::Text),
+                (1, BlockKind::ToolCall),
+                (2, BlockKind::ToolCall),
+            ]
+        );
     }
 
     #[test]
@@ -470,8 +503,8 @@ mod tests {
         // Only the first choice's text participates: one BlockStart, one TextDelta.
         assert_eq!(frames.len(), 2);
         assert!(frames.iter().all(|f| match f {
-            StreamFrame::BlockStart { index, .. }
-            | StreamFrame::TextDelta { index, .. } => *index == 0,
+            StreamFrame::BlockStart { index, .. } | StreamFrame::TextDelta { index, .. } =>
+                *index == 0,
             _ => false,
         }));
     }

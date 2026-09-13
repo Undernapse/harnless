@@ -31,8 +31,8 @@
 //! * **`Disposer::dispose()` runs the cleanup now** — the explicit, one-shot
 //!   early-teardown form.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
@@ -325,15 +325,11 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let a = order.clone();
         let _ga = fiber
-            .effect(move || {
-                Some(Box::new(move || a.lock().push("a")) as DisposeFn)
-            })
+            .effect(move || Some(Box::new(move || a.lock().push("a")) as DisposeFn))
             .unwrap();
         let b = order.clone();
         let _gb = fiber
-            .effect(move || {
-                Some(Box::new(move || b.lock().push("b")) as DisposeFn)
-            })
+            .effect(move || Some(Box::new(move || b.lock().push("b")) as DisposeFn))
             .unwrap();
         fiber.dispose();
         assert_eq!(*order.lock(), vec!["b", "a"]);
@@ -397,9 +393,7 @@ mod tests {
             })
             .unwrap();
         let _g2 = fiber
-            .effect(|| {
-                Some(Box::new(|| panic!("cleanup exploded")) as DisposeFn)
-            })
+            .effect(|| Some(Box::new(|| panic!("cleanup exploded")) as DisposeFn))
             .unwrap();
         fiber.dispose(); // must not panic; both slots processed
         assert_eq!(ran.load(Ordering::SeqCst), 1);

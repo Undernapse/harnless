@@ -14,8 +14,8 @@ use async_stream::stream;
 use futures::StreamExt;
 
 use harnless_seams::{
-    BoxStream, CallId, ErrorCode, Message, ModelAdapter, ProviderFailure, ReplayState,
-    Result, SeamError, StreamEvent, StreamFrame, ToolSchema,
+    BoxStream, CallId, ErrorCode, Message, ModelAdapter, ProviderFailure, ReplayState, Result,
+    SeamError, StreamEvent, StreamFrame, ToolSchema,
 };
 
 use crate::config::OpenAiConfig;

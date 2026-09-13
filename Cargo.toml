@@ -5,6 +5,7 @@ members = [
     "crates/harnless-seams",
     "crates/harnless-agent",
     "crates/harnless-llm-openai",
+    "crates/harnless-llm-replay",
 ]
 
 [workspace.package]

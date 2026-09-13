@@ -19,8 +19,8 @@ pub mod spine;
 pub mod tools;
 
 pub use events::{
-    ChunkRecord, CommittedRecord, ContentBlock, LogRecord, MessageRecord, Position,
-    SessionEvent, ToolCallRecord, ToolResultRecord, TurnEndReason,
+    ChunkRecord, CommittedRecord, ContentBlock, LogRecord, MessageRecord, Position, SessionEvent,
+    ToolCallRecord, ToolResultRecord, TurnEndReason,
 };
 pub use history::{History, SurfaceNode};
 pub use loop_::{AgentLoop, DerivedTurn, Driver, DriverOutcome};

@@ -42,7 +42,7 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 
 use crate::error::Result;
-use crate::fiber::{Disposer, DisposeFn, Fiber};
+use crate::fiber::{DisposeFn, Disposer, Fiber};
 
 /// Listener placement, mirroring the reference `EventOptions`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -330,7 +330,9 @@ impl EventRegistry {
         E: Send + Sync + 'static,
         R: Send + 'static,
     {
-        let mut slots = Self::waterfall_slots::<E, R>(&self.set_of::<E>()).read().clone();
+        let mut slots = Self::waterfall_slots::<E, R>(&self.set_of::<E>())
+            .read()
+            .clone();
         // `Next::call` pops from the end, so reverse to make the first
         // registration the outermost wrapper (dispatch order).
         slots.reverse();
@@ -706,14 +708,9 @@ mod tests {
         let reg = EventRegistry::new();
         let fiber = Fiber::active();
         let _guard = reg
-            .on::<Ping, _>(
-                &fiber,
-                |_: &mut Ping| panic!("boom"),
-                EventOptions::new(),
-            )
+            .on::<Ping, _>(&fiber, |_: &mut Ping| panic!("boom"), EventOptions::new())
             .unwrap();
         // Must complete without propagating the panic (allSettled semantics).
         reg.parallel(Ping { hits: 0 }).await;
     }
 }
-

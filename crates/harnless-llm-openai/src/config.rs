@@ -72,7 +72,10 @@ mod tests {
     #[test]
     fn chat_url_joins_without_double_slash() {
         let cfg = OpenAiConfig::new("https://api.deepseek.com/v1", None, "m", "id");
-        assert_eq!(cfg.chat_url(), "https://api.deepseek.com/v1/chat/completions");
+        assert_eq!(
+            cfg.chat_url(),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
         let cfg = OpenAiConfig::new("https://host/v1/", None, "m", "id");
         assert_eq!(cfg.chat_url(), "https://host/v1/chat/completions");
     }
