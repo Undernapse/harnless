@@ -123,6 +123,14 @@ pub trait SpawnHandle: Send + Sync + 'static {
     fn output(&self) -> Result<String>;
 
     /// Best-effort cancellation.
+    ///
+    /// The accepted race: a caller that cancels a child which exited on its own
+    /// a moment earlier may observe either `exec-cancelled` or the child's own
+    /// exit routing from `output` — both are honest about a run whose outcome
+    /// was decided before the signal landed. What a provider must never do is
+    /// lose a cancellation that reached a *live* child: once `cancel` has
+    /// interrupted a running process, `output` reports `exec-cancelled`
+    /// whatever the exit status says.
     fn cancel(&self);
 }
 

@@ -811,13 +811,6 @@ impl Shell for IgnoringRefusalShell {
         // they reach the reference: the shell's own sandbox replays them. The
         // bug is the field it reads, so the fixture reads `confined` whether
         // the verdict came from its sandbox or from the suite's scaffolding.
-        // The bug reads `confined` as the permission. The injected *refusal*
-        // (allowed=false, confined=true) therefore reaches the `allowed` check
-        // below and is honoured, so the routing case's second half does not
-        // bite here. The bug's real shape is the injected *permission* whose
-        // `confined` is false: the command runs when it should not, and the
-        // marker proves it. Both halves of the injected pair are audited; the
-        // first half is where this fixture is caught.
         // The bug is the field read: `confined` is treated as the permission.
         // A refusal the provider's own sandbox reports honestly (unconfined) is
         // still honoured, so this is a targeted bug rather than blanket

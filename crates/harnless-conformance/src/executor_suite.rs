@@ -1006,12 +1006,16 @@ const CANCEL_SENTINEL: &str = "harnless-conformance-running";
 
 /// How long the sentinel probe's command runs if nothing stops it.
 ///
-/// Deliberately well above any fixture's `cancel_timeout` (the suite default is
-/// 10s, and the negative fixtures go lower). The probe is now *cancelled* rather
-/// than waited out, so its lifetime is only the window a leaked child could
-/// linger — it must never be a value tuned near a fixture constant. A case whose
-/// bite depended on the probe outliving the fixture by a hair was not a guard.
-const PROBE_LIFETIME_SECS: u64 = 120;
+/// Deliberately *shorter* than the release bound in [`probe_running`]
+/// (`2 × PROBE_BOUND`). The probe is cancelled rather than waited out, but the
+/// release observation is a bound on `output()` returning — and a provider
+/// whose signal races an exit already under way, or whose child traps the
+/// signal and exits on its own, releases a moment late. With the child's own
+/// lifetime under the bound, "the provider never signalled and never released"
+/// cannot be confused with "the provider signalled late": an honest provider's
+/// child is gone before the bound expires either way, and only a provider that
+/// ignores `cancel` stays unreleased at the bound.
+const PROBE_LIFETIME_SECS: u64 = 4;
 
 /// How long the suite waits for a probe to announce itself.
 const PROBE_BOUND: Duration = Duration::from_secs(5);
@@ -1307,39 +1311,60 @@ fn denied_command_never_runs(providers: &Executors, fixture: &ExecFixture, cx: &
             return;
         }
     };
-    if verdict.allowed {
-        cx.skip("no refusing policy available for this provider; nothing to assert");
-        return;
-    }
+    // Whether the provider's own policy produced a refusal, or the suite has to
+    // force one. A provider that confines by mode rather than by root (or whose
+    // `default_confined` is advisory) answers `allowed == true` here, and the
+    // obligation "a denial happens before the subprocess is touched" would go
+    // unexercised if the case skipped. So the refusal is replayed through a
+    // suite-owned sandbox that answers *only* from the installed verdict: the
+    // provider's real policy is out of play by construction, and the shell faces
+    // a denial it cannot explain away as the provider's own conservatism.
+    let forced = verdict.allowed;
+    let refusal = if forced {
+        Enforced {
+            allowed: false,
+            confined: false,
+            mode: "conformance-forced".to_string(),
+            reason: INJECTED_REASON.to_string(),
+        }
+    } else {
+        verdict.clone()
+    };
 
-    // The provider's own verdict, replayed through the injected-verdict path so
-    // the shell faces the same refusal twice: once as the sandbox's answer, once
-    // as the installed fixture. This drives the shell over a sandbox that
-    // consults `injected_verdict`, so a shell that spawns anyway is caught here
-    // rather than passing because its own policy happens to refuse.
+    // The refusal — the provider's own, or the suite's forced one — is replayed
+    // so the shell faces it as a verdict. When the provider refused naturally the
+    // shell sees the same answer twice: once as its sandbox's verdict, once as
+    // the installed fixture. When the provider has no refusing policy, the
+    // verdict-only sandbox is the only source, and a shell that spawns anyway is
+    // caught rather than passing because the provider never says no.
+    let sandbox_leg: Arc<dyn Sandbox> = if forced {
+        Arc::new(VerdictOnlySandbox)
+    } else {
+        Arc::new(LoggingSandbox {
+            inner: Arc::clone(providers.sandbox.as_ref().expect("checked by cx.leg")),
+            seen: recorder::Recorder::default(),
+        })
+    };
     let wired = Executors::new()
         .shell(Arc::clone(
             providers.shell.as_ref().expect("checked by cx.leg"),
         ))
-        .sandbox(Arc::new(LoggingSandbox {
-            inner: Arc::clone(providers.sandbox.as_ref().expect("checked by cx.leg")),
-            seen: recorder::Recorder::default(),
-        }))
+        .sandbox(sandbox_leg)
         .subprocess(Arc::clone(
             providers.subprocess.as_ref().expect("checked by cx.leg"),
         ));
     let wired_shell = wired.shell.as_deref().expect("just set");
-    inject(verdict.clone());
+    inject(refusal.clone());
     let outcome = run(wired_shell, &touch_command(&marker), &denied_policy);
     clear_injection();
     match &outcome {
         Ran::Err(ErrorCode::SandboxDenied, message) => {
             // The refusal must be auditable: the report's mode and reason
             // belong in what the caller sees.
-            if !message.contains(&verdict.mode) && !message.contains(&verdict.reason) {
+            if !message.contains(&refusal.mode) && !message.contains(&refusal.reason) {
                 cx.fail(format!(
                     "the refusal surfaced as `{}` without the enforced mode or reason in \
-                     it: {message:?} (verdict was {verdict:?})",
+                     it: {message:?} (verdict was {refusal:?})",
                     ErrorCode::SandboxDenied.as_str()
                 ));
             }
@@ -1509,11 +1534,12 @@ fn cancellation_is_honoured(providers: &Executors, fixture: &ExecFixture, cx: &m
     // A command no conforming test waits out. The provider decides process
     // grouping, so a group-kill provider also proves it reaches descendants.
     //
-    // The command is deliberately much longer than the fixture's cancellation
-    // bound. A provider that ignores `cancel` is caught by the bound — but the
-    // suite still has to wait for the child to finish before `output()` returns,
-    // so an unbounded sleep would make the negative test hang for minutes. The
-    // bound is the assertion; the sleep is the thing being cancelled.
+    // The command outlives the fixture's cancellation bound, so a provider that
+    // ignores `cancel` is caught by the bound rather than by luck. The bound is
+    // the assertion; the sleep is the thing being cancelled. The sentinel probe
+    // has the opposite shape (its lifetime is deliberately *under* the release
+    // bound, see [`PROBE_LIFETIME_SECS`]): the measured child must outlive the
+    // bound, the probe child must not.
     let sleep_secs = fixture.cancel_timeout.as_secs() + 5;
     let spawn = Spawn {
         argv: vec![
@@ -1606,10 +1632,9 @@ fn cancellation_is_honoured(providers: &Executors, fixture: &ExecFixture, cx: &m
             return;
         }
     }
-    // Measured from here, after every fixture probe has settled: the bound is on
-    // how long a *cancelled* child takes to stop, and probe time must not count
-    // against the provider.
-    let started = Instant::now();
+    // The bound is on how long a *cancelled* child takes to stop, and it is
+    // taken immediately before `cancel` inside the scope below — not here — so
+    // fixture probe time can never be charged to the provider.
     enum Stage {
         Running,
         /// The measured command never announced itself even though the probe
@@ -1621,7 +1646,7 @@ fn cancellation_is_honoured(providers: &Executors, fixture: &ExecFixture, cx: &m
         ProbeNeverRan,
         CancelPanicked,
     }
-    let (stage, outcome) = std::thread::scope(|waiters| {
+    let (stage, outcome, cancel_elapsed) = std::thread::scope(|waiters| {
         let waiting = waiters.spawn(|| handle.output());
         // Cancel only once the child is observably mid-run. The bound is generous
         // and the loop exits as soon as the sentinel appears, so a fast machine
@@ -1631,22 +1656,26 @@ fn cancellation_is_honoured(providers: &Executors, fixture: &ExecFixture, cx: &m
             Ok(()) => {}
             Err(RanUp::NeverSpawned) => {
                 let _ = waiting.join();
-                return (Stage::ProbeNeverRan, Err(()));
+                return (Stage::ProbeNeverRan, Err(()), Duration::ZERO);
             }
             Err(RanUp::SpawnedButQuiet) => {
                 let _ = waiting.join();
-                return (Stage::MeasuredNeverRan, Err(()));
+                return (Stage::MeasuredNeverRan, Err(()), Duration::ZERO);
             }
         }
+        // Measured from the signal, after every fixture probe has settled: this
+        // is the provider's cancellation latency, with no probe time in it.
+        let started = Instant::now();
         let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handle.cancel();
         }));
         if cancelled.is_err() {
             // The scope cannot propagate a panic from here; report it after.
             let _ = waiting.join();
-            return (Stage::CancelPanicked, Err(()));
+            return (Stage::CancelPanicked, Err(()), started.elapsed());
         }
-        (Stage::Running, waiting.join().map_err(|_| ()))
+        let outcome = waiting.join().map_err(|_| ());
+        (Stage::Running, outcome, started.elapsed())
     });
     let outcome = match (stage, outcome) {
         (Stage::Running, Ok(outcome)) => outcome,
@@ -1682,7 +1711,7 @@ fn cancellation_is_honoured(providers: &Executors, fixture: &ExecFixture, cx: &m
         Ok(out) => cx.fail(format!(
             "a cancelled command returned Ok({out:?}) after {:?}; cancellation must not \
              deliver a completed run as success",
-            started.elapsed()
+            cancel_elapsed
         )),
         Err(err) => {
             // The seam's taxonomy is explicit: a cancelled run reports
@@ -1702,11 +1731,10 @@ fn cancellation_is_honoured(providers: &Executors, fixture: &ExecFixture, cx: &m
             }
         }
     }
-    if started.elapsed() > fixture.cancel_timeout {
+    if cancel_elapsed > fixture.cancel_timeout {
         cx.fail(format!(
-            "the cancelled command took {:?} to stop, past the fixture's {:?} bound; \
-             `cancel` did not reach the process",
-            started.elapsed(),
+            "the cancelled command took {cancel_elapsed:?} to stop, past the fixture's \
+             {:?} bound; `cancel` did not reach the process",
             fixture.cancel_timeout
         ));
     }
@@ -1866,6 +1894,21 @@ impl Subprocess for LoggingSubprocess {
 // injections and fails the cases that need them, which is the honest outcome:
 // the suite cannot claim to have tested a routing decision the provider never
 // faced.
+//
+// # Injection is per-thread, and every injection-dependent assertion is
+// # driving-thread
+//
+// The slot is thread-local: a sandbox consulted on a *worker* thread (the
+// cancellation probes spawn several) sees `None` and falls back to its real
+// policy. That is deliberate and load-bearing, not an accident — the suite's
+// probe machinery must run against the provider's real behaviour, never against
+// a verdict a different case installed. The contract this imposes on the suite
+// itself: `inject`/`clear_injection` and every `run` whose outcome is
+// attributed to the installed verdict happen on the driving thread, inside one
+// case, and are cleared before the case returns. Any future case that wants to
+// assert about an installed verdict on an off-thread leg must move the
+// injection into that thread first; asserting cross-thread would silently test
+// the provider's natural policy instead.
 thread_local! {
     static INJECTED: std::sync::Mutex<Option<Enforced>> =
         const { std::sync::Mutex::new(None) };
