@@ -16,6 +16,7 @@ pub mod persistence;
 pub mod prompt;
 pub mod session;
 pub mod spine;
+pub mod testsupport;
 pub mod tools;
 
 pub use events::{

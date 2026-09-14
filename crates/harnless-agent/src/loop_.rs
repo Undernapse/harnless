@@ -52,12 +52,38 @@ pub struct AgentLoop {
     log: Arc<SessionLog>,
     events: EventRegistry,
     fiber: Arc<Fiber>,
+    tools: Option<Arc<crate::tools::ToolRegistry>>,
 }
 
 impl AgentLoop {
-    /// Create a loop bound to `log` and `fiber` (which owns its effects).
+    /// Create a loop bound to `log` and `fiber` (which owns its effects),
+    /// with no tool pipeline — a tool-call step answers with the empty
+    /// object, as the minimal loop always did. Prefer [`AgentLoop::with_tools`].
     pub fn new(log: Arc<SessionLog>, events: EventRegistry, fiber: Arc<Fiber>) -> Self {
-        Self { log, events, fiber }
+        Self {
+            log,
+            events,
+            fiber,
+            tools: None,
+        }
+    }
+    /// Create a loop that answers tool calls through `tools`' guarded
+    /// pipeline: the call is executed (pre-execute → monotonic guards →
+    /// execute → post-execute → finalize → notify) and the frozen result
+    /// is what the log records as the tool result. A denied or failed
+    /// pipeline records a structured error result — fail-closed, visible.
+    pub fn with_tools(
+        log: Arc<SessionLog>,
+        events: EventRegistry,
+        fiber: Arc<Fiber>,
+        tools: Arc<crate::tools::ToolRegistry>,
+    ) -> Self {
+        Self {
+            log,
+            events,
+            fiber,
+            tools: Some(tools),
+        }
     }
 
     /// The session log this loop drives.
@@ -116,10 +142,7 @@ impl AgentLoop {
             DriverOutcome::ToolCall(call) => {
                 self.log.append(SessionEvent::ToolCall(call.clone()));
                 let _ = history.apply(&SessionEvent::ToolCall(call.clone()));
-                let result = ToolResultRecord {
-                    call_id: call.call_id,
-                    content: "{}".into(),
-                };
+                let result = self.answer_tool_call(&call);
                 self.log.append(SessionEvent::ToolResult(result.clone()));
                 let _ = history.apply(&SessionEvent::ToolResult(result));
                 TurnEndReason::Completed
@@ -150,6 +173,23 @@ impl AgentLoop {
         }
     }
 
+    /// Produce the tool result for `call`: through the guarded pipeline when
+    /// one is mounted, otherwise the minimal empty-object answer.
+    fn answer_tool_call(&self, call: &ToolCallRecord) -> ToolResultRecord {
+        let content = match &self.tools {
+            Some(registry) => {
+                match registry.execute(call.call_id, &call.tool, call.arguments.as_bytes()) {
+                    Ok(frozen) => frozen.value.to_string(),
+                    Err(err) => format!(r#"{{"error":"{}"}}"#, err.code),
+                }
+            }
+            None => "{}".into(),
+        };
+        ToolResultRecord {
+            call_id: call.call_id,
+            content,
+        }
+    }
     /// Fire the model-streaming waterfall over `msg`.
     ///
     /// The built-in behavior commits the message unchanged; a listener that

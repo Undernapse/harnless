@@ -10,6 +10,8 @@ description = "Session log, agent loop, system-prompt assembly, and core spine s
 harnless-runtime = { path = "../harnless-runtime" }
 parking_lot = "0.12"
 harnless-seams = { path = "../harnless-seams" }
+harnless-llm-replay = { path = "../harnless-llm-replay" }
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
