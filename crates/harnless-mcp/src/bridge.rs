@@ -54,14 +54,29 @@ use crate::supervisor::{
 /// own one.
 pub fn runtime() -> &'static Arc<Runtime> {
     static RT: std::sync::LazyLock<Arc<Runtime>> = std::sync::LazyLock::new(|| {
-        Arc::new(
-            Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .thread_name("harnless-mcp")
-                .build()
-                .expect("harnless-mcp runtime"),
-        )
+        match Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("harnless-mcp")
+            .build()
+        {
+            Ok(rt) => Arc::new(rt),
+            Err(e) => {
+                // Thread/fd exhaustion is exactly when a reconnect is
+                // attempted; a panic here would poison the LazyLock and
+                // kill every later use. Degrade to a minimal runtime.
+                warn!(detail = %e,
+                    "harnless-mcp: could not build the shared runtime; falling back to a single worker");
+                Arc::new(
+                    Builder::new_multi_thread()
+                        .worker_threads(1)
+                        .enable_all()
+                        .thread_name("harnless-mcp")
+                        .build()
+                        .expect("harnless-mcp minimal runtime"),
+                )
+            }
+        }
     });
     &RT
 }
@@ -103,15 +118,15 @@ struct BridgeState {
     generations: HashMap<String, HashMap<String, Entry>>,
     /// public name → live (not yet unregistered).
     live: HashSet<String>,
-    /// public name → the definition we registered there. `Tools` has no
-    /// unregister, so names that disappear from a generation leave an
-    /// orphan forwarder in the registry; we remember the definition so the
-    /// name's reappearance re-adopts our own forwarder instead of
-    /// conflicting with ourselves.
-    registered: HashMap<String, ToolDefinition>,
+    /// public name → (owning server, the definition we registered there).
+    /// `Tools` has no unregister, so names that disappear from a
+    /// generation leave an orphan forwarder in the registry; we remember
+    /// the definition so the name's reappearance re-adopts our own
+    /// forwarder instead of conflicting with ourselves.
+    registered: HashMap<String, (String, ToolDefinition)>,
     /// public names whose forwarder outlived its generation (still ours,
-    /// not callable).
-    orphans: HashSet<String>,
+    /// not callable), with the owning server.
+    orphans: HashMap<String, String>,
     /// public names we believe are ours but the registry no longer holds
     /// our definition under — taken out-of-band. Not live, not callable.
     stolen: HashSet<String>,
@@ -171,7 +186,9 @@ impl McpToolBridge {
         call_id: CallId,
         args: &[u8],
     ) -> harnless_seams::Result<serde_json::Value> {
-        {
+        // One read guard for both checks: a concurrent publish cannot
+        // swap the entry or mark the name stolen between them.
+        let entry = {
             let state = self.state.read();
             if state.stolen.contains(public) {
                 return Err(SeamError::new(
@@ -179,19 +196,17 @@ impl McpToolBridge {
                     format!("mcp tool {public} was taken over out-of-band"),
                 ));
             }
+            state
+                .generations
+                .values()
+                .find_map(|g| g.get(public).cloned())
         }
-        let entry = self
-            .state
-            .read()
-            .generations
-            .values()
-            .find_map(|g| g.get(public).cloned())
-            .ok_or_else(|| {
-                SeamError::new(
-                    ErrorCode::ToolNotFound,
-                    format!("mcp tool {public} not bridged"),
-                )
-            })?;
+        .ok_or_else(|| {
+            SeamError::new(
+                ErrorCode::ToolNotFound,
+                format!("mcp tool {public} not bridged"),
+            )
+        })?;
         entry.2.run(call_id, args)
     }
 
@@ -204,8 +219,17 @@ impl McpToolBridge {
         if let Some(table) = state.generations.remove(server) {
             for public in table.keys() {
                 state.live.remove(public);
+                state.stolen.remove(public);
             }
         }
+        // Drop the server's ownership bookkeeping: names it registered or
+        // orphaned are no longer claimed, so a later registration (after a
+        // reconnect) performs a fresh theft check against the registry
+        // instead of re-adopting a possibly-taken name. The underlying
+        // registry keeps the stale forwarder (Tools has no unregister); it
+        // resolves `tool-not-found` because the generation is gone.
+        state.registered.retain(|_, (owner, _)| owner != server);
+        state.orphans.retain(|_, owner| owner != server);
     }
 
     /// Whether the bridge currently serves `public`.
@@ -262,12 +286,15 @@ impl RegistryHandle {
 impl Registry for RegistryHandle {
     fn replace_generation(&self, server: &str, tools: Generation) -> Result<(), String> {
         // The handle is bound to one server (the plugin's); the supervisor
-        // names that server, and it must be the one we serve.
-        assert_eq!(
-            server, self.server,
-            "registry handle is bound to `{}`",
-            self.server
-        );
+        // names that server, and it must be the one we serve. Reported as
+        // an error — a panic here would fire inside the rmcp service task
+        // or the supervisor thread and mask the real cause.
+        if server != self.server {
+            return Err(format!(
+                "registry handle is bound to `{}`, got generation for `{server}`",
+                self.server
+            ));
+        }
         self.publish(tools)
     }
 
@@ -306,14 +333,22 @@ impl RegistryHandle {
             return Err("registry handle disposed; generation dropped".to_string());
         }
         let server = self.server.as_str();
-        let mut state = self.bridge.state.write();
-        let previous = state.generations.get(server).cloned().unwrap_or_default();
-        // Conflict check: every attempted public name must be free, or
-        // already owned by *this* server. Anything else — another MCP
-        // server's name, a non-MCP tool — rolls the attempted generation
-        // back entirely (the previous table stays untouched, nothing from
-        // the attempt stays registered).
-        for (public, _, _) in &tools {
+        let previous: HashMap<String, Entry> = {
+            let state = self.bridge.state.read();
+            state.generations.get(server).cloned().unwrap_or_default()
+        };
+        // Build the new table.
+        let mut table: HashMap<String, Entry> = HashMap::new();
+        for (raw, def, body) in tools {
+            table.insert(def.name.clone(), (raw, def, body));
+        }
+        // Conflict check (no locks held across calls into the foreign
+        // registry): every attempted public name must be free, or already
+        // owned by *this* server. Anything else — another MCP server's
+        // name, a non-MCP tool — rolls the attempted generation back
+        // entirely (nothing from the attempt is registered).
+        for public in table.keys() {
+            let state = self.bridge.state.read();
             for (other, gen) in state.generations.iter() {
                 if other != server && gen.contains_key(public) {
                     return Err(format!(
@@ -325,42 +360,69 @@ impl RegistryHandle {
             // bookkeeping: a third party that took our public name
             // out-of-band must conflict, even while we believe the name
             // is ours. A name that is absent from the registry is free.
+            // `inner.get` runs with no lock held.
             if let Some(existing) = self.bridge.inner.get(public) {
                 // The registry holds something under this name. It is
                 // ours only if we registered that exact definition there
                 // (live or orphaned) and it still matches. Anything else —
                 // a third party's tool, or our name overwritten out-of-band
                 // — conflicts, even if our bookkeeping still claims it.
-                let ours_intact = state
-                    .registered
-                    .get(public)
-                    .is_some_and(|ours_def| same_definition(ours_def, &existing));
+                let ours_intact =
+                    state
+                        .registered
+                        .get(public)
+                        .is_some_and(|(ours_server, ours_def)| {
+                            ours_server == server && same_definition(ours_def, &existing)
+                        });
+                drop(state);
                 if !ours_intact {
-                    if state.live.contains(public) || state.orphans.contains(public) {
+                    let mut state = self.bridge.state.write();
+                    if state.live.contains(public) || state.orphans.contains_key(public) {
                         state.stolen.insert(public.clone());
                         state.live.remove(public);
                         state.orphans.remove(public);
                     }
                     return Err(format!("public name `{public}` is taken by a non-MCP tool"));
                 }
+            } else {
+                drop(state);
             }
         }
-        // Build the new table.
-        let mut table: HashMap<String, Entry> = HashMap::new();
-        for (raw, def, body) in tools {
-            table.insert(def.name.clone(), (raw, def, body));
-        }
-        // Register thin forwarders for newly appearing names; roll the
-        // whole attempt back if any registration fails.
+        // Register thin forwarders for newly appearing names. The state
+        // write lock is taken only for bookkeeping commits — never across
+        // a call into the foreign registry.
         let mut added: Vec<String> = Vec::new();
         for public in table.keys() {
-            if previous.contains_key(public) || state.live.contains(public) {
+            let (skip, adopt_orphan) = {
+                let state = self.bridge.state.read();
+                let skip = previous.contains_key(public) || state.live.contains(public);
+                // An orphan forwarder of ours is still in the registry —
+                // re-adopt it instead of re-registering (Tools has no
+                // unregister). Re-verify the registry still holds *our*
+                // definition first: a third party could have overwritten
+                // the orphan with an identical-looking definition while we
+                // weren't looking.
+                let adopt_orphan = !skip
+                    && state.orphans.get(public).is_some_and(|o| o == server)
+                    && state
+                        .registered
+                        .get(public)
+                        .is_some_and(|(ours_server, ours_def)| {
+                            ours_server == server
+                                && self
+                                    .bridge
+                                    .inner
+                                    .get(public)
+                                    .is_some_and(|cur| same_definition(ours_def, &cur))
+                        });
+                (skip, adopt_orphan)
+            };
+            if skip {
                 continue;
             }
-            // An orphan forwarder of ours is still in the registry —
-            // re-adopt it instead of re-registering (Tools has no
-            // unregister, and re-registering would mask a theft check).
-            if state.orphans.remove(public) {
+            if adopt_orphan {
+                let mut state = self.bridge.state.write();
+                state.orphans.remove(public);
                 state.live.insert(public.clone());
                 continue;
             }
@@ -371,12 +433,16 @@ impl RegistryHandle {
             });
             match self.bridge.inner.register(def.clone(), forwarder) {
                 Ok(()) => {
+                    let mut state = self.bridge.state.write();
                     state.live.insert(public.clone());
-                    state.registered.insert(public.clone(), def);
+                    state
+                        .registered
+                        .insert(public.clone(), (server.to_string(), def));
                     added.push(public.clone());
                 }
                 Err(e) => {
                     // Roll the attempted generation back entirely.
+                    let mut state = self.bridge.state.write();
                     for name in added {
                         state.live.remove(&name);
                         state.registered.remove(&name);
@@ -385,16 +451,20 @@ impl RegistryHandle {
                 }
             }
         }
-        // Names that disappeared: drop liveness, remember the orphan.
-        for public in previous.keys() {
-            if !table.contains_key(public) {
-                state.live.remove(public);
-                if state.registered.contains_key(public) {
-                    state.orphans.insert(public.clone());
+        // Commit the generation; names that disappeared drop liveness and
+        // become orphans (their forwarder stays in the registry, ours).
+        {
+            let mut state = self.bridge.state.write();
+            for public in previous.keys() {
+                if !table.contains_key(public.as_str()) {
+                    state.live.remove(public);
+                    if state.registered.contains_key(public) {
+                        state.orphans.insert(public.clone(), server.to_string());
+                    }
                 }
             }
+            state.generations.insert(server.to_string(), table);
         }
-        state.generations.insert(server.to_string(), table);
         Ok(())
     }
 }
@@ -558,7 +628,29 @@ impl McpServerPlugin {
         // owns the only live connection.
         probe_stop.cancel();
         if let Some(handle) = probe.lock().unwrap().take() {
-            let _ = handle.join();
+            // Bound the join: a factory that ignores cancellation must
+            // not block activation forever after its probe deadline
+            // already expired. An abandoned probe thread owns no live
+            // connection (the handshake failed or timed out), so leaking
+            // it is safe; the supervisor never re-uses it.
+            let deadline = Instant::now() + self.probe_timeout;
+            let mut abandoned = false;
+            while !handle.is_finished() {
+                if Instant::now() > deadline {
+                    error!(server = %name,
+                        "mcp probe thread did not exit after cancellation; abandoning it");
+                    abandoned = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if abandoned {
+                // Detach: the thread outlives activation but owns no live
+                // connection (its stop token is cancelled).
+                std::mem::forget(handle);
+            } else {
+                let _ = handle.join();
+            }
         }
         match &outcome {
             Ok(()) => info!(server = %name, "mcp server activated"),
@@ -680,6 +772,12 @@ impl Plugin for McpServerPlugin {
             )
         })?;
         let claims = ctx.get::<ServerClaims>().unwrap_or_default();
+        // Resolve the fiber BEFORE activating: activation claims the
+        // server name, registers tools, and spawns the supervisor, so a
+        // fiber-less context must fail before any of that starts.
+        let fiber: Arc<Fiber> = ctx
+            .fiber()
+            .ok_or_else(|| RuntimeError::new("MISSING_FIBER", "mcp plugin runs within a fiber"))?;
         let mount = self.activate(bridge.clone(), claims.clone()).map_err(|e| {
             // The detail is logged here — this is the load boundary — and
             // the RuntimeError keeps a stable code.
@@ -687,7 +785,6 @@ impl Plugin for McpServerPlugin {
                 "mcp server failed to start; plugin load failed");
             RuntimeError::new("MCP_START_FAILED", "mcp server failed to start (see logs)")
         })?;
-        let fiber: Arc<Fiber> = ctx.fiber().expect("mcp plugin runs within a fiber");
         let server = mount.config.name.clone();
         let stop = mount.stop.clone();
         let bridge_for_unload = bridge.clone();

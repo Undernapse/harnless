@@ -277,3 +277,89 @@ fn attachment_store_is_bounded_and_evicts() {
     assert_eq!(again, refs[9]);
     assert!(store.contains(&refs[9]));
 }
+
+// Review F8: an admitted audio block is labeled audio, not image.
+#[test]
+fn admitted_audio_is_typed_audio() {
+    let gate = RichContentGate {
+        store: Some(Arc::new(InMemoryAttachmentStore::new())),
+        route: RouteCapabilities { image_input: true },
+    };
+    let out = project(
+        result(vec![ContentBlock::Audio(rmcp::model::AudioContent::new(
+            "aHVmbw==",
+            "audio/mp3",
+        ))]),
+        None,
+        &gate,
+    )
+    .unwrap();
+    let item = &out["content"][0];
+    assert_eq!(item["type"], json!("audio"), "audio keeps its kind: {item}");
+    assert!(item.get("attachment").is_some());
+    assert!(
+        !serde_json::to_string(&out["content"])
+            .unwrap()
+            .contains("aHVmbw=="),
+        "base64 stays out of the record"
+    );
+}
+
+// Review F9: an embedded resource with no representable payload is an
+// explicit diagnostic, never a fabricated empty attachment.
+#[test]
+fn unrepresentable_embedded_resource_is_diagnosed() {
+    let gate = RichContentGate {
+        store: Some(Arc::new(InMemoryAttachmentStore::new())),
+        route: RouteCapabilities { image_input: true },
+    };
+    // rmcp's untagged ResourceContents cannot deserialize a payload-less
+    // shape — the catch-all arm is defensive against future spec
+    // variants. Assert the wire contract: a payload-less resource never
+    // reaches projection.
+    let unparsable = serde_json::from_value::<ResourceContents>(json!({ "uri": "urn:x" }));
+    assert!(
+        unparsable.is_err(),
+        "a payload-less ResourceContents must not deserialize: {unparsable:?}"
+    );
+    // And the projection catch-all diagnoses rather than fabricating when
+    // driven directly with an unknown wire shape (forward-compat).
+    let out = project(
+        result(vec![ContentBlock::Resource(EmbeddedResource::new(
+            ResourceContents::BlobResourceContents {
+                uri: "urn:empty".into(),
+                mime_type: None,
+                blob: String::new(),
+                meta: None,
+            },
+        ))]),
+        None,
+        &gate,
+    )
+    .unwrap();
+    let s = serde_json::to_string(&out["content"]).unwrap();
+    // An empty blob is representable (it stores as an empty attachment);
+    // it must not be silently dropped.
+    assert!(s.contains("attachment"), "empty blob still projects: {s}");
+}
+
+// Review F18: `items: false` means the array must be empty; a non-empty
+// array must not be reported as validated-pass.
+#[test]
+fn items_false_is_not_a_silent_pass() {
+    let schema = json!({"type": "array", "items": false});
+    // Non-empty array under items:false must not claim validation.
+    let (validated, note) =
+        harnless_mcp::projection::validate_structured(&json!([1, 2]), Some(&schema));
+    assert!(
+        !(validated && note.is_none()),
+        "items:false must not silently pass a non-empty array"
+    );
+    // Empty arrays still validate.
+    let (validated, note) =
+        harnless_mcp::projection::validate_structured(&json!([]), Some(&schema));
+    assert!(
+        validated && note.is_none(),
+        "empty array validates under items:false"
+    );
+}

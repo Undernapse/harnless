@@ -112,7 +112,8 @@ fn project_blocks(blocks: Vec<ContentBlock>, gate: &RichContentGate) -> Vec<Valu
     let mut items: Vec<Value> = Vec::new();
     // Whole-batch validation for rich content: collect first, admit only
     // if every member of the batch stores cleanly.
-    let mut pending_rich: Vec<(usize, Value, String, String)> = Vec::new(); // (insert idx, placeholder, mime, b64)
+    // (insert idx, placeholder, mime, block kind, b64)
+    let mut pending_rich: Vec<(usize, Value, String, String, String)> = Vec::new();
 
     for block in blocks {
         match block {
@@ -151,7 +152,12 @@ fn project_blocks(blocks: Vec<ContentBlock>, gate: &RichContentGate) -> Vec<Valu
                         None,
                         Some(blob.clone()),
                     ),
-                    _ => (String::new(), "application/octet-stream".into(), None, None),
+                    _ => {
+                        // A variant we cannot represent at all: explicit
+                        // diagnostic, never a fabricated empty attachment.
+                        items.push(diagnostic("embedded resource has no representable content"));
+                        continue;
+                    }
                 };
                 match text {
                     Some(text) => items.push(json!({
@@ -168,16 +174,29 @@ fn project_blocks(blocks: Vec<ContentBlock>, gate: &RichContentGate) -> Vec<Valu
                             items.len(),
                             json!({ "type": "resource", "uri": uri, "mime": mime }),
                             mime,
+                            "image".to_string(),
                             b64,
                         ));
                     }
                 }
             }
             ContentBlock::Image(image) => {
-                pending_rich.push((items.len(), Value::Null, image.mime_type, image.data));
+                pending_rich.push((
+                    items.len(),
+                    Value::Null,
+                    image.mime_type,
+                    "image".to_string(),
+                    image.data,
+                ));
             }
             ContentBlock::Audio(audio) => {
-                pending_rich.push((items.len(), Value::Null, audio.mime_type, audio.data));
+                pending_rich.push((
+                    items.len(),
+                    Value::Null,
+                    audio.mime_type,
+                    "audio".to_string(),
+                    audio.data,
+                ));
             }
             // Any other kind (future spec kinds) is an explicit diagnostic.
             other => items.push(diagnostic(&format!(
@@ -223,7 +242,7 @@ fn join_text_like(items: &[Value]) -> String {
 /// diagnostics naming the failure).
 fn admit_rich(
     items: &mut Vec<Value>,
-    pending: Vec<(usize, Value, String, String)>,
+    pending: Vec<(usize, Value, String, String, String)>,
     gate: &RichContentGate,
 ) {
     if pending.is_empty() {
@@ -237,7 +256,7 @@ fn admit_rich(
             } else {
                 "calling route does not declare image input"
             };
-            for (idx, placeholder, mime, _) in pending {
+            for (idx, placeholder, mime, _, _) in pending {
                 let mut diag = diagnostic(&format!("rich content ({mime}) withheld: {reason}"));
                 if placeholder.get("type").and_then(Value::as_str) == Some("resource") {
                     // Keep the link's identity even when the blob is withheld.
@@ -256,11 +275,11 @@ fn admit_rich(
     };
     // Validate the whole batch before admitting any member.
     let mut stored = Vec::with_capacity(pending.len());
-    for (_, _, mime, b64) in &pending {
+    for (_, _, mime, _, b64) in &pending {
         match store.put(mime, b64) {
             Ok(reference) => stored.push(reference),
             Err(e) => {
-                for (idx, placeholder, mime, _) in pending {
+                for (idx, placeholder, mime, _, _) in pending {
                     let mut diag = diagnostic(&format!("rich content batch rejected: {mime}: {e}"));
                     if let Some(uri) = placeholder.get("uri").and_then(Value::as_str) {
                         diag["uri"] = json!(uri);
@@ -275,8 +294,10 @@ fn admit_rich(
     let mut admitted: Vec<(usize, Value)> = pending
         .iter()
         .zip(stored)
-        .map(|((idx, placeholder, mime, _), reference)| {
-            let mut item = json!({ "type": "image", "mime": mime, "attachment": reference });
+        .map(|((idx, placeholder, mime, kind, _), reference)| {
+            // The item's type is the block's own kind, never a blanket
+            // "image": audio that passes the gate is labeled audio.
+            let mut item = json!({ "type": kind, "mime": mime, "attachment": reference });
             if let Some(uri) = placeholder.get("uri").and_then(Value::as_str) {
                 item["uri"] = json!(uri);
             }
@@ -417,8 +438,14 @@ fn check_node(value: &Value, schema: &Value) -> Check {
                         other => return other,
                     }
                 }
-            } else if !items.is_boolean() {
-                return Check::Unsupported("items schema is not an object".into());
+            } else if let Some(allow) = items.as_bool() {
+                // Boolean schema: `false` admits nothing, so any
+                // non-empty array fails; `true` admits anything.
+                if !allow && !value.as_array().unwrap().is_empty() {
+                    return Check::Fail("items: false allows no elements".into());
+                }
+            } else {
+                return Check::Unsupported("items schema is not an object or boolean".into());
             }
         }
     }

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use rmcp::model::{ClientCapabilities, Implementation, InitializeRequestParams};
-use rmcp::service::{Peer, ServiceError};
+use rmcp::service::Peer;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
@@ -314,6 +314,9 @@ pub async fn run_connection(
     established: Arc<Mutex<Option<Instant>>>,
 ) -> Result<(), String> {
     let handler = BridgeHandler::new(sink.clone(), cfg.clone(), gate.clone());
+    // Shared debounce clock: the handler stamps it on every list round;
+    // run_connection stamps it around the initial discovery too.
+    let listed_clock = handler.listed_clock();
     let transport = open_transport(&cfg)?;
     let client = handler
         .serve_with_ct(transport, stop.clone())
@@ -322,9 +325,12 @@ pub async fn run_connection(
     *established.lock() = Some(Instant::now());
 
     // Discovery: list tools (paginating) and publish the first generation.
-    let tools = discover(client.peer(), cfg.call_timeout)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Stamp the shared debounce clock so a list_changed arriving during
+    // this discovery waits out its quiet period *after* we finish, never
+    // racing an older response over our newer one.
+    *listed_clock.lock() = Some(Instant::now());
+    let tools = discover(client.peer(), cfg.call_timeout).await?;
+    *listed_clock.lock() = Some(Instant::now());
     let generation = build_generation(
         &cfg.name,
         tools,
@@ -335,13 +341,31 @@ pub async fn run_connection(
     sink.publish(generation);
 
     // Wait until the service dies (transport loss) or we are told to stop.
+    // Park the service in an Option so the stop leg can consume it for an
+    // awaited teardown.
+    let mut client = Some(client);
     tokio::select! {
-        quit = client.waiting() => {
+        quit = async { client.take().expect("service present").waiting().await } => {
             *established.lock() = None;
             sink.outage(format!("mcp connection closed ({quit:?})"));
             Err("mcp connection closed by transport".to_string())
         }
-        _ = stop.cancelled() => Ok(()),
+        _ = stop.cancelled() => {
+            // Await the transport teardown instead of dropping the
+            // RunningService: rmcp's drop guard only *requests* the serve
+            // task's cancellation, so a stdio child's graceful shutdown
+            // (wait, then kill) would run detached and could outlive the
+            // runtime. `cancel()` consumes the service and waits for the
+            // serve task — and the transport close inside it — to
+            // complete, bounded so a wedged child cannot hang the
+            // supervisor. The survival stamp is retired with the
+            // connection so a later loss cannot count a stale survival.
+            *established.lock() = None;
+            if let Some(client) = client.take() {
+                let _ = tokio::time::timeout(cfg.call_timeout, client.cancel()).await;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -441,7 +465,7 @@ pub fn serve_fake_keepalive_handoff(
 
         let tools = match discover(client.peer(), call_timeout).await {
             Ok(t) => t,
-            Err(e) => return (Err(e.to_string()), None),
+            Err(e) => return (Err(e), None),
         };
         let peer = client.peer().clone();
         let generation = build_generation(&cfg.name, tools, peer.clone(), call_timeout, &gate);
@@ -590,22 +614,33 @@ where
 async fn discover(
     peer: &Peer<rmcp::RoleClient>,
     timeout: Duration,
-) -> Result<Vec<rmcp::model::Tool>, ServiceError> {
+) -> Result<Vec<rmcp::model::Tool>, String> {
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
-    loop {
+    // A hostile or buggy server can keep returning the same non-empty
+    // cursor forever, pinning the connection and growing memory without
+    // bound. Seen cursors are a hard stop; so is the page cap.
+    const MAX_PAGES: usize = 256;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..MAX_PAGES {
         let params =
             cursor.map(|c| rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c)));
         let result = tokio::time::timeout(timeout, peer.list_tools(params))
             .await
-            .map_err(|_| ServiceError::TransportClosed)??;
+            .map_err(|_| "tools/list timed out".to_string())?
+            .map_err(|e| e.to_string())?;
         tools.extend(result.tools);
         match result.next_cursor {
-            Some(next) if !next.is_empty() => cursor = Some(next),
-            _ => break,
+            Some(next) if !next.is_empty() => {
+                if !seen.insert(next.clone()) {
+                    return Err("tools/list cursor repeated; aborting pagination".to_string());
+                }
+                cursor = Some(next);
+            }
+            _ => return Ok(tools),
         }
     }
-    Ok(tools)
+    Err("tools/list exceeded the page limit".to_string())
 }
 
 /// Build one generation: public-named definitions plus bodies that call
@@ -617,13 +652,33 @@ pub(crate) fn build_generation(
     timeout: Duration,
     gate: &crate::projection::RichContentGate,
 ) -> Generation {
-    let raws: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
-    let by_raw: std::collections::HashMap<String, rmcp::model::Tool> =
-        tools.into_iter().map(|t| (t.name.to_string(), t)).collect();
+    // Keep the first occurrence of each raw name; a server that repeats a
+    // raw name loses the later one, and that loss must be visible, not
+    // silent.
+    let mut by_raw: std::collections::HashMap<String, rmcp::model::Tool> =
+        std::collections::HashMap::new();
+    let mut raws: Vec<String> = Vec::new();
+    for tool in tools {
+        let raw = tool.name.to_string();
+        if by_raw.contains_key(&raw) {
+            warn!(server = %server, raw = %raw,
+                "tools/list repeated a raw name; keeping the first definition");
+            continue;
+        }
+        by_raw.insert(raw.clone(), tool);
+        raws.push(raw);
+    }
     naming::public_names(server, &raws)
         .into_iter()
         .filter_map(|(raw, public)| {
-            let tool = by_raw.get(&raw)?;
+            let tool = match by_raw.get(&raw) {
+                Some(tool) => tool,
+                None => {
+                    warn!(server = %server, raw = %raw,
+                        "discovered tool could not be named and was dropped");
+                    return None;
+                }
+            };
             let def = ToolDefinition {
                 name: public,
                 schema: serde_json::Value::Object((*tool.input_schema).clone()),
@@ -779,11 +834,22 @@ impl ToolBody for CallBody {
                                         ),
                                     ),
                                 );
-                            let _ = peer.send_notification(notification).await;
-                            return Err(SeamError::new(
-                                ErrorCode::ToolTimeout,
-                                format!("mcp call {raw} timed out; cancellation sent"),
-                            ));
+                            match peer.send_notification(notification).await {
+                                Ok(()) => {
+                                    return Err(SeamError::new(
+                                        ErrorCode::ToolTimeout,
+                                        format!("mcp call {raw} timed out; cancellation sent"),
+                                    ))
+                                }
+                                Err(e) => {
+                                    return Err(SeamError::new(
+                                        ErrorCode::ToolTimeout,
+                                        format!(
+                                        "mcp call {raw} timed out; cancellation not delivered: {e}"
+                                    ),
+                                    ))
+                                }
+                            }
                         }
                         Ok(Err(_send_err)) => {
                             return Err(SeamError::new(
@@ -839,6 +905,11 @@ pub(crate) struct BridgeHandler {
 }
 
 impl BridgeHandler {
+    /// The shared debounce clock handle.
+    pub(crate) fn listed_clock(&self) -> Arc<Mutex<Option<Instant>>> {
+        self.last_listed.clone()
+    }
+
     pub(crate) fn new(
         sink: Arc<dyn GenerationSink>,
         config: McpServerConfig,

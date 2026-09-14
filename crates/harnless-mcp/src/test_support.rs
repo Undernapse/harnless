@@ -12,7 +12,7 @@ use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rmcp::model::{
     CallToolResult, ErrorData, JsonRpcNotification, JsonRpcResponse, JsonRpcVersion2_0,
-    ListToolsResult, ServerNotification, ServerRequest, ServerResult, Tool,
+    ListToolsResult, ServerNotification, ServerRequest, Tool,
 };
 use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
 use serde_json::{json, Value};
@@ -249,13 +249,25 @@ enum ServerJsonRpcWire {
 fn remap_wire(msg: &ServerJsonRpcWire) -> RxJsonRpcMessage<rmcp::RoleClient> {
     match msg {
         ServerJsonRpcWire::Response { id, result } => {
-            let result: ServerResult = serde_json::from_value(wrapped_result(result))
-                .expect("fake produced an unparseable result");
-            RxJsonRpcMessage::<rmcp::RoleClient>::Response(JsonRpcResponse {
-                jsonrpc: JsonRpcVersion2_0,
-                id: id.clone(),
-                result,
-            })
+            // A scripted result that matches no ServerResult variant is a
+            // test bug, not a runtime panic: answer with a JSON-RPC error
+            // naming the payload so the failing test points at itself.
+            match serde_json::from_value(wrapped_result(result)) {
+                Ok(result) => RxJsonRpcMessage::<rmcp::RoleClient>::Response(JsonRpcResponse {
+                    jsonrpc: JsonRpcVersion2_0,
+                    id: id.clone(),
+                    result,
+                }),
+                Err(e) => RxJsonRpcMessage::<rmcp::RoleClient>::Error(rmcp::model::JsonRpcError {
+                    jsonrpc: JsonRpcVersion2_0,
+                    id: Some(id.clone()),
+                    error: rmcp::model::ErrorData::new(
+                        rmcp::model::ErrorCode::INVALID_PARAMS,
+                        format!("fake produced an unparseable result: {e}: {result}"),
+                        None,
+                    ),
+                }),
+            }
         }
         ServerJsonRpcWire::Error { id, code, message } => {
             RxJsonRpcMessage::<rmcp::RoleClient>::Error(rmcp::model::JsonRpcError {
@@ -309,8 +321,10 @@ fn decode_client_request(
         "method": method,
         "params": params,
     }))
-    .unwrap_or_else(|_| {
-        // CustomRequest fallback keeps the method name.
+    .ok()
+    // A malformed request shape must not panic the fake's pump on the
+    // shared runtime; answer it as a custom request instead.
+    .unwrap_or_else(|| {
         ServerRequest::CustomRequest(rmcp::model::CustomRequest::new(method, Some(params)))
     });
     let id: rmcp::model::RequestId =
