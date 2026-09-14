@@ -416,6 +416,7 @@ async fn conflict_rolls_back_the_attempted_generation_entirely() {
             "x".into(),
             ToolDefinition {
                 name: "mcp__beta__x".into(),
+                description: "test tool".into(),
                 schema: json!({"type": "object"}),
                 serialized: false,
             },
@@ -425,6 +426,7 @@ async fn conflict_rolls_back_the_attempted_generation_entirely() {
             "y".into(),
             ToolDefinition {
                 name: "mcp__beta__y".into(),
+                description: "test tool".into(),
                 schema: json!({"type": "object"}),
                 serialized: false,
             },
@@ -704,6 +706,7 @@ impl TransportFactory for OkFactory {
             "present".to_string(),
             ToolDefinition {
                 name: public_name(self.0, "present"),
+                description: "test tool".into(),
                 schema: json!({"type": "object"}),
                 serialized: false,
             },
@@ -854,6 +857,7 @@ impl TransportFactory for PublishThenHang {
             "t".to_string(),
             ToolDefinition {
                 name: public_name(self.0, "t"),
+                description: "test tool".into(),
                 schema: json!({"type": "object"}),
                 serialized: false,
             },
@@ -949,6 +953,7 @@ async fn out_of_band_name_theft_conflicts_on_resync() {
                     public_name("alpha", n),
                     ToolDefinition {
                         name: public_name("alpha", n),
+                        description: "test tool".into(),
                         schema: json!({"type": "object"}),
                         serialized: false,
                     },
@@ -966,6 +971,7 @@ async fn out_of_band_name_theft_conflicts_on_resync() {
         public_name("alpha", "y"),
         ToolDefinition {
             name: public_name("alpha", "y"),
+            description: "test tool".into(),
             schema: json!({"type": "string"}),
             serialized: true,
         },
@@ -1076,6 +1082,7 @@ async fn late_publish_after_unload_does_not_reregister() {
         "x".to_string(),
         ToolDefinition {
             name: public_name("alpha", "x"),
+            description: "test tool".into(),
             schema: json!({"type": "object"}),
             serialized: false,
         },
@@ -1103,6 +1110,7 @@ async fn orphan_forwarder_reappearance_is_readopted_not_conflict() {
                     public_name("alpha", n),
                     ToolDefinition {
                         name: public_name("alpha", n),
+                        description: "test tool".into(),
                         schema: json!({"type": "object"}),
                         serialized: false,
                     },
@@ -1423,6 +1431,7 @@ async fn stolen_name_recovers_after_the_thief_vacates() {
                     public_name("alpha", n),
                     ToolDefinition {
                         name: public_name("alpha", n),
+                        description: "test tool".into(),
                         schema: json!({"type": "object"}),
                         serialized: false,
                     },
@@ -1440,6 +1449,7 @@ async fn stolen_name_recovers_after_the_thief_vacates() {
         public_name("alpha", "x"),
         ToolDefinition {
             name: public_name("alpha", "x"),
+            description: "test tool".into(),
             schema: json!({"type": "string"}),
             serialized: true,
         },

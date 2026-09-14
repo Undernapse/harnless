@@ -133,10 +133,20 @@ struct BridgeState {
 }
 
 /// Whether two definitions are the same registration we placed.
-/// `ToolDefinition` has no `PartialEq` (it is a seam type we must not
-/// edit); name + schema + serialized flag identify it.
+/// `ToolDefinition` has no `PartialEq` (it is a seam type whose shape is
+/// owned elsewhere); name + description + schema + serialized flag identify
+/// it.
+///
+/// The description is not decoration: it is model-facing allowlisted text,
+/// so two definitions differing only by it are different registrations.
+/// Compare them and a server's description-only update is treated as a
+/// no-op — the stale text stays registered while the bridge's bookkeeping
+/// claims otherwise.
 fn same_definition(a: &ToolDefinition, b: &ToolDefinition) -> bool {
-    a.name == b.name && a.schema == b.schema && a.serialized == b.serialized
+    a.name == b.name
+        && a.description == b.description
+        && a.schema == b.schema
+        && a.serialized == b.serialized
 }
 
 /// The bridge service: owns the MCP-side dispatch table and registers thin
@@ -398,7 +408,26 @@ impl RegistryHandle {
                 // A poisoned name is NOT skipped: our forwarder may no
                 // longer be the registry's live body, so re-establish
                 // ownership (re-register or re-adopt) and clear the mark.
-                let skip = (previous.contains_key(public) || state.live.contains(public))
+                //
+                // A known name is skipped only while its definition is
+                // unchanged. Presence alone is not enough: a server may
+                // republish the same name with different model-facing text,
+                // and skipping on name identity would leave the old
+                // description registered forever while the bridge's own
+                // bookkeeping claimed the new one.
+                let unchanged = previous
+                    .get(public)
+                    .map(|(_, def, _)| def)
+                    .or_else(|| {
+                        state
+                            .registered
+                            .get(public)
+                            .filter(|(owner, _)| owner == server)
+                            .map(|(_, def)| def)
+                    })
+                    .is_some_and(|def| same_definition(def, &table[public].1));
+                let skip = unchanged
+                    && (previous.contains_key(public) || state.live.contains(public))
                     && !state.stolen.contains(public);
                 // An orphan forwarder of ours is still in the registry —
                 // re-adopt it instead of re-registering (Tools has no

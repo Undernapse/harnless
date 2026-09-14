@@ -212,9 +212,16 @@ impl Harness {
     }
 
     /// Register a tool (definition + body) on the guarded registry.
+    ///
+    /// `description` is the model-facing text the definition carries: it is
+    /// what [`harnless_seams::ToolDefinition::to_schema`] would hand an
+    /// adapter, so a test that cares about what a provider would see has to
+    /// state it explicitly — there is no defaulted description that can
+    /// silently vanish from a registration.
     pub fn register_tool(
         &self,
         name: &str,
+        description: &str,
         schema: serde_json::Value,
         body: Arc<dyn ToolBody>,
     ) -> harnless_seams::Result<()> {
@@ -222,6 +229,7 @@ impl Harness {
         self.tools.register(
             ToolDefinition {
                 name: name.to_string(),
+                description: description.to_string(),
                 schema,
                 serialized: false,
             },

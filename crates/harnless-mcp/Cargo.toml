@@ -33,3 +33,7 @@ test-support = []
 [[test]]
 name = "primary_seam"
 required-features = ["test-support"]
+
+[[test]]
+name = "tool_description"
+required-features = ["test-support"]

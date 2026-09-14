@@ -178,6 +178,7 @@ impl FakePlugin {
             name: id.into(),
             tools: vec![ToolSpec {
                 name: tool.into(),
+                description: format!("the {tool} tool of plugin {id}"),
                 schema: json!({"type": "object"}),
                 output: "json".into(),
                 serialized: false,
@@ -208,6 +209,7 @@ fn mount(manager: &WasmPluginManager, spine: &Spine, p: &mut FakePlugin) -> u64 
             .register(
                 ToolDefinition {
                     name: name.clone(),
+                    description: spec.description.clone(),
                     schema: spec.schema.clone(),
                     serialized: spec.serialized,
                 },
@@ -263,6 +265,23 @@ fn mount_registers_through_the_tools_seam() {
         spine.registry.get("fs.read").map(|d| d.schema),
         Some(json!({"type": "object"})),
         "the declaration carries the tool's argument schema"
+    );
+}
+
+/// The description path, asserted where the loader owns it: a descriptor
+/// that declares model-facing text registers a definition carrying exactly
+/// that text, and the loader never invents one for a plugin that declared
+/// none.
+#[test]
+fn a_declared_description_reaches_the_registered_definition() {
+    let manager = WasmPluginManager::new();
+    let spine = Spine::new();
+    let mut p = FakePlugin::new("fs", vec![]);
+    mount(&manager, &spine, &mut p);
+    assert_eq!(
+        spine.registry.get("fs.read").map(|d| d.description),
+        Some("the read tool of plugin fs".into()),
+        "the description the guest declared is the description the seam holds"
     );
 }
 
