@@ -1,0 +1,24 @@
+[package]
+name = "echo-fs-read"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "harnless:plugin-fs-read"
+
+[package.metadata.component.target.dependencies]
+"wasi:filesystem" = { path = "wit/deps/filesystem.wit" }
+"wasi:io" = { path = "wit/deps/io.wit" }
+"wasi:clocks" = { path = "wit/deps/clocks.wit" }
+
+# Standalone: this package builds for wasm32-unknown-unknown via
+# `cargo component`, not as a member of the host workspace. Without its own
+# `[workspace]` table cargo walks up to the repository root, finds the host
+# workspace, refuses to build here, and no Cargo.lock can be pinned.
+[workspace]

@@ -83,6 +83,20 @@ impl ServiceMap {
         self.inner.write().insert(key, Arc::new(service))
     }
 
+    /// Install an existing shared handle under `T`'s plain key.
+    ///
+    /// [`ServiceMap::provide`] wraps its argument, so the stored `Arc` is never
+    /// the caller's and a lookup for `T` — as opposed to `Arc<T>` — cannot see
+    /// a service that is legitimately shared by handle. This stores `service`
+    /// itself, so `get::<T>()` returns an `Arc<T>` aliasing the owner's handle.
+    pub fn provide_arc<T: Any + Send + Sync>(&self, service: Arc<T>) -> Option<BoxedService> {
+        let key = Key::of::<T>();
+        self.names
+            .write()
+            .insert(key.clone(), std::any::type_name::<T>());
+        self.inner.write().insert(key, service)
+    }
+
     /// Look up a service by type, returning an `Arc` to it.
     ///
     /// The returned handle outlives any concurrent re-registration.

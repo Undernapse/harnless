@@ -1,0 +1,9 @@
+package harnless:plugin;
+
+world plugin {
+  import wasi:filesystem/types@0.2.12;
+  import wasi:filesystem/preopens@0.2.12;
+  export descriptor: func() -> string;
+  export call-read: func(input: string) -> string;
+  export call-escape: func(input: string) -> string;
+}
