@@ -427,7 +427,6 @@ impl Scripted {
     /// only a fixture would recognise.
     const MARKER: &'static str = "__fixture_provider";
     const SELF: &'static str = "fixture-under-test";
-    const FOREIGN: &'static str = "some-other-fixture";
 
     fn owns_state(state: &ReplayState, claim_all: bool) -> bool {
         if claim_all {

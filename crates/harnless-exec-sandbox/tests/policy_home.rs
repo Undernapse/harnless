@@ -1,11 +1,16 @@
 //! Cross-provider tests for the execution world: one [`PolicyHome`] must
 //! drive both the fs side and the exec side, and the executor contract
-//! (exact-argv handover, auditable refusals) is conformed to by hand here
-//! until the conformance kit's `check_executor` mirrors these assertions.
+//! (exact-argv handover, auditable refusals) is conformed to by hand here.
+//!
+//! The generic form of these obligations lives in
+//! `harnless_conformance::executor_suite`, instantiated against the shipped
+//! providers by `conformance_tests_executor!`. This file stays because the
+//! shared-policy-home invariant is a *cross-provider* statement the suite
+//! checks leg-by-leg and cannot express on its own.
 //!
 //! The fs stand-in below is intentionally the thinnest thing that proves the
-//! invariant: when `harnless-fs-local` lands, its provider drops in and this
-//! test keeps its shape.
+//! invariant: `harnless-fs-local`'s provider drops in and this test keeps its
+//! shape.
 
 use std::path::{Path, PathBuf};
 

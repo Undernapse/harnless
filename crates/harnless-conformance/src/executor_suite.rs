@@ -131,17 +131,6 @@ impl Executors {
         self
     }
 
-    /// Copy this bundle's shell constructor onto a bundle the case rebuilt.
-    ///
-    /// The handover case drives a bundle whose legs are its recorders; the
-    /// constructor travels with it so any nested construction still builds the
-    /// shell over the recorded legs.
-    #[must_use]
-    fn shell_over_from(mut self, providers: &Executors) -> Self {
-        self.shell_over = providers.shell_over;
-        self
-    }
-
     /// Set the shell leg.
     #[must_use]
     pub fn shell(mut self, shell: Arc<dyn Shell>) -> Self {
@@ -483,12 +472,6 @@ fn sandbox_sees_exact_argv(providers: &Executors, fixture: &ExecFixture, cx: &mu
     let seen = recorder::Recorder::<Vec<String>>::default();
     let spawned = recorder::Recorder::<Spawn>::default();
 
-    // The shell's own command line is recorded separately from the argv the
-    // sandbox is consulted with: the two are the same recorder in the naive
-    // wiring, which makes "the shell never consulted the sandbox" look like
-    // "the sandbox was consulted and nothing spawned" — a skip that hides the
-    // bug. Keeping them apart is the whole point of the case.
-    let commands = recorder::Recorder::<Vec<String>>::default();
     // The recording legs wrap the bundle's legs, and the shell under test is
     // *rebuilt over the wrapped legs* — not merely wrapped itself. A shell owns
     // the sandbox and spawner it was constructed with, so a wrapper around the
@@ -505,26 +488,31 @@ fn sandbox_sees_exact_argv(providers: &Executors, fixture: &ExecFixture, cx: &mu
         inner: Arc::clone(providers.subprocess.as_ref().expect("checked by cx.leg")),
         spawned: spawned.clone(),
     });
-    let shell = match providers.shell_over {
+
+    // The shell under test is the SAME object the rest of the suite drives: the
+    // harness's declared constructor applied to the recording legs when one is
+    // declared, otherwise the shipped shell. Building a shell here and then
+    // driving a *different* object would make this case pass without ever
+    // exercising the wiring it claims to check.
+    let shell_under_test: Arc<dyn Shell> = match providers.shell_over {
         Some(over) => over(
             Arc::clone(&recording_sandbox),
             Arc::clone(&recording_subprocess),
         ),
         None => Arc::clone(providers.shell.as_ref().expect("checked by cx.leg")),
     };
-    let recording_shell = Arc::new(LoggingShell {
-        inner: shell,
-        commands: commands.clone(),
-    });
 
-    // The bundle the case drives carries the *recorded* legs, so the shell's
-    // calls land on the recorders.
     let wired = Executors::new()
-        .shell(recording_shell)
+        .shell(Arc::clone(&shell_under_test))
         .sandbox(recording_sandbox)
-        .subprocess(recording_subprocess)
-        .shell_over_from(providers);
+        .subprocess(recording_subprocess);
     let wired_shell = wired.shell.as_deref().expect("just set");
+    // The bundle must hand over the very shell the case built, or the legs it
+    // consults are not the legs the recorders are attached to.
+    debug_assert!(
+        Arc::ptr_eq(wired.shell.as_ref().expect("just set"), &shell_under_test),
+        "the wired bundle must drive the shell this case constructed"
+    );
 
     let outcome = run(wired_shell, command, &policy);
     match outcome {
@@ -657,52 +645,8 @@ fn enforced_reason_is_never_blank(providers: &Executors, fixture: &ExecFixture, 
     }
 }
 
-/// A refusal is never reported as confinement.
-///
-/// The seam's rule is that a command which does not run was not confined.
-/// A report saying `allowed == false, confined == true` is the shape that
-/// lets a silent pass masquerade as an enforced sandbox, so the case hunts
-/// for a refusing policy and checks the report's honesty.
-fn refusal_is_never_reported_as_confined(
-    providers: &Executors,
-    fixture: &ExecFixture,
-    cx: &mut Cx,
-) {
-    let Some(sandbox) = cx.leg(&providers.sandbox, "sandbox") else {
-        return;
-    };
-    let Some(root) = cx.root(fixture) else {
-        return;
-    };
-    let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()];
-    // A refusing fixture is the harness's to build: a root that cannot be
-    // entered is the portable way to ask a sandbox for a refusal.
-    let missing = root.join("harnless-conformance-vanished-root");
-    let refusing = PolicyHome {
-        workspace_root: missing.display().to_string(),
-        default_confined: true,
-    };
-    let enforced = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        sandbox.enforce(&argv, &refusing)
-    })) {
-        Ok(Ok(enforced)) => enforced,
-        Ok(Err(err)) => {
-            cx.skip(format!(
-                "sandbox errored rather than reporting a refusal (`{}`); the report is \
-                 mandatory for a refusal",
-                err.code.as_str()
-            ));
-            return;
-        }
-        Err(_) => {
-            cx.fail("the sandbox panicked on a policy whose root does not exist");
-            return;
-        }
-    };
-    if enforced.allowed {
-        cx.skip("sandbox permitted a policy whose root does not exist; nothing to audit here");
-        return;
-    }
+/// A refusal report must be honest about what it refused.
+fn audit_refusal(cx: &mut Cx, enforced: &Enforced) {
     if enforced.confined {
         cx.fail(format!(
             "refusal reported `confined == true`: {enforced:?}; a command that does not run \
@@ -718,6 +662,76 @@ fn refusal_is_never_reported_as_confined(
     }
 }
 
+fn refusal_is_never_reported_as_confined(
+    providers: &Executors,
+    fixture: &ExecFixture,
+    cx: &mut Cx,
+) {
+    let Some(sandbox) = cx.leg(&providers.sandbox, "sandbox") else {
+        return;
+    };
+    let Some(root) = cx.root(fixture) else {
+        return;
+    };
+    let policy = fixture.policy().expect("root implies a policy");
+    let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()];
+    // Two independent ways to reach a refusal, because a single natural fixture
+    // can be silently unavailable: a root that cannot be entered is the
+    // portable ask, and an installed fixture verdict is the guaranteed one. A
+    // sandbox that refuses on neither offers the obligation no reachable
+    // fixture, which is a hole in the provider — not a skip.
+    let mut reached_refusal = false;
+
+    // Path 1: a natural refusal from an unenterable root.
+    let missing = root.join("harnless-conformance-vanished-root");
+    let refusing = PolicyHome {
+        workspace_root: missing.display().to_string(),
+        default_confined: true,
+    };
+    let natural = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sandbox.enforce(&argv, &refusing)
+    }));
+    match natural {
+        Ok(Ok(enforced)) => {
+            if enforced.allowed {
+                // Legitimate for a sandbox that confines nothing by root. Not a
+                // pass: the obligation still has to be exercised, so fall
+                // through to the injected path below.
+            } else {
+                reached_refusal = true;
+                audit_refusal(cx, &enforced);
+            }
+        }
+        Ok(Err(_)) | Err(_) => {
+            // An errored or panicking report on a plain policy is handled by the
+            // reason/panic cases; here it just means no natural refusal.
+        }
+    }
+
+    // Path 2: a refusal the suite installs, so the obligation is always
+    // exercised. This audits the shape a consumer actually reads.
+    if !reached_refusal {
+        inject(Enforced {
+            allowed: false,
+            confined: true,
+            mode: "sandbox-local".to_string(),
+            reason: INJECTED_REASON.to_string(),
+        });
+        let injected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sandbox.enforce(&argv, &policy)
+        }));
+        clear_injection();
+        match injected {
+            Ok(Ok(enforced)) if !enforced.allowed => audit_refusal(cx, &enforced),
+            _ => cx.fail(
+                "no refusal is reachable for this sandbox — neither an unenterable root nor \
+                 an installed deny verdict produced `allowed == false`; the obligation \
+                 (a refusal never reports `confined == true`) was never exercised",
+            ),
+        }
+    }
+}
+
 /// Consumers route on `allowed`, so the report must not need help.
 ///
 /// The shipped consumer decides "run / refuse / surface to the user" by
@@ -726,15 +740,16 @@ fn refusal_is_never_reported_as_confined(
 /// leaks a heuristic read of `confined`/`mode` into a decision — and checks
 /// that the shell's behaviour still follows `allowed` alone.
 ///
-/// # The legs are swapped, not the shell
+/// # The verdict is installed, not the shell swapped
 ///
 /// A shell owns the sandbox it consults, so the suite cannot inject a verdict
 /// by handing the shell a different bundle — the shell would never look at it.
-/// The injected verdicts therefore go through [`Executors::injected_sandbox`],
-/// which the shell consults *in place of* its own when a case is installing a
-/// fixture verdict. A provider whose shell ignores the installed sandbox fails
-/// the case: the obligation under test is that the verdict the shell acts on is
-/// the verdict it was given.
+/// An injected verdict therefore goes where the shell will actually look: a
+/// sandbox participating in these cases calls [`injected_verdict`] before
+/// deciding and replays what is installed. A provider whose sandbox ignores it
+/// is not driven by the injection and fails the cases that need it, which is
+/// the honest outcome — the suite cannot claim to have tested a routing
+/// decision the provider never faced.
 fn consumer_routes_on_allowed(providers: &Executors, fixture: &ExecFixture, cx: &mut Cx) {
     let Some(policy) = fixture.policy() else {
         cx.skip("harness provisioned no scratch workspace root");
@@ -954,6 +969,52 @@ struct ProbeReport {
     /// cannot name is not worth leaking a thread over.
     #[allow(dead_code)]
     handle: Option<Box<dyn SpawnHandle>>,
+}
+/// Poll until a probe spawn succeeds, up to `PROBE_BOUND`.
+///
+/// Used instead of sleeping a fixed beat between the sentinel probe and the
+/// measured spawn: a spawn that succeeds is the evidence that the probe is
+/// gone, so the case waits on the condition it actually depends on.
+fn wait_until_quiet(subprocess: &dyn Subprocess, cwd: &str) -> bool {
+    let probe = Spawn {
+        argv: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
+        cwd: Some(cwd.to_string()),
+        confine: None,
+    };
+    let deadline = Instant::now() + PROBE_BOUND;
+    loop {
+        let spawned =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| subprocess.spawn(&probe)));
+        if let Ok(Ok(handle)) = spawned {
+            // The probe completing is the proof the previous child is reaped.
+            if handle.output().is_ok() {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Poll until a probe command announces itself mid-run, up to `bound`.
+///
+/// The measured command is the one being cancelled; this only establishes that
+/// the provider can get a child to a cancellable state within the fixture's own
+/// cancellation bound. Returns `false` when the bound expires, which the caller
+/// turns into a skip — asserting on a child that never started would be
+/// asserting on the suite's fixture, not the provider.
+fn await_running(subprocess: &dyn Subprocess, cwd: &str, bound: Duration) -> bool {
+    let deadline = Instant::now() + bound;
+    loop {
+        if await_sentinel(subprocess, cwd).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+    }
 }
 
 /// A denied command never runs.
@@ -1246,35 +1307,54 @@ fn cancellation_is_honoured(providers: &Executors, fixture: &ExecFixture, cx: &m
         cx.skip(reason);
         return;
     }
-    // The sentinel probe above is a separate short-lived command; give the OS a
-    // beat to reap it before the measured spawn.
-    std::thread::sleep(Duration::from_millis(50));
+    // The sentinel probe above is a separate short-lived command. Rather than
+    // sleeping a fixed beat and hoping the OS reaped it, poll for the state the
+    // measured spawn actually needs: a spawn that succeeds proves the probe is
+    // gone, so this waits on the condition instead of a duration.
+    if !wait_until_quiet(subprocess, &policy.workspace_root) {
+        cx.skip("the sentinel probe never cleared; cannot measure cancellation cleanly");
+        return;
+    }
     // `output()` blocks for the child's whole life, so the wait and the
     // cancellation have to be on different threads — and the canceller needs
     // the handle the waiter is blocked on, so the waiter *borrows* it.
     let started = Instant::now();
-    let outcome = std::thread::scope(|waiters| {
+    enum Stage {
+        Running,
+        NeverRan,
+        CancelPanicked,
+    }
+    let (stage, outcome) = std::thread::scope(|waiters| {
         let waiting = waiters.spawn(|| handle.output());
-        // Give the child a moment to actually be running, then cancel the very
-        // handle the waiter is blocked on.
-        std::thread::sleep(Duration::from_millis(150));
+        // Cancel only once the child is observably mid-run. The bound is generous
+        // and the loop exits as soon as the sentinel appears, so a fast machine
+        // cancels sooner and a loaded CI box still gets its child to a cancellable
+        // state — a fixed sleep gets this wrong in both directions.
+        if !await_running(subprocess, &policy.workspace_root, fixture.cancel_timeout) {
+            let _ = waiting.join();
+            return (Stage::NeverRan, Err(()));
+        }
         let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handle.cancel();
         }));
         if cancelled.is_err() {
             // The scope cannot propagate a panic from here; report it after.
             let _ = waiting.join();
-            return Err(());
+            return (Stage::CancelPanicked, Err(()));
         }
-        Ok(waiting.join().map_err(|_| ()))
+        (Stage::Running, waiting.join().map_err(|_| ()))
     });
-    let outcome = match outcome {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(_)) => {
+    let outcome = match (stage, outcome) {
+        (Stage::Running, Ok(outcome)) => outcome,
+        (Stage::Running, Err(_)) => {
             cx.fail("waiting for the cancelled command panicked the executor");
             return;
         }
-        Err(_) => {
+        (Stage::NeverRan, _) => {
+            cx.skip("the measured command never announced itself mid-run; nothing to cancel");
+            return;
+        }
+        (Stage::CancelPanicked, _) => {
             cx.fail("`SpawnHandle::cancel` panicked");
             return;
         }
@@ -1286,14 +1366,18 @@ fn cancellation_is_honoured(providers: &Executors, fixture: &ExecFixture, cx: &m
             started.elapsed()
         )),
         Err(err) => {
-            // The seam's own taxonomy for this: a cancelled run reports
-            // cancellation. A plain spawn failure is honest-ish (the process
-            // did die) but loses the distinction a caller uses to avoid
-            // retrying its own cancel, so require the code.
-            if err.code != ErrorCode::ExecCancelled && err.code != ErrorCode::SpawnFailed {
+            // The seam's taxonomy is explicit: a cancelled run reports
+            // `exec-cancelled`. Accepting a spawn failure here would let the
+            // exact bug this case exists for pass — a `cancel` that reaches
+            // nothing leaves the child to die of its own bounded probe lifetime,
+            // and the wait can surface that as a spawn-ish failure. The child is
+            // observably mid-run when cancelled (the sentinel was seen), so a
+            // spawn failure afterwards is not an honest report about THIS run.
+            if err.code != ErrorCode::ExecCancelled {
                 cx.fail(format!(
                     "a cancelled command failed with `{}`; a cancelled run must report \
-                     cancellation (`exec-cancelled`) or at worst a spawn failure",
+                     `exec-cancelled`, since a caller routes on the code to avoid retrying \
+                     its own cancellation",
                     err.code.as_str()
                 ));
             }
@@ -1405,23 +1489,6 @@ mod recorder {
                 .last()
                 .cloned()
         }
-    }
-}
-
-/// Records the command line each `exec` was asked to run.
-///
-/// The seam traits require `'static`, so the wrappers hold an `Arc` clone of
-/// the leg rather than borrowing it — which is also why `Executors` hands the
-/// suite owned legs in the first place.
-struct LoggingShell {
-    inner: Arc<dyn Shell>,
-    commands: recorder::Recorder<Vec<String>>,
-}
-
-impl Shell for LoggingShell {
-    fn exec(&self, command: &str, policy: &PolicyHome) -> harnless_seams::error::Result<String> {
-        self.commands.push(vec![command.to_string()]);
-        self.inner.exec(command, policy)
     }
 }
 

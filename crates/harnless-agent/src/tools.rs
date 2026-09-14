@@ -418,8 +418,19 @@ impl ToolRegistry {
     /// order the moment it is installed, so a spine that wires the log after
     /// a first tool exchange still sees every record.
     pub fn set_post_execute_context_sink(&self, sink: ContextSink) {
+        // Take, install, and flush in ONE `context` critical section. Splitting
+        // them lets a concurrent `deliver_post_execute_context` read the old
+        // (absent) sink between the install and the flush, then push into
+        // `pending` after the drain loop already ran — that context would sit
+        // in `pending` forever with a sink mounted, which is the silent loss
+        // this method's own contract forbids.
+        //
+        // Lock order is `context` before `pending` here and in
+        // [`Self::deliver_post_execute_context`], so it cannot deadlock.
+        let mut context = self.context.write();
         let held = std::mem::take(&mut *self.pending.write());
-        *self.context.write() = Some(sink.clone());
+        *context = Some(sink.clone());
+        drop(context);
         for (call_id, value) in held {
             sink(call_id, value);
         }

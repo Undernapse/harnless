@@ -1245,13 +1245,16 @@ fn make_reference_executors() -> Executors {
     world.executors_with_over()
 }
 
-/// Instantiate the execution-world suite as `#[test]` functions.
-///
-/// This is the same macro a downstream provider calls, so running it here means
-/// a breakage in the macro itself — a case name that no longer resolves, a
-/// factory signature that no longer compiles, a `full_suite` test that never
-/// actually runs the cases — is caught in this crate rather than in a provider's
-/// CI.
+// Instantiate the execution-world suite as `#[test]` functions.
+//
+// This is the same macro a downstream provider calls, so running it here means
+// a breakage in the macro itself — a case name that no longer resolves, a
+// factory signature that no longer compiles, a `full_suite` test that never
+// actually runs the cases — is caught in this crate rather than in a provider's
+// CI.
+//
+// A `//` comment, not `///`: a macro invocation is not an item, so an outer doc
+// comment attaches to nothing.
 #[cfg(unix)]
 harnless_conformance::conformance_tests_executor! {
     reference_world,
