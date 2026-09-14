@@ -433,6 +433,9 @@ unsafe extern "C" {
 /// `ExecCancelled` after cancel, best-effort process-group kill.
 struct ConfinedHandle {
     child: Arc<parking_lot::Mutex<std::process::Child>>,
+    /// The child's pid, cached at spawn so `cancel` can signal the process group
+    /// without taking the child lock (which `output` holds across `wait`).
+    child_pid: i32,
     stdout: Reader,
     stderr: Reader,
     cancelled: std::sync::atomic::AtomicBool,
@@ -442,8 +445,10 @@ impl ConfinedHandle {
     fn new(mut child: std::process::Child) -> Box<dyn SpawnHandle> {
         let stdout = Reader::start(child.stdout.take());
         let stderr = Reader::start(child.stderr.take());
+        let child_pid = child.id() as i32;
         Box::new(Self {
             child: Arc::new(parking_lot::Mutex::new(child)),
+            child_pid,
             stdout,
             stderr,
             cancelled: std::sync::atomic::AtomicBool::new(false),
@@ -483,20 +488,31 @@ impl SpawnHandle for ConfinedHandle {
     fn cancel(&self) {
         use std::sync::atomic::Ordering;
         self.cancelled.store(true, Ordering::SeqCst);
-        let Some(mut child) = self.child.try_lock() else {
-            return;
-        };
         // Prefer the whole process group (the child leads its own via
         // setsid); fall back to a direct kill.
         #[cfg(unix)]
         {
-            let pid = child.id() as i32;
+            // The pid is read from the spawn-time cache, never from the locked
+            // child. `output` holds the child across `wait`, and a caller
+            // cancelling a run it is blocked waiting on — the shape of any "stop
+            // this command" caller — would otherwise deadlock against that wait
+            // (or, with a try-lock that gives up, have its cancellation dropped
+            // and be handed the completed run as success). Signalling a
+            // since-exited group is harmless: the signal simply does not land,
+            // and `output` reports the real exit.
+            let pid = self.child_pid;
             if unsafe { kill(-pid, harnless_exec_subprocess::SIGTERM) } != 0 {
-                let _ = child.kill();
+                // The group is gone or was never led by the child; the direct
+                // kill needs the child, so it is best-effort under a try-lock.
+                if let Some(mut child) = self.child.try_lock() {
+                    let _ = child.kill();
+                }
             }
         }
         #[cfg(not(unix))]
-        let _ = child.kill();
+        if let Some(mut child) = self.child.try_lock() {
+            let _ = child.kill();
+        }
     }
 }
 
