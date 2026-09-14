@@ -294,6 +294,7 @@ fn emit_dispatches_fire_and_forget_in_registration_order() {
     h.allow_all().unwrap();
     h.register_tool(
         "echo",
+        "test tool",
         serde_json::json!({}),
         CountingTool::new(r#"{"ok":true}"#),
     )
@@ -544,7 +545,7 @@ fn guarded_pipeline_runs_every_stage_in_locked_order() {
         ],
     );
     let tool = CountingTool::new(r#"{"echo":"1"}"#);
-    h.register_tool("echo", serde_json::json!({"type":"object"}), tool.clone())
+    h.register_tool("echo", "test tool", serde_json::json!({"type":"object"}), tool.clone())
         .unwrap();
 
     // 1. Pre-execute: allow (and record the stage).
@@ -682,7 +683,7 @@ fn approval_fails_closed_with_no_pre_execute_handler() {
         vec![ScriptedCall::new(corpus("tool_echo.json"), MessageId(2))],
     );
     let tool = CountingTool::new(r#"{"ok":true}"#);
-    h.register_tool("echo", serde_json::json!({}), tool.clone())
+    h.register_tool("echo", "test tool", serde_json::json!({}), tool.clone())
         .unwrap();
     let _ = h.run_turn();
     assert_eq!(tool.invocations(), 0, "a denied call never runs the body");
@@ -709,7 +710,7 @@ fn approval_ask_is_denied_not_deferred() {
         vec![ScriptedCall::new(corpus("tool_echo.json"), MessageId(2))],
     );
     let tool = CountingTool::new(r#"{"ok":true}"#);
-    h.register_tool("echo", serde_json::json!({}), tool.clone())
+    h.register_tool("echo", "test tool", serde_json::json!({}), tool.clone())
         .unwrap();
     h.tools
         .on_pre_execute(
@@ -739,7 +740,7 @@ fn monotonic_guard_denial_beats_pre_execute_allow() {
         vec![ScriptedCall::new(corpus("tool_echo.json"), MessageId(2))],
     );
     let tool = CountingTool::new(r#"{"ok":true}"#);
-    h.register_tool("echo", serde_json::json!({}), tool.clone())
+    h.register_tool("echo", "test tool", serde_json::json!({}), tool.clone())
         .unwrap();
     h.allow_all().unwrap();
     h.tools.add_guard(
@@ -786,6 +787,7 @@ fn prompt_assembly_mirrors_the_derived_surface() {
     h.allow_all().unwrap();
     h.register_tool(
         "echo",
+        "test tool",
         serde_json::json!({}),
         CountingTool::new(r#"{"ok":true}"#),
     )
@@ -880,6 +882,7 @@ fn persisted_log_round_trips_and_rederives_the_same_history() {
     h.allow_all().unwrap();
     h.register_tool(
         "echo",
+        "test tool",
         serde_json::json!({}),
         CountingTool::new(r#"{"ok":true}"#),
     )
@@ -929,7 +932,7 @@ fn post_execute_listener_runs_in_the_locked_order() {
         ],
     );
     let tool = CountingTool::new(r#"{"echo":"1"}"#);
-    h.register_tool("echo", serde_json::json!({"type":"object"}), tool.clone())
+    h.register_tool("echo", "test tool", serde_json::json!({"type":"object"}), tool.clone())
         .unwrap();
     h.allow_all().unwrap();
     let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -968,7 +971,7 @@ fn tool_exchange_harness(session: u64) -> (Harness, Arc<CountingTool>) {
         ],
     );
     let tool = CountingTool::new(r#"{"echo":"1"}"#);
-    h.register_tool("echo", serde_json::json!({"type":"object"}), tool.clone())
+    h.register_tool("echo", "test tool", serde_json::json!({"type":"object"}), tool.clone())
         .unwrap();
     h.allow_all().unwrap();
     (h, tool)
