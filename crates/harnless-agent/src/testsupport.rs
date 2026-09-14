@@ -174,6 +174,17 @@ impl Harness {
             fiber.clone(),
             tools.clone(),
         ));
+        // The log is the observable behavior, so it is also where the
+        // pipeline delivers post-execute context: an `AddContext` decision
+        // becomes an ordinary log record, model-visible and ordered, exactly
+        // the way a consumer that owns a log is meant to mount the sink.
+        let sink_log = log.clone();
+        tools.set_post_execute_context_sink(std::sync::Arc::new(move |call_id, value| {
+            sink_log.append(SessionEvent::ToolResult(ToolResultRecord {
+                call_id,
+                content: format!("[context] {value}"),
+            }));
+        }));
         // The adapter needs at least one recording; an unscripted harness
         // gets a trivial placeholder so construction never panics, and the
         // driver's id list keeps the same length so indexing can never
@@ -249,21 +260,13 @@ impl Harness {
     /// Register an accept-all post-execute listener: observe the body's
     /// value and delegate it onward (the post waterfall's accept path).
     ///
-    /// NOTE (ISSUE-19): until the registry's post-execute dispatch key is
-    /// unified, a listener registered this way — like any
-    /// [`crate::tools::ToolRegistry::on_post_execute`] listener — is never
-    /// invoked (see the ignored
-    /// `post_execute_listener_runs_in_the_locked_order` test in
-    /// `tests/primary_seam.rs`). Do not assert a post-stage effect as
-    /// passing behavior.
+    /// Post-execute listeners are dispatched under the registry's outcome
+    /// result type, so a listener registered here really does run — see
+    /// `post_execute_listener_runs_in_the_locked_order` in
+    /// `tests/primary_seam.rs`.
     pub fn accept_post(&self) -> RtResult<Disposer> {
         self.tools.on_post_execute(
-            |e: &mut crate::tools::PostExecute,
-             next: &mut Next<
-                '_,
-                crate::tools::PostExecute,
-                harnless_seams::tools::PostDecision,
-            >| {
+            |e: &mut crate::tools::PostExecute, next: &mut crate::tools::BridgeNext| {
                 let (call_id, value) = e.clone();
                 next.call((call_id, value))
             },

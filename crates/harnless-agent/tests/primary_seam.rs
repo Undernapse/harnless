@@ -571,19 +571,19 @@ fn guarded_pipeline_runs_every_stage_in_locked_order() {
         );
     }
     // 4. Post-execute: observe the body's value and delegate it onward
-    //    (the accept path of the post waterfall).
-    //
-    //    NOTE (ISSUE-19): `ToolRegistry::execute` composes the post-execute
-    //    waterfall under the `(CallId, Value) -> (CallId, Value)` dispatch
-    //    key, while `on_post_execute` registers its listener under
-    //    `(CallId, Value) -> PostDecision` — the two keys never meet, so a
-    //    registered post-execute listener is never invoked and the body's
-    //    value is frozen unchanged. The pre-execute stage dispatches
-    //    `(String, Vec<u8>) -> PreDecision`, matching its registration key,
-    //    so only the post stage is affected. The violated guarantee is
-    //    pinned by an ignored test rather than a lib fix in this crate; see
-    //    `post_execute_listener_runs_in_the_locked_order` below.
-    h.accept_post().unwrap();
+    //    (the accept path of the post waterfall). The listener really runs:
+    //    the stage dispatches under the key the registrar registers under.
+    {
+        let trace = trace.clone();
+        h.tools
+            .on_post_execute(
+                move |e: &mut PostExecute, next: &mut harnless_agent::BridgeNext| {
+                    trace.lock().unwrap().push(format!("post:{}", e.1));
+                    next.call((e.0, e.1.clone()))
+                },
+            )
+            .unwrap();
+    }
     // 6. Notify: the frozen-result emission.
     {
         let trace = trace.clone();
@@ -602,8 +602,13 @@ fn guarded_pipeline_runs_every_stage_in_locked_order() {
 
     assert_eq!(
         trace.lock().unwrap().clone(),
-        vec!["pre:echo", "guard:echo", "notify:{\"echo\":\"1\"}"],
-        "stages ran in the locked order: pre → guard → body → (post, see ISSUE-19) → notify"
+        vec![
+            "pre:echo",
+            "guard:echo",
+            "post:{\"echo\":\"1\"}",
+            "notify:{\"echo\":\"1\"}",
+        ],
+        "stages ran in the locked order: pre → guard → body → post → notify",
     );
     assert_eq!(tool.invocations(), 1, "the body executed exactly once");
     // The frozen (post-replaced) value is what the loop logged as the result.
@@ -905,17 +910,16 @@ fn persisted_log_round_trips_and_rederives_the_same_history() {
     assert_eq!(rebuilt.nodes(), live.as_slice());
 }
 
-/// ISSUE-19: the post-execute stage of the locked pipeline is supposed to
-/// dispatch every registered [`on_post_execute`] listener around the body's
-/// value (accept, block, replace, add context). It does not: the registry
-/// dispatches the `(CallId, Value) -> (CallId, Value)` waterfall key while
-/// the registrar registers under `(CallId, Value) -> PostDecision`, so the
-/// listener slot is never reached and the body's value is frozen unchanged.
+/// The post-execute stage of the locked pipeline dispatches every registered
+/// [`harnless_agent::ToolRegistry::on_post_execute`] listener around the
+/// body's value (accept, block, replace, add context).
 ///
-/// Ignored until the dispatch keys are unified; run with
-/// `cargo test -p harnless-agent --test primary_seam -- --ignored`.
+/// The registry and the registrar must agree on one dispatch key: the runtime
+/// keys waterfall slots by `(TypeId<E>, TypeId<R>)`, so a stage that
+/// dispatches under a result type nobody registers under composes an empty
+/// chain and silently freezes the body's value. This test is the pin: the
+/// listener observes the body's value and delegates it onward.
 #[test]
-#[ignore = "ISSUE-19: post-execute waterfall dispatch key never reaches registered listeners"]
 fn post_execute_listener_runs_in_the_locked_order() {
     let h = Harness::with_script(
         SessionId(1931),
@@ -933,9 +937,9 @@ fn post_execute_listener_runs_in_the_locked_order() {
         let seen = seen.clone();
         h.tools
             .on_post_execute(
-                move |e: &mut PostExecute, next: &mut Next<'_, PostExecute, PostDecision>| {
+                move |e: &mut PostExecute, next: &mut harnless_agent::BridgeNext| {
                     seen.lock().unwrap().push(format!("post:{}", e.1));
-                    next.call(e.clone())
+                    next.call((e.0, e.1.clone()))
                 },
             )
             .unwrap();
@@ -945,6 +949,203 @@ fn post_execute_listener_runs_in_the_locked_order() {
         *seen.lock().unwrap(),
         vec!["post:{\"echo\":\"1\"}"],
         "the post-execute listener must observe the body's value"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Post-execute decisions, observed through the log
+// ---------------------------------------------------------------------------
+
+/// A harness scripted for one full tool exchange (`echo` body → final
+/// answer), with the tool registered and approval granted — the shared
+/// setup for the `PostDecision` outcome tests below.
+fn tool_exchange_harness(session: u64) -> (Harness, Arc<CountingTool>) {
+    let h = Harness::with_script(
+        SessionId(session),
+        vec![
+            ScriptedCall::new(corpus("tool_echo.json"), MessageId(2)),
+            ScriptedCall::new(corpus("answer_final.json"), MessageId(3)),
+        ],
+    );
+    let tool = CountingTool::new(r#"{"echo":"1"}"#);
+    h.register_tool("echo", serde_json::json!({"type":"object"}), tool.clone())
+        .unwrap();
+    h.allow_all().unwrap();
+    (h, tool)
+}
+
+/// The content of the first logged tool result.
+fn first_logged_tool_result(h: &Harness) -> String {
+    h.log
+        .snapshot()
+        .records
+        .iter()
+        .find_map(|r| match &r.event {
+            SessionEvent::ToolResult(t) => Some(t.content.clone()),
+            _ => None,
+        })
+        .expect("a tool exchange logs a result")
+}
+
+/// A `Replace` decision changes what the loop logs as the tool result: the
+/// model sees the listener's value, not the body's.
+#[test]
+fn post_execute_replace_changes_the_logged_tool_result() {
+    let (h, tool) = tool_exchange_harness(1932);
+    let _post = h
+        .tools
+        .on_post_execute(|_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
+            PostDecision::Replace(serde_json::json!({"redacted": true}))
+        })
+        .unwrap();
+    let _ = h.run_tool_turn();
+    assert_eq!(tool.invocations(), 1, "the body still ran");
+    assert_eq!(
+        first_logged_tool_result(&h),
+        r#"{"redacted":true}"#,
+        "the replaced value is what the log — and therefore the model — sees"
+    );
+    // The derived surface projects the replaced content too.
+    let derived = h.derived();
+    assert!(matches!(
+        &derived[0].blocks[0],
+        ContentBlock::ToolResult { content, .. } if content == r#"{"redacted":true}"#
+    ));
+}
+
+/// A `Block` decision makes the logged tool result the structured denial:
+/// the `tool-denied` code, never the body's value.
+#[test]
+fn post_execute_block_logs_the_denial_code() {
+    let (h, tool) = tool_exchange_harness(1933);
+    let _post = h
+        .tools
+        .on_post_execute(|_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
+            PostDecision::Block("policy says no".into())
+        })
+        .unwrap();
+    let _ = h.run_tool_turn();
+    assert_eq!(tool.invocations(), 1, "the body ran before the post stage");
+    // The loop renders an errored pipeline as a structured error result;
+    // consumers route on the code, so that is what the log must carry.
+    assert_eq!(first_logged_tool_result(&h), r#"{"error":"tool-denied"}"#);
+}
+
+/// An `AddContext` decision leaves the logged tool result byte-for-byte the
+/// body's value and surfaces the extra context as its own model-visible
+/// record.
+#[test]
+fn post_execute_add_context_keeps_the_result_and_surfaces_context() {
+    let (h, _tool) = tool_exchange_harness(1934);
+    let _post = h
+        .tools
+        .on_post_execute(|_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
+            PostDecision::AddContext(vec![serde_json::json!({"note": "extra"})])
+        })
+        .unwrap();
+    let _ = h.run_tool_turn();
+    // Both records are in the log, in order: the sink's context record is
+    // delivered inside `execute`, the loop's result record lands after.
+    let contents: Vec<String> = h
+        .log
+        .snapshot()
+        .records
+        .iter()
+        .filter_map(|r| match &r.event {
+            SessionEvent::ToolResult(t) => Some(t.content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        contents,
+        vec![
+            r#"[context] {"note":"extra"}"#.to_string(),
+            r#"{"echo":"1"}"#.to_string()
+        ],
+        "the context is surfaced without corrupting the result"
+    );
+    // The derived surface carries the intact result — the model's view of
+    // the call is exactly what the accepted stage produced.
+    let derived = h.derived();
+    assert!(matches!(
+        &derived[1].blocks[0],
+        ContentBlock::ToolResult { content, .. } if content == r#"{"echo":"1"}"#
+    ));
+}
+
+/// A post listener that returns without calling `next` vetoes the remainder:
+/// later listeners never run, and neither does the built-in accept — the
+/// vetoing decision alone is what the log shows.
+#[test]
+fn post_execute_veto_hides_later_listeners_and_the_built_in() {
+    let (h, _tool) = tool_exchange_harness(1935);
+    let later_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _outer = h
+        .tools
+        .on_post_execute(|_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
+            PostDecision::Replace(serde_json::json!({"vetoed": true}))
+        })
+        .unwrap();
+    let ran = later_ran.clone();
+    let _inner = h
+        .tools
+        .on_post_execute(move |_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            PostDecision::Replace(serde_json::json!({"inner": true}))
+        })
+        .unwrap();
+    let _ = h.run_tool_turn();
+    assert!(
+        !later_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "a veto must not run later listeners"
+    );
+    assert_eq!(
+        first_logged_tool_result(&h),
+        r#"{"vetoed":true}"#,
+        "only the vetoing decision's value reaches the log"
+    );
+}
+
+/// Listeners compose in registration order, outermost first: the outer
+/// listener sees (and may amend) what its `next` answered, and the
+/// outermost value is what the log carries.
+#[test]
+fn post_execute_listeners_compose_outermost_first_through_the_log() {
+    let (h, _tool) = tool_exchange_harness(1936);
+    let order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let trace = order.clone();
+    let _outer = h
+        .tools
+        .on_post_execute(move |e: &mut PostExecute, next: &mut harnless_agent::BridgeNext| {
+            trace.lock().unwrap().push("outer".into());
+            match next.call((e.0, e.1.clone())) {
+                PostDecision::Replace(v) => {
+                    let mut obj = v.as_object().cloned().unwrap_or_default();
+                    obj.insert("outer".into(), serde_json::json!(true));
+                    PostDecision::Replace(serde_json::Value::Object(obj))
+                }
+                other => other,
+            }
+        })
+        .unwrap();
+    let trace = order.clone();
+    let _inner = h
+        .tools
+        .on_post_execute(move |_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
+            trace.lock().unwrap().push("inner".into());
+            PostDecision::Replace(serde_json::json!({"inner": true}))
+        })
+        .unwrap();
+    let _ = h.run_tool_turn();
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec!["outer", "inner"],
+        "registration order is outermost-first"
+    );
+    assert_eq!(
+        first_logged_tool_result(&h),
+        r#"{"inner":true,"outer":true}"#,
+        "the outer listener amended the inner listener's replacement"
     );
 }
 
