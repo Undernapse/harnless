@@ -395,7 +395,11 @@ impl RegistryHandle {
         for public in table.keys() {
             let (skip, adopt_orphan) = {
                 let state = self.bridge.state.read();
-                let skip = previous.contains_key(public) || state.live.contains(public);
+                // A poisoned name is NOT skipped: our forwarder may no
+                // longer be the registry's live body, so re-establish
+                // ownership (re-register or re-adopt) and clear the mark.
+                let skip = (previous.contains_key(public) || state.live.contains(public))
+                    && !state.stolen.contains(public);
                 // An orphan forwarder of ours is still in the registry —
                 // re-adopt it instead of re-registering (Tools has no
                 // unregister). Re-verify the registry still holds *our*
@@ -418,12 +422,19 @@ impl RegistryHandle {
                 (skip, adopt_orphan)
             };
             if skip {
+                // The name stays ours (previous generation or live): any
+                // earlier poison was a transient theft that this publish
+                // has already re-verified against the registry — clear it
+                // so a vacated name recovers instead of staying dead.
+                let mut state = self.bridge.state.write();
+                state.stolen.remove(public);
                 continue;
             }
             if adopt_orphan {
                 let mut state = self.bridge.state.write();
                 state.orphans.remove(public);
                 state.live.insert(public.clone());
+                state.stolen.remove(public);
                 continue;
             }
             let def = table[public].1.clone();
@@ -438,6 +449,9 @@ impl RegistryHandle {
                     state
                         .registered
                         .insert(public.clone(), (server.to_string(), def));
+                    // Our forwarder now owns the name again: any earlier
+                    // poison is stale.
+                    state.stolen.remove(public);
                     added.push(public.clone());
                 }
                 Err(e) => {

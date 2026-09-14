@@ -35,6 +35,17 @@ pub trait AttachmentStore: Send + Sync {
     /// Store `base64` bytes of MIME type `mime`; return an opaque
     /// reference (e.g. a content-addressed id) for the record.
     fn put(&self, mime: &str, base64: &str) -> Result<String, String>;
+
+    /// Entries currently held. Bounded stores cap this at their capacity.
+    /// Default `None` for stores that do not track a count.
+    fn len(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether the store holds nothing.
+    fn is_empty(&self) -> bool {
+        self.len().is_some_and(|n| n == 0)
+    }
 }
 
 /// What the calling route declared about its input capabilities.
@@ -58,6 +69,23 @@ impl RichContentGate {
     /// A gate with nothing mounted: rich content is never admitted.
     pub fn closed() -> Self {
         Self::default()
+    }
+
+    /// A gate over the default bounded attachment store with an explicit
+    /// capacity, and image input declared on the route. The capacity is
+    /// the mount surface's knob for how much server output the process
+    /// retains; it never grows past this bound.
+    pub fn with_store_capacity(capacity: usize) -> Self {
+        Self {
+            store: Some(Arc::new(InMemoryAttachmentStore::with_capacity(capacity))),
+            route: RouteCapabilities { image_input: true },
+        }
+    }
+
+    /// A gate over an explicit store with an explicit capacity, using the
+    /// default bounded store implementation.
+    pub fn bounded_store(capacity: usize) -> Arc<dyn AttachmentStore> {
+        Arc::new(InMemoryAttachmentStore::with_capacity(capacity))
     }
 
     /// Whether rich content may be admitted at all (both halves).
@@ -537,6 +565,10 @@ impl InMemoryAttachmentStore {
 }
 
 impl AttachmentStore for InMemoryAttachmentStore {
+    fn len(&self) -> Option<usize> {
+        Some(self.len())
+    }
+
     fn put(&self, mime: &str, base64: &str) -> Result<String, String> {
         // FNV-1a over the payload bytes: stable, dependency-free addressing.
         const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;

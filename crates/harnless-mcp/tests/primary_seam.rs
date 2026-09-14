@@ -1406,3 +1406,60 @@ fn strict_failure_detail_is_logged() {
         "the real failure detail must reach the log: {logged:?}"
     );
 }
+
+/// Review P2: a stolen-name poison must not outlive the theft. Once the
+/// third party vacates the name, the next re-sync must re-establish our
+/// forwarder and calls must flow again — not a permanently-dead tool.
+#[tokio::test(flavor = "multi_thread")]
+async fn stolen_name_recovers_after_the_thief_vacates() {
+    let reg = Arc::new(MapRegistry::default());
+    let bridge = Arc::new(McpToolBridge::new(reg.clone()));
+    let handle = RegistryHandle::new(bridge.clone(), "alpha");
+    let gen = |names: &[&'static str]| -> Generation {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    public_name("alpha", n),
+                    ToolDefinition {
+                        name: public_name("alpha", n),
+                        schema: json!({"type": "object"}),
+                        serialized: false,
+                    },
+                    Arc::new(NoopBody) as Arc<dyn ToolBody>,
+                )
+            })
+            .collect()
+    };
+    // init
+    handle
+        .replace_generation("alpha", gen(&["x"]))
+        .expect("first generation registers");
+    // steal: a third party lands a different definition under our name.
+    reg.tools.lock().insert(
+        public_name("alpha", "x"),
+        ToolDefinition {
+            name: public_name("alpha", "x"),
+            schema: json!({"type": "string"}),
+            serialized: true,
+        },
+    );
+    // conflict: re-sync must roll back entirely.
+    let err = handle
+        .replace_generation("alpha", gen(&["x"]))
+        .expect_err("theft must conflict");
+    assert!(err.contains("non-MCP tool"), "theft conflict: {err}");
+    // unsteal: the third party vacates the name.
+    let vacated: Option<ToolDefinition> = reg.tools.lock().remove(&public_name("alpha", "x"));
+    assert!(vacated.is_some(), "the thief held the name");
+    // re-sync: must succeed and re-establish our forwarder.
+    handle
+        .replace_generation("alpha", gen(&["x"]))
+        .expect("re-sync after the thief vacates must succeed");
+    assert!(bridge.is_live("mcp__alpha__x"), "name is live again");
+    // calls must flow again.
+    let out = bridge
+        .call("mcp__alpha__x", CallId(1), b"{}")
+        .expect("call must succeed after recovery");
+    let _ = out;
+}

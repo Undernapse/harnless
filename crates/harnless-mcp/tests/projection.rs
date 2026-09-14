@@ -363,3 +363,20 @@ fn items_false_is_not_a_silent_pass() {
         "empty array validates under items:false"
     );
 }
+
+// Review P3: the attachment-store capacity must be reachable from the
+// bridge/mount surface, not only the store's own Default.
+#[test]
+fn gate_builder_sizes_the_attachment_store() {
+    let gate = RichContentGate::with_store_capacity(4);
+    let store = gate.store.clone().expect("gate carries a store");
+    for i in 0..8 {
+        store.put("image/png", &format!("p-{i}")).expect("put");
+    }
+    assert_eq!(
+        store.len().expect("len"),
+        4,
+        "the gate's store must honor the configured capacity"
+    );
+    assert!(gate.admits());
+}
