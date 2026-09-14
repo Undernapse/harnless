@@ -67,6 +67,22 @@ impl ToolRegistry {
         self.tools.write().remove(name).is_some()
     }
 
+    /// Whether `name` is registered with exactly `body` as its body.
+    ///
+    /// Identity, not definition: two plugins (or one plugin's two generations)
+    /// can declare the same name with different bodies, and the reversible
+    /// unregister a mount performs must only undo *its own* registration. A
+    /// reload registers the new generation's body under the old name before
+    /// retiring the old generation, so the old mount's unwind must leave the
+    /// live entry standing.
+    pub fn body_is(&self, name: &str, body: &Arc<dyn ToolBody>) -> bool {
+        self.tools
+            .read()
+            .get(name)
+            .map(|(_, stored)| Arc::ptr_eq(stored, body))
+            .unwrap_or(false)
+    }
+
     /// Register a monotonic guard under `name`.
     ///
     /// Guards run after the pre-execute waterfall and cannot be reordered

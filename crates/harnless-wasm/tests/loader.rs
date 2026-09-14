@@ -147,10 +147,6 @@ struct FakePlugin {
     body: Arc<ScopedGuest>,
     /// The mount's fiber, so a test can drive teardown explicitly.
     fiber: Arc<Fiber>,
-    /// The reversible registration handle, owned by the mount exactly as the
-    /// shipped loader owns it: while the mount lives the handle lives, and
-    /// dropping it removes precisely the plugin's own tool names.
-    registration: Option<Registration>,
 }
 
 impl FakePlugin {
@@ -195,7 +191,6 @@ impl FakePlugin {
             descriptor,
             body,
             fiber: Fiber::pending(),
-            registration: None,
         }
     }
 }
@@ -208,7 +203,8 @@ fn mount(manager: &WasmPluginManager, spine: &Spine, p: &mut FakePlugin) -> u64 
     plugin_ctx.set_fiber(p.fiber.clone());
 
     let names = Arc::new(Mutex::new(Vec::<String>::new()));
-    names.lock().extend(p.descriptor.tools.iter().map(|spec| {
+    let bodies = Arc::new(Mutex::new(Vec::<Arc<dyn ToolBody>>::new()));
+    for spec in &p.descriptor.tools {
         let name = format!("{}.{}", p.descriptor.name, spec.name);
         spine
             .registry
@@ -221,28 +217,29 @@ fn mount(manager: &WasmPluginManager, spine: &Spine, p: &mut FakePlugin) -> u64 
                 p.body.clone(),
             )
             .unwrap_or_else(|e| panic!("register {name}: {e:?}"));
-        name
-    }));
+        names.lock().push(name);
+        bodies.lock().push(p.body.clone());
+    }
 
-    // The shipped reversible handle, owned by the mount exactly as the
-    // loader owns it: while the mount lives the handle lives, and dropping
-    // it removes precisely these names.
-    p.registration = Some(Registration {
+    // The shipped loader's reversibility: the handle's single strong owner is
+    // an effect on the plugin's fiber, which `record_mount` installs. Fiber
+    // teardown — driven by `unmount`, or by the test directly — drops the
+    // handle, and its `Drop` removes exactly these registrations.
+    let handle = Arc::new(Mutex::new(Registration {
         registry: spine.registry.clone(),
         names: names.clone(),
-    });
-
+        bodies,
+    }));
     p.fiber.set_state(FiberState::Active);
     // The shipped manager records the same mount, so `generations` and
     // `unmount` stay the authority the assertions read.
-    manager.record_mount(&p.config, &p.fiber, &names, None)
+    manager.record_mount(&p.config, &p.fiber, &names, None, handle)
 }
 
 /// Tear one mount down the way the shipped loader does: dispose the plugin's
-/// fiber, then drop its registration handle.
+/// fiber, which drops the registration handle its effect owns.
 fn teardown(p: &mut FakePlugin) {
     p.fiber.dispose();
-    p.registration = None;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,18 +299,40 @@ fn reload_swaps_the_generation_without_duplicates() {
     let manager = WasmPluginManager::new();
     let spine = Spine::new();
     let mut p = FakePlugin::new("fs", vec![]);
-    mount(&manager, &spine, &mut p);
+    let g1 = mount(&manager, &spine, &mut p);
     let mut p2 = FakePlugin::new("fs", vec![]);
-    let g = mount(&manager, &spine, &mut p2);
-    assert_eq!(g, 2, "the remount is the next generation");
-    // The older generation's registrations unwind as the new one lands.
-    p.fiber.dispose();
+    let g2 = mount(&manager, &spine, &mut p2);
+    assert_eq!((g1, g2), (1, 2), "the remount is the next generation");
     assert_eq!(
-        spine.names(),
-        vec!["fs.read"],
-        "the tool set swaps; it never accumulates duplicates"
+        manager.generations(),
+        vec![("fs".into(), 1u64), ("fs".into(), 2u64)],
+        "both generations are live until the old one is retired"
     );
+
+    // The shipped reload's unwind step: retire the superseded row, which
+    // disposes its fiber and drops its registration handle.
+    assert!(manager.unmount_generation("fs", Some(g1)));
+    // Both generations declare the same tool name, so the registry holds one
+    // slot for it: the old generation's registration was *replaced* when the
+    // new one registered, and unwinding the old one cannot remove the live
+    // generation's entry. That is why a reload swaps instead of accumulating.
+    assert_eq!(
+        spine.registry.get("fs.read").map(|d| d.schema),
+        Some(json!({"type": "object"})),
+        "the live generation's tool survives the old generation's unwind"
+    );
+    assert_eq!(spine.names(), vec!["fs.read"], "no duplicate tool names");
     assert_eq!(manager.generations(), vec![("fs".into(), 2u64)]);
+    assert_eq!(
+        p.fiber.state(),
+        FiberState::Disposed,
+        "the retired generation's fiber tore down"
+    );
+    assert_eq!(
+        p2.fiber.state(),
+        FiberState::Active,
+        "the live generation's fiber is untouched"
+    );
 }
 
 #[test]
@@ -423,11 +442,11 @@ fn no_host_access_unless_config_grants_it() {
     );
 }
 
+/// The reversal direction of the unmount guarantee: a plugin's registrations
+/// unwind when *its own* fiber tears down — no manager call involved — and
+/// never when another plugin's fiber or the spine's fiber tears down.
 #[test]
-fn the_spine_fiber_teardown_unwinds_the_spine_only() {
-    // Guards the reversal direction of the unmount guarantee: a plugin's
-    // registrations survive the *spine's* fiber only while its own fiber is
-    // alive, and a plugin fiber's teardown never touches another's tools.
+fn fiber_teardown_unwinds_only_its_own_plugins_tools() {
     let manager = WasmPluginManager::new();
     let spine = Spine::new();
     let mut a = FakePlugin::new("alpha", vec![]);
@@ -435,23 +454,40 @@ fn the_spine_fiber_teardown_unwinds_the_spine_only() {
     mount(&manager, &spine, &mut a);
     mount(&manager, &spine, &mut b);
 
+    // The spine's own fiber tearing down must not touch a plugin's tools:
+    // each mount owns a separate fiber.
+    let spine_only = Spine::new();
+    let gamma = WasmPluginManager::new();
+    let mut c = FakePlugin::new("gamma", vec![]);
+    mount(&gamma, &spine_only, &mut c);
+    spine_only.fiber.dispose();
+    assert_eq!(
+        spine_only.names(),
+        vec!["gamma.read"],
+        "the spine's fiber teardown unwinds the spine, not the plugin"
+    );
+
+    // A plugin fiber disposed directly — no manager involved — unwinds exactly
+    // its own tools, because its registration handle lives in that fiber.
     a.fiber.dispose();
     assert_eq!(
         spine.names(),
         vec!["beta.read"],
         "explicit fiber teardown alone unwinds that plugin's tools"
     );
+    assert_eq!(
+        b.fiber.state(),
+        FiberState::Active,
+        "the other plugin's fiber is untouched"
+    );
+    assert_eq!(
+        manager.generations(),
+        vec![("alpha".into(), 1u64), ("beta".into(), 1u64)],
+        "the tree still lists both rows: disposing a fiber is not unmounting a \
+         config row, and `unmount` is what retires the row"
+    );
+    // Retiring alpha's row is now a no-op unwind (its fiber is already down)
+    // but still removes the row.
+    assert!(manager.unmount("alpha"));
     assert_eq!(manager.generations(), vec![("beta".into(), 1u64)]);
-    let _ = spine.fiber.state();
-}
-
-#[test]
-fn zz_probe_lifetime() {
-    let manager = WasmPluginManager::new();
-    let spine = Spine::new();
-    let mut a = FakePlugin::new("alpha", vec![]);
-    let g = mount(&manager, &spine, &mut a);
-    eprintln!("gen {g} names {:?} effects {}", spine.names(), a.fiber.effect_count());
-    eprintln!("has reg: {}", spine.ctx.has::<Registration>());
-    assert!(false, "probe");
 }

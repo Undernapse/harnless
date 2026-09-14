@@ -26,6 +26,7 @@
 //! (fail-closed), guards, and the frozen-result notification around the
 //! guest call exactly as for a native tool.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use harnless_agent::tools::ToolRegistry;
@@ -43,6 +44,18 @@ use crate::engine::{build_engine, LiveInstance};
 
 /// The tool names one plugin generation registered, in registration order.
 pub type RegisteredTools = Arc<Mutex<Vec<String>>>;
+
+/// Weak observers of the live mounts' registration handles, keyed by the
+/// plugin fiber's identity.
+///
+/// The strong owner of a mount's [`Registration`] is a fiber effect, never the
+/// manager: this map only reports which mounts are still reversible.
+type Mounts = Arc<Mutex<HashMap<usize, std::sync::Weak<Mutex<Registration>>>>>;
+
+/// Identity key for one plugin fiber.
+fn fiber_key(fiber: &Arc<Fiber>) -> usize {
+    Arc::as_ptr(fiber).addr()
+}
 
 /// A tool body that crosses into the guest: `call_<tool>(raw-json)`.
 struct GuestBody {
@@ -70,21 +83,33 @@ impl ToolBody for GuestBody {
 
 /// The reversible tool registrations one plugin owns.
 ///
-/// Held inside the plugin's fiber: when the fiber unloads, the handle drops
-/// and removes exactly this plugin's tools from the registry — the
-/// mechanical guarantee behind "removing the plugin by editing config
-/// unwinds its registrations".
+/// Held by the plugin's fiber: when the fiber unloads, the handle drops and
+/// removes exactly this plugin's tools from the registry — the mechanical
+/// guarantee behind "removing the plugin by editing config unwinds its
+/// registrations".
+///
+/// Unwind is **identity-checked**: a name is removed only while the registry
+/// still holds *this* mount's body under it. [`WasmPluginManager::reload`]
+/// registers the new generation's body under the same name before the old
+/// generation is retired, so retiring the old one must not delete the live
+/// one — that is what makes a reload a swap instead of a disappearance.
 pub struct Registration {
     /// The registry the names were registered on.
     pub registry: Arc<ToolRegistry>,
     /// The registered names, in registration order.
     pub names: RegisteredTools,
+    /// The bodies this mount registered, in the same order as [`Self::names`].
+    pub bodies: Arc<Mutex<Vec<Arc<dyn ToolBody>>>>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        for name in self.names.lock().iter() {
-            self.registry.remove(name);
+        for (name, body) in self.names.lock().iter().zip(self.bodies.lock().iter()) {
+            // `remove` reports whether the slot was occupied; the registry
+            // entry is superseded when its body is not this mount's.
+            if self.registry.body_is(name, body) {
+                self.registry.remove(name);
+            }
         }
     }
 }
@@ -102,6 +127,11 @@ pub struct MountedPlugin {
     pub config: PluginConfig,
     /// The registered tool names.
     pub names: RegisteredTools,
+    /// A weak observer of the mount's reversible handle. The handle's single
+    /// strong owner is an effect on [`Self::fiber`], so this upgrade succeeds
+    /// exactly while the mount is live: fiber teardown drops the handle, and
+    /// the [`Registration`]'s `Drop` removes exactly this plugin's names.
+    pub handle: std::sync::Weak<Mutex<Registration>>,
 }
 
 /// The WASM plugin manager: owns the shared engine and the mounted tree.
@@ -109,7 +139,13 @@ pub struct MountedPlugin {
 pub struct WasmPluginManager {
     engine: wasmtime::Engine,
     mounted: Arc<Mutex<Vec<MountedPlugin>>>,
+    /// Weak observers of the live mounts' handles, keyed by plugin fiber
+    /// identity. A mount whose handle has dropped (its fiber tore down) stops
+    /// being reported here, which is how the manager observes unwinds it did
+    /// not itself trigger.
+    handles: Mounts,
 }
+
 
 impl Default for WasmPluginManager {
     fn default() -> Self {
@@ -123,6 +159,7 @@ impl WasmPluginManager {
         Self {
             engine: build_engine().expect("wasmtime engine"),
             mounted: Arc::new(Mutex::new(Vec::new())),
+            handles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -186,9 +223,11 @@ impl WasmPluginManager {
         ));
 
         // Register each declared tool through the seam (the same
-        // `ctx.tools` surface a native tool uses). Names are recorded so
-        // the fiber-owned Registration handle removes exactly these.
+        // `ctx.tools` surface a native tool uses). Names *and* bodies are
+        // recorded so the fiber-owned Registration handle removes exactly
+        // these registrations — and only those still owned by this mount.
         let names: RegisteredTools = Arc::new(Mutex::new(Vec::new()));
+        let bodies: Arc<Mutex<Vec<Arc<dyn ToolBody>>>> = Arc::new(Mutex::new(Vec::new()));
         for spec in &descriptor.tools {
             let name = format!("{}.{}", descriptor.name, spec.name);
             let def = ToolDefinition {
@@ -202,33 +241,27 @@ impl WasmPluginManager {
                 fuel: config.fuel_per_call,
             });
             registry
-                .register(def, body)
+                .register(def, body.clone())
                 .map_err(|e| format!("plugin {}: register {name}: {e:?}", config.id))?;
             names.lock().push(name);
+            bodies.lock().push(body);
         }
 
-        // The reversible handle lives inside the plugin fiber: fiber
-        // teardown drops it, and its Drop removes the tools.
-        let registration = Registration {
+        // The reversible handle. `record_mount` gives its *single* strong
+        // owner to an effect on the plugin's fiber, so the mount's tools
+        // disappear exactly when that fiber tears down — whether the manager
+        // unmounts the row or the fiber is disposed on its own.
+        let handle = Arc::new(Mutex::new(Registration {
             registry: registry.clone(),
             names: names.clone(),
-        };
-        if let Err(err) = plugin_ctx.provide(registration) {
-            // Roll the registrations back before surfacing the failure.
-            for name in names.lock().iter() {
-                registry.remove(name);
-            }
-            return Err(format!("plugin {}: provide registration: {err}", config.id));
-        }
-
+            bodies,
+        }));
         fiber.set_state(FiberState::Active);
-        Ok(self.record_mount(config, &fiber, &names, Some(live)))
+        Ok(self.record_mount(config, &fiber, &names, Some(live), handle))
     }
 
-    /// The bookkeeping half of a mount: allocate the generation for `config`
-    /// and record the mounted-tree entry, for a plugin whose tools are
-    /// already registered and whose reversible handle is already provided on
-    /// `fiber`.
+    /// The bookkeeping half of a mount, for a mount that carries its own
+    /// reversible [`Registration`] handle.
     ///
     /// [`Self::mount`] is this plus compiling the component and wiring the
     /// guest calls through [`LiveInstance`]. Splitting the two lets a test
@@ -236,13 +269,42 @@ impl WasmPluginManager {
     /// guest body that is not a loadable component — the substitution
     /// `tests/loader.rs` documents (ISSUE-15). `live` is `None` exactly for
     /// such a stand-in mount.
+    ///
+    /// The handle's single strong owner becomes an effect on `fiber`, so the
+    /// [`Registration`]'s `Drop` — which removes exactly its names — runs when
+    /// the fiber tears down. [`Self::unmount`] and [`Self::reload`] drive that
+    /// teardown; a fiber disposed by anyone else drives it too. The manager
+    /// additionally keeps a weak observer so [`Self::mounted_handles`] can
+    /// report what is live.
     pub fn record_mount(
         &self,
         config: &PluginConfig,
         fiber: &Arc<Fiber>,
         names: &RegisteredTools,
         live: Option<Arc<Mutex<LiveInstance>>>,
+        handle: Arc<Mutex<Registration>>,
     ) -> u64 {
+        let key = fiber_key(fiber);
+        let detached = self.handles.clone();
+        let observer = Arc::downgrade(&handle);
+        // The handle's only strong owner lives in this effect: fiber teardown
+        // drops it, the Registration's Drop removes the plugin's tools, and the
+        // weak observer in the manager's map stops reporting the mount.
+        let owned = Mutex::new(Some(handle.clone()));
+        let reversible = fiber
+            .effect(move || {
+                let observer = observer.clone();
+                detached.lock().insert(key, observer);
+                Some(Box::new(move || {
+                    drop(owned.lock().take());
+                }) as harnless_runtime::fiber::DisposeFn)
+            })
+            .is_ok();
+        debug_assert!(
+            reversible,
+            "plugin {}: mount recorded on a disposed fiber is not reversible",
+            config.id
+        );
         let mut mounted = self.mounted.lock();
         let g = mounted
             .iter()
@@ -257,20 +319,40 @@ impl WasmPluginManager {
             live,
             config: config.clone(),
             names: names.clone(),
+            // The row observes the handle; the fiber's effect owns it.
+            handle: Arc::downgrade(&handle),
         });
         g
     }
 
-    /// Unmount a plugin by id: dispose its fiber, unwinding exactly its
-    /// registrations. Returns `false` when no such plugin is mounted.
+    /// Unmount a plugin by id: retire its newest row and dispose its fiber,
+    /// unwinding exactly its registrations. Returns `false` when no such
+    /// plugin is mounted.
     pub fn unmount(&self, id: &str) -> bool {
+        self.unmount_generation(id, None)
+    }
+
+    /// Unmount one plugin *generation* by id: retire exactly that row and
+    /// dispose its fiber, unwinding exactly that generation's registrations.
+    /// `None` means the newest generation, like [`Self::unmount`].
+    ///
+    /// This is the primitive [`Self::reload`] uses to retire the superseded
+    /// generation, and what a caller uses when a config edit replaces one
+    /// generation while a newer one is already live.
+    pub fn unmount_generation(&self, id: &str, generation: Option<u64>) -> bool {
         let victim = {
             let mut mounted = self.mounted.lock();
-            let pos = mounted.iter().rposition(|m| m.config.id == id);
+            let pos = match generation {
+                Some(g) => mounted.iter().rposition(|m| m.config.id == id && m.generation == g),
+                None => mounted.iter().rposition(|m| m.config.id == id),
+            };
             pos.map(|pos| mounted.remove(pos))
         };
         match victim {
             Some(plugin) => {
+                // The fiber's effect owns the registration handle: disposing
+                // the fiber drops it, and the handle's Drop removes exactly
+                // this plugin's tool names.
                 plugin.fiber.dispose();
                 true
             }
@@ -339,12 +421,24 @@ impl WasmPluginManager {
     }
 
     /// The mounted plugin ids with generations.
+    ///
+    /// A row leaves the tree when the plugin is unmounted or superseded by a
+    /// reload, so this is the observable config-tree state: `unmount` and
+    /// `reload` are what retire rows, and a row's tools unwind with its fiber.
     pub fn generations(&self) -> Vec<(String, u64)> {
         self.mounted
             .lock()
             .iter()
             .map(|m| (m.config.id.clone(), m.generation))
             .collect()
+    }
+
+    /// Whether a mount for `id` at generation `generation` is in the tree.
+    pub fn is_mounted(&self, id: &str, generation: u64) -> bool {
+        self.mounted
+            .lock()
+            .iter()
+            .any(|m| m.config.id == id && m.generation == generation)
     }
 
     /// The host-recorded log lines for one mounted plugin.
