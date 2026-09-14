@@ -57,7 +57,9 @@ mod stubs;
 pub mod types;
 
 pub use adapter_suite::{
-    check_model_adapter_contract, check_model_adapter_contract_all, ADAPTER_CONFORMANCE_CASES,
+    check_model_adapter_cases, check_model_adapter_contract, check_model_adapter_contract_all,
+    ADAPTER_CONFORMANCE_CASES,
+    Scenario, ScenarioFactory, ScenarioKind,
 };
 pub use executor_suite::{
     check_executor_contract, check_executor_contract_all, injected_verdict, EXECUTOR_CONFORMANCE_CASES,
@@ -172,15 +174,28 @@ macro_rules! conformance_tests_fs {
 ///     replay,
 ///     make_adapter,
 ///     scenario_for,
+///     make_full_suite_adapter,
 ///     "usage_before_finish",
 ///     "raw_json_tool_arguments",
 /// }
 /// ```
 ///
-/// `adapter_factory` is a `fn() -> Adapter` (a plain function item) producing
-/// a fresh adapter per case, and `scenario_factory` is the
+/// `adapter_factory` is a `fn(&str) -> Adapter` (a plain function item)
+/// producing a fresh adapter for the named case, and `scenario_factory` is the
 /// [`ScenarioFactory`](adapter_suite::ScenarioFactory) supplying that case's
-/// scripted turn. Each case runs against a *fresh* provider, so cases never
+/// scripted turn.
+///
+/// The adapter factory receives the case name for the same reason the scenario
+/// factory does — see [`ScenarioFactory`](adapter_suite::ScenarioFactory). A
+/// harness whose adapter needs no per-case scripting takes `_`:
+/// `fn make(_case: &str) -> MyAdapter`.
+///
+/// `full_suite_factory` is a `fn(&[&str]) -> Adapter` for the `full_suite`
+/// test, which drives *one* adapter through every case and so cannot be served
+/// by a per-case adapter: it needs a script holding every corpus. It receives
+/// the cases this instantiation names, in the order the checks run them, so the
+/// harness can pair each case with its own corpus; a harness whose adapter is
+/// corpus-agnostic returns the same adapter for any list. Each case runs against a *fresh* provider, so cases never
 /// interfere, and a `full_suite` test runs everything in one pass. A case
 /// fails with the violation details, or with a note that the provider
 /// panicked — a panic is a contract violation too.
@@ -190,13 +205,19 @@ macro_rules! conformance_tests_fs {
 /// instantiations.
 #[macro_export]
 macro_rules! conformance_tests_adapter {
-    ($name:ident, $adapter_factory:expr, $scenario_factory:expr, $($case:literal),+ $(,)?) => {
+    (
+        $name:ident,
+        $adapter_factory:expr,
+        $scenario_factory:expr,
+        $full_suite_factory:expr,
+        $($case:literal),+ $(,)?
+    ) => {
         $crate::__paste! {
             $(
                 #[test]
                 fn [<conformance_ $name _ $case>]() {
-                    let factory: fn() -> _ = $adapter_factory;
-                    let adapter = factory();
+                    let factory: fn(&str) -> _ = $adapter_factory;
+                    let adapter = factory($case);
                     let outcome = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                         $crate::check_model_adapter_contract(&adapter, $case, $scenario_factory)
                     }));
@@ -224,10 +245,19 @@ macro_rules! conformance_tests_adapter {
 
             #[test]
             fn [<conformance_ $name _full_suite>]() {
-                let factory: fn() -> _ = $adapter_factory;
-                let adapter = factory();
+                // The whole-suite run drives one adapter through every case, so
+                // a per-case adapter cannot serve it. The macro cannot call the
+                // factory once per case and join the adapters, so the harness is
+                // asked for an adapter scripted with every case's corpus, in suite
+                // order — the same order the checks run them in.
+                let factory: fn(&[&str]) -> _ = $full_suite_factory;
+                // The list handed to the factory is the list this run actually
+                // checks, so a harness scripting one corpus per case pairs them
+                // correctly even when the instantiation is a subset.
+                let cases: &[&str] = &[$($case),+];
+                let adapter = factory(cases);
                 let outcome = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    $crate::check_model_adapter_contract_all(&adapter, $scenario_factory)
+                    $crate::check_model_adapter_cases(&adapter, $scenario_factory, cases)
                 }));
                 match outcome {
                     Ok(violations) => assert!(

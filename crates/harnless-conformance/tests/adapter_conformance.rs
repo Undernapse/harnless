@@ -15,7 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use harnless_conformance::adapter_suite::{
-    check_model_adapter_contract, check_model_adapter_contract_all, Scenario,
+    check_model_adapter_contract, check_model_adapter_contract_all, Scenario, ScenarioKind,
     ADAPTER_CONFORMANCE_CASES,
 };
 use harnless_seams::error::{ErrorCode, Result, SeamError};
@@ -192,18 +192,21 @@ impl Corpus {
         }
     }
 
+    /// The corpus a scenario kind is expected to drive.
+    fn for_kind(kind: ScenarioKind) -> Self {
+        match kind {
+            ScenarioKind::ToolTurn => Self::tool_turn(),
+            ScenarioKind::FailedTurn => Self::failed_turn(ErrorCode::ProviderFailure),
+            ScenarioKind::ContextOverflowTurn => Self::failed_turn(ErrorCode::ContextOverflow),
+            ScenarioKind::SilentTurn => Self::silent_turn(),
+            ScenarioKind::InterleavedTurn => Self::interleaved_turn(),
+            ScenarioKind::TextTurn => Self::text_turn(),
+        }
+    }
+
     /// The corpus the suite's `case` is expected to drive.
     fn for_case(case: &str) -> Self {
-        match case {
-            "raw_json_tool_arguments" => Self::tool_turn(),
-            "sanctioned_failure_paths" | "in_band_failure_is_terminal" => {
-                Self::failed_turn(ErrorCode::ProviderFailure)
-            }
-            "empty_completion_is_retryable_failure" => Self::silent_turn(),
-            "context_overflow_canonical_code" => Self::failed_turn(ErrorCode::ContextOverflow),
-            "replay_alignment_is_emission_order" => Self::interleaved_turn(),
-            _ => Self::text_turn(),
-        }
+        Self::for_kind(ScenarioKind::for_case(case))
     }
 
     /// The metadata this corpus's adapter appends, defect applied.
@@ -225,7 +228,12 @@ impl Corpus {
     }
 
     /// The scenario a provider harness would build for this corpus.
-    fn scenario(&self, case: &str, defect: Defect) -> Scenario {
+    ///
+    /// `case` is still needed here for one thing the kind cannot express: the
+    /// ownership case hands `stream()` state the adapter claims, which only that
+    /// case scripts. A real harness reads the same distinction off the kind it is
+    /// asked for; this fixture is shared by every case, so it keeps the name.
+    fn scenario(&self, kind: ScenarioKind, defect: Defect) -> Scenario {
         let frames = match defect {
             // The re-serialising adapter buffers its fragments and rewrites
             // the assembled payload; its scenario must describe the honest
@@ -243,7 +251,15 @@ impl Corpus {
             Some(failure) => scenario.failure(failure.clone()),
             None => scenario,
         };
-        if case == "replay_state_ownership" {
+        // The fixture is a provider, so it declares *its own* marker to the
+        // suite — the same thing a real harness declares with its real marker
+        // (see the replay provider's harness). The suite builds both ownership
+        // documents from this declaration.
+        let scenario = scenario.ownership_marker(Scripted::MARKER, Scripted::SELF);
+        // The ownership case is the only one that hands `stream()` state the
+        // adapter claims. It drives a plain text corpus, so the kind that
+        // carries it is the text turn.
+        if kind == ScenarioKind::TextTurn {
             scenario.with_owned_replay()
         } else {
             scenario
@@ -402,17 +418,31 @@ impl Scripted {
         })
     }
 
+    /// The fixture's replay-state identity, mirroring a live adapter's.
+    ///
+    /// The fixture is a provider, so it owns a marker of its own: a top-level
+    /// field whose value names it. The harness declares that marker to the suite
+    /// (see `scenario_for`), and the suite drives `owns()` with the documents it
+    /// builds from the declaration — so the predicate here is the ordinary one,
+    /// and the case's bite comes from the *values* differing, not from a shape
+    /// only a fixture would recognise.
+    const MARKER: &'static str = "__fixture_provider";
+    const SELF: &'static str = "fixture-under-test";
+    const FOREIGN: &'static str = "some-other-fixture";
+
     fn owns_state(state: &ReplayState, claim_all: bool) -> bool {
         if claim_all {
             return true;
         }
+        // Read the *value*, not the marker's presence: both documents carry the
+        // field, and an adapter that claimed on presence alone would claim
+        // another provider's state.
         state
             .response
             .as_ref()
-            .and_then(|r| r.get("harnless_conformance_owned"))
-            .and_then(|owner| owner.get("key"))
+            .and_then(|r| r.get(Self::MARKER))
             .and_then(|v| v.as_str())
-            == Some("harnless-conformance-self")
+            == Some(Self::SELF)
     }
 }
 
@@ -519,14 +549,14 @@ impl ModelAdapter for Scripted {
 ///
 /// A provider's own harness writes exactly this shape against its real golden
 /// files.
-fn scenario_for(case: &str) -> Scenario {
-    scenario_for_defect(case, Defect::None)
+fn scenario_for(_case: &str, kind: ScenarioKind) -> Scenario {
+    scenario_for_defect(kind, Defect::None)
 }
 
 /// The scenario factory for one defect: the corpus is the same, and the
 /// provider-published metadata is whatever that defect's adapter appends.
-fn scenario_for_defect(case: &str, defect: Defect) -> Scenario {
-    let scenario = Corpus::for_case(case).scenario(case, defect);
+fn scenario_for_defect(kind: ScenarioKind, defect: Defect) -> Scenario {
+    let scenario = Corpus::for_kind(kind).scenario(kind, defect);
     match defect {
         // A hanging provider is bounded by the scenario's watchdog; a fixture
         // test should not wait out the default ten seconds.
@@ -542,16 +572,16 @@ thread_local! {
 }
 
 /// The factory the negative fixtures drive: reads the running defect.
-fn scenario_for_negative(case: &str) -> Scenario {
-    scenario_for_defect(case, DEFECT.with(|d| d.get()))
+fn scenario_for_negative(_case: &str, kind: ScenarioKind) -> Scenario {
+    scenario_for_defect(kind, DEFECT.with(|d| d.get()))
 }
 
 /// A factory that also records which case is running, so a single adapter
 /// instance can serve the whole suite (each case's corpus differs).
-fn scenario_for_tracking(case: &str) -> Scenario {
-    CURRENT.with(|current| *current.borrow_mut() = Corpus::for_case(case));
+fn scenario_for_tracking(case: &str, kind: ScenarioKind) -> Scenario {
+    CURRENT.with(|current| *current.borrow_mut() = Corpus::for_kind(kind));
     DEFECT.with(|d| d.set(Defect::None));
-    scenario_for(case)
+    scenario_for(case, kind)
 }
 
 thread_local! {
@@ -891,7 +921,13 @@ impl ModelAdapter for MacroAdapter {
     }
 }
 
-fn make_reference() -> MacroAdapter {
+fn make_reference(_case: &str) -> MacroAdapter {
+    MacroAdapter
+}
+
+/// The whole-suite factory: the macro's `full_suite` test drives one adapter
+/// through every case, and this fixture answers whichever corpus is running.
+fn make_reference_full(_cases: &[&str]) -> MacroAdapter {
     MacroAdapter
 }
 
@@ -899,6 +935,7 @@ harnless_conformance::conformance_tests_adapter! {
     reference,
     make_reference,
     scenario_for_tracking,
+    make_reference_full,
     "usage_before_finish",
     "nothing_after_finish",
     "raw_json_tool_arguments",

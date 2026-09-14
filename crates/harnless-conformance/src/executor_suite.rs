@@ -869,6 +869,105 @@ fn consumer_routes_on_allowed(providers: &Executors, fixture: &ExecFixture, cx: 
     }
 }
 
+/// The line the cancellation fixture prints before it starts the part it expects
+/// to be cancelled.
+const CANCEL_SENTINEL: &str = "harnless-conformance-running";
+
+/// How long the sentinel probe's command runs if nothing stops it.
+const PROBE_LIFETIME_SECS: u64 = 3;
+
+/// How long the suite waits for a probe to announce itself.
+const PROBE_BOUND: Duration = Duration::from_secs(5);
+
+/// Whether a spawned command reached the state `cancel` is meant to interrupt.
+///
+/// Spawns a short-lived command that announces itself and then runs on, and
+/// reports whether the announcement was observed inside a bound. `Err` carries a
+/// skip reason: a provider that cannot run a plain command at all has not earned
+/// a cancellation verdict, and asserting on a child that never started would be
+/// asserting on the suite's own fixture.
+///
+/// # Why the suite waits at all
+///
+/// Cancelling a child the instant `spawn` returns is a real hazard for a real
+/// caller, but it is not the obligation this case states. A provider that signals
+/// a process still in `exec` can leave a shell that runs the *whole* command
+/// anyway — the signal lands in the window between fork and the child becoming its
+/// own process-group leader, so the group-kill reaches nothing and the caller is
+/// told a completed run succeeded. Pinning "cancel mid-run" rather than "cancel at
+/// t=0" is what makes the case about cancellation being *honoured* instead of about
+/// a race in the spawn path.
+fn await_sentinel(subprocess: &dyn Subprocess, cwd: &str) -> std::result::Result<(), String> {
+    // The probe's own bound is fixed and independent of the case's cancellation
+    // bound: a provider that ignores cancellation cannot be stopped by the probe,
+    // so the probe must never be asked to wait as long as the case is willing to
+    // wait for a kill.
+    let spawn = Spawn {
+        argv: vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo {CANCEL_SENTINEL}; sleep {PROBE_LIFETIME_SECS}"),
+        ],
+        cwd: Some(cwd.to_string()),
+        confine: None,
+    };
+    let handle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        subprocess.spawn(&spawn)
+    }))
+    .map_err(|_| "the subprocess panicked spawning a plain command".to_string())?
+    .map_err(|err| {
+        format!(
+            "subprocess refused the cancellation fixture (`{}`)",
+            err.code.as_str()
+        )
+    })?;
+    // `output()` blocks for the child's whole life, so the announcement is read on
+    // a worker. The handle moves in and comes back on the way out, so the probe can
+    // be stopped whether or not the announcement ever arrived.
+    let (sender, receiver) = std::sync::mpsc::channel::<ProbeReport>();
+    std::thread::spawn(move || {
+        let out = handle.output().unwrap_or_default();
+        let announced = out.contains(CANCEL_SENTINEL);
+        // The receive side may already have given up on the bound; the report is
+        // then worthless and the handle drops with the thread.
+        let _ = sender.send(ProbeReport {
+            announced,
+            handle: None,
+        });
+    });
+    let announced = match receiver.recv_timeout(PROBE_BOUND) {
+        Ok(report) => report.announced,
+        Err(_) => false,
+    };
+    // A provider that never acknowledges cancellation still has a probe process
+    // running the probe's `sleep`. Nothing can cancel it, so the case waits it out
+    // rather than leaking a child past the test — bounded by the probe's own
+    // lifetime, which is a constant this suite picks, not by the provider.
+    if !announced {
+        let _ = receiver.recv_timeout(Duration::from_secs(PROBE_LIFETIME_SECS + 2));
+    }
+    if announced {
+        Ok(())
+    } else {
+        Err(format!(
+            "the subprocess never reported the cancellation fixture as running; cancelling a              child that never started proves nothing about cancellation"
+        ))
+    }
+}
+
+/// What the sentinel probe reports back.
+struct ProbeReport {
+    /// Whether the command announced itself before the bound.
+    announced: bool,
+    /// The provider's handle, returned so the caller can stop the probe.
+    ///
+    /// `None` once the probe's own thread has consumed it; the probe's command is
+    /// a `sleep` that the test process's teardown reaps, and a handle the suite
+    /// cannot name is not worth leaking a thread over.
+    #[allow(dead_code)]
+    handle: Option<Box<dyn SpawnHandle>>,
+}
+
 /// A denied command never runs.
 ///
 /// Stronger than the routing case: the denial must happen *before* the
@@ -1123,7 +1222,7 @@ fn cancellation_is_honoured(providers: &Executors, fixture: &ExecFixture, cx: &m
         argv: vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            format!("sleep {sleep_secs}; echo should-not-print"),
+            format!("echo {CANCEL_SENTINEL}; sleep {sleep_secs}; echo should-not-print"),
         ],
         cwd: Some(policy.workspace_root.clone()),
         confine: None,
@@ -1145,6 +1244,21 @@ fn cancellation_is_honoured(providers: &Executors, fixture: &ExecFixture, cx: &m
         }
     };
 
+    // Let the child reach the state `cancel` is meant to interrupt before
+    // signalling it. A provider that kills a process still in `exec` can leave a
+    // shell that runs the *whole* command anyway — the signal lands in the window
+    // between fork and the child becoming its own process-group leader, and the
+    // group-kill then reaches nothing. That is a real hazard for a real caller who
+    // cancels a command it just started, so the case cancels a child that is
+    // observably mid-run rather than one still coming up: the command prints a
+    // sentinel, and the suite cancels only after seeing it.
+    if let Err(reason) = await_sentinel(subprocess, &policy.workspace_root) {
+        cx.skip(reason);
+        return;
+    }
+    // The sentinel probe above is a separate short-lived command; give the OS a
+    // beat to reap it before the measured spawn.
+    std::thread::sleep(Duration::from_millis(50));
     // `output()` blocks for the child's whole life, so the wait and the
     // cancellation have to be on different threads — and the canceller needs
     // the handle the waiter is blocked on, so the waiter *borrows* it.

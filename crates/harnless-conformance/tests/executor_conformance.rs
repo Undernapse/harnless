@@ -1229,3 +1229,73 @@ mod negative {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The instantiation macro, exercised on the reference world
+// ---------------------------------------------------------------------------
+
+/// The world the macro's factories build.
+///
+/// The macro calls a plain `fn` item with no arguments, so the world cannot be
+/// captured. It is built on demand and installed as the fixture source, exactly
+/// as the hand-written driver does — the scratch directory is deliberately leaked
+/// into a process-wide slot rather than dropped, because the macro's factory
+/// returns the bundle and nothing holds the world alive afterwards.
+#[cfg(unix)]
+fn make_reference_executors() -> Executors {
+    let world = Box::leak(Box::new(World::new("macro", Defect::None)));
+    install(world);
+    world.executors_with_over()
+}
+
+/// Instantiate the execution-world suite as `#[test]` functions.
+///
+/// This is the same macro a downstream provider calls, so running it here means
+/// a breakage in the macro itself — a case name that no longer resolves, a
+/// factory signature that no longer compiles, a `full_suite` test that never
+/// actually runs the cases — is caught in this crate rather than in a provider's
+/// CI.
+#[cfg(unix)]
+harnless_conformance::conformance_tests_executor! {
+    reference_world,
+    make_reference_executors,
+    fixture_for,
+    "sandbox_sees_exact_argv",
+    "enforced_reason_is_never_blank",
+    "refusal_is_never_reported_as_confined",
+    "consumer_routes_on_allowed",
+    "denied_command_never_runs",
+    "confined_run_is_actually_confined",
+    "cancellation_is_honoured",
+    "failing_command_is_typed_error",
+}
+
+/// The macro's case list must be the suite's case list.
+///
+/// The instantiation above names its cases by hand — that is the point of a
+/// declarative macro — and a hand-written list rots the moment a case is added.
+/// This asserts the two agree, so the macro run here covers the whole suite.
+#[cfg(unix)]
+#[test]
+fn the_macro_instantiation_covers_every_case() {
+    let named: std::collections::BTreeSet<&str> = MACRO_CASES.iter().copied().collect();
+    let suite: std::collections::BTreeSet<&str> =
+        EXECUTOR_CONFORMANCE_CASES.iter().copied().collect();
+    assert_eq!(
+        named, suite,
+        "the macro instantiation and the suite's case list disagree"
+    );
+}
+
+/// The cases named in the instantiation above.
+#[cfg(unix)]
+const MACRO_CASES: &[&str] = &[
+    "sandbox_sees_exact_argv",
+    "enforced_reason_is_never_blank",
+    "refusal_is_never_reported_as_confined",
+    "consumer_routes_on_allowed",
+    "denied_command_never_runs",
+    "confined_run_is_actually_confined",
+    "cancellation_is_honoured",
+    "failing_command_is_typed_error",
+];

@@ -61,17 +61,25 @@ use serde_json::Value;
 
 use crate::types::Violation;
 
-/// The response-metadata key the ownership cases stamp replay state with.
+/// The marker document the ownership cases stamp replay state with.
 ///
-/// Replay state is adapter-private, so the suite cannot know a provider's
-/// real marker. The ownership cases instead build state the *harness*
-/// declares claimable: [`Scenario::with_owned_replay`] and
-/// [`Scenario::foreign_replay_state`] each carry a key/value pair, and the
-/// case asserts only the relationship — the adapter must claim the state
-/// the harness says is its own and refuse the state the harness says
-/// belongs to someone else. Which literal marker means "mine" stays the
+/// The marker is a **top-level** field named by the harness — it *is* the
+/// adapter's own marker, not a copy of it filed under a key of the suite's.
+/// That is what makes the case portable: the suite asks each provider "which
+/// field of your response metadata do you stamp into replay state, and what
+/// value names you?" ([`Scenario::ownership_marker`]) and drives `owns()` with
+/// exactly that field. A suite-namespaced wrapper would be a document no shipped
+/// adapter has any reason to recognise, and a pass would prove nothing about the
+/// real handoff.
+///
+/// Replay state stays adapter-private: the suite never interprets the state's
+/// *body*, only whether the adapter claims it. The case asserts the
+/// relationship — claim what the harness says is yours, refuse what the harness
+/// says is someone else's — and which literal marker means "mine" remains the
 /// provider's business, exactly as on the live seam.
-const OWNED_MARKER_KEY: &str = "harnless_conformance_owned";
+fn marker_metadata(key: &str, value: &str) -> Value {
+    serde_json::json!({ key: value })
+}
 
 /// Every adapter conformance case, in suite order.
 pub const ADAPTER_CONFORMANCE_CASES: &[&str] = &[
@@ -140,6 +148,13 @@ pub struct Scenario {
     /// watchdog" is the one contract obligation a conformance run can only
     /// observe as a timeout.
     pub stall_timeout: Duration,
+    /// The harness's declaration of the adapter's own replay-ownership marker.
+    ///
+    /// `Some((key, value))` where `key` names the response-metadata field the
+    /// adapter stamps into its replay state and `value` is the value that names
+    /// *this* adapter. `None` leaves the suite's placeholder in place, which no
+    /// shipped adapter stamps — see [`Scenario::ownership_marker`].
+    pub ownership: Option<(String, String)>,
 }
 
 impl Scenario {
@@ -156,6 +171,7 @@ impl Scenario {
             failure: None,
             frame_drift_tolerated: false,
             stall_timeout: Duration::from_secs(10),
+            ownership: None,
         }
     }
 
@@ -246,57 +262,171 @@ impl Scenario {
         self
     }
 
+    /// Declare the adapter's own replay-ownership marker.
+    ///
+    /// Replay state is adapter-private, so the suite cannot know which field of
+    /// the provider's response metadata ends up stamped into it, nor which value
+    /// of that field names the adapter. The ownership case would otherwise drive
+    /// `owns()` with a document the adapter has no reason to recognise, and a
+    /// pass would prove nothing about the real handoff. A provider harness
+    /// declares the pair here and the suite builds *both* ownership documents
+    /// from it — the claimed one carrying `value`, the foreign one carrying a
+    /// value no honest identity of this adapter carries.
+    ///
+    /// A harness that declares nothing gets [`OWNED_STATE_KEY`]/
+    /// [`OWNED_STATE_VALUE`], deliberately not any shipped adapter's real
+    /// marker: an undeclared adapter then **fails** the ownership case rather
+    /// than passing it by accident.
+    #[must_use]
+    pub fn ownership_marker(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.ownership = Some((key.into(), value.into()));
+        self
+    }
+
+    /// The marker key this scenario declares, or the suite's placeholder.
+    #[must_use]
+    pub fn marker_key(&self) -> &str {
+        self.ownership
+            .as_ref()
+            .map_or(OWNED_STATE_KEY, |(key, _)| key.as_str())
+    }
+
+    /// The marker value naming this adapter, or the suite's placeholder.
+    #[must_use]
+    pub fn owned_marker_value(&self) -> &str {
+        self.ownership
+            .as_ref()
+            .map_or(OWNED_STATE_VALUE, |(_, value)| value.as_str())
+    }
+
+    /// The value this scenario declares as *another* provider's.
+    ///
+    /// The suite cannot know which values an adapter recognises, so the foreign
+    /// value is derived from the declared owned value rather than guessed at:
+    /// the adapter's own value with a suffix no honest identity carries. The
+    /// case's question is only "does this adapter claim state it did not
+    /// stamp?", and a derived value answers it for any marker.
+    fn foreign_marker_value(&self) -> String {
+        format!("{}{}", self.owned_marker_value(), "-not-me")
+    }
+
     /// Response metadata declaring replay state to be this adapter's own.
     #[must_use]
-    pub fn owned_response_metadata() -> Value {
-        marker_metadata(OWNED_STATE_KEY, OWNED_STATE_VALUE)
+    pub fn owned_response_metadata(&self) -> Value {
+        marker_metadata(self.marker_key(), self.owned_marker_value())
     }
 
     /// Response metadata declaring replay state to be another provider's.
+    ///
+    /// Same key, a value no adapter recognises: an adapter that claims *this*
+    /// is claiming state it cannot interpret.
     #[must_use]
-    pub fn foreign_response_metadata() -> Value {
-        marker_metadata(FOREIGN_STATE_KEY, FOREIGN_STATE_VALUE)
+    pub fn foreign_response_metadata(&self) -> Value {
+        marker_metadata(self.marker_key(), &self.foreign_marker_value())
     }
 
-    /// Set [`Scenario::replay`] to the state this suite's ownership case
-    /// declares to be the adapter's own.
+    /// Set [`Scenario::replay`] to the state this scenario declares to be the
+    /// adapter's own.
     #[must_use]
     pub fn with_owned_replay(mut self) -> Self {
-        self.replay = Some(Self::owned_replay_state());
+        self.replay = Some(self.owned_replay_state());
         self
     }
 
     /// The state [`Scenario::with_owned_replay`] installs, exposed so a
     /// harness can build the same value for an `owns` assertion.
+    ///
+    /// Built from this scenario's declared marker, so a harness asserting on
+    /// this value and the suite driving `owns()` with it are guaranteed to be
+    /// looking at the same document.
     #[must_use]
-    pub fn owned_replay_state() -> ReplayState {
+    pub fn owned_replay_state(&self) -> ReplayState {
         ReplayState {
-            response: Some(Self::owned_response_metadata()),
+            response: Some(self.owned_response_metadata()),
             blocks: Vec::new(),
         }
     }
 
     /// The foreign-owner state the ownership case asserts against.
     #[must_use]
-    pub fn foreign_replay_state() -> ReplayState {
+    pub fn foreign_replay_state(&self) -> ReplayState {
         ReplayState {
-            response: Some(Self::foreign_response_metadata()),
+            response: Some(self.foreign_response_metadata()),
             blocks: Vec::new(),
         }
     }
 }
 
-/// The marker document the ownership cases key on.
-fn marker_metadata(key: &str, value: &str) -> Value {
-    serde_json::json!({ OWNED_MARKER_KEY: { "key": key, "value": value } })
+/// The corpus shape an adapter conformance case drives.
+///
+/// The suite's case names are about *obligations* ("nothing after finish"),
+/// which say nothing to a provider harness about what to script. The kind does:
+/// it is the small vocabulary of turn shapes the suite's cases are built from,
+/// so a harness can write one corpus per shape and map several cases onto it.
+/// A harness that wants to distinguish two cases sharing a kind gets the case
+/// name as well — see [`ScenarioFactory`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScenarioKind {
+    /// A plain completed text turn.
+    TextTurn,
+    /// A turn ending in a tool call.
+    ToolTurn,
+    /// A turn ending in-band with a provider failure.
+    ///
+    /// The failure's code is part of the corpus, not the shape: a generic
+    /// provider failure and a canonical context overflow are different corpora
+    /// and the suite asserts the exact code, so they are separate kinds.
+    FailedTurn,
+    /// A turn ending in-band with the canonical context-overflow failure.
+    ContextOverflowTurn,
+    /// A completion with no content at all.
+    SilentTurn,
+    /// A turn whose blocks are emitted in descending index order.
+    InterleavedTurn,
+}
+
+impl ScenarioKind {
+    /// The corpus the suite's `case` drives.
+    #[must_use]
+    pub fn for_case(case: &str) -> Self {
+        match case {
+            "raw_json_tool_arguments" => Self::ToolTurn,
+            "sanctioned_failure_paths" | "in_band_failure_is_terminal" => Self::FailedTurn,
+            "context_overflow_canonical_code" => Self::ContextOverflowTurn,
+            "empty_completion_is_retryable_failure" => Self::SilentTurn,
+            "replay_alignment_is_emission_order" => Self::InterleavedTurn,
+            _ => Self::TextTurn,
+        }
+    }
 }
 
 /// A provider's scenario library: builds the scripted turn one case drives.
 ///
-/// A plain `fn` item is `Send + Sync + 'static`, so the suite entry points
-/// take a function pointer. Each case asks for its own scenario, which
-/// keeps the suite independent of any one adapter's corpus format.
-pub type ScenarioFactory = fn(&str) -> Scenario;
+/// Takes the case name and the [`ScenarioKind`] it drives, and returns the
+/// scenario. The kind is the useful half — it says which corpus to script
+/// without the harness having to know the suite's case list — and the name is
+/// the escape hatch for the handful of cases that share a corpus but assert
+/// different things about it (`sanctioned_failure_paths` and
+/// `in_band_failure_is_terminal` both drive a failed turn; a provider with a
+/// throw-on-broken-corpus path needs the name to script the throw variant).
+/// A harness that does not care about the name takes `_` for it.
+///
+/// # Why the case name, and not a corpus index
+///
+/// A harness whose adapter answers "call *n* gets recording *n*" would like the
+/// suite to hand it *n*. It cannot, and the reason is the suite's own shape: the
+/// stream is driven on a worker thread so a stalled provider produces a
+/// violation instead of hanging the run, so any per-case state a harness keeps
+/// on the test thread is invisible to its own adapter factory. Naming the case
+/// lets a harness index its script by case, which is stable under a provider
+/// adding or reordering cases in *its* table — where a call index would silently
+/// serve the wrong corpus the moment the suite's case list and the harness's
+/// script disagreed.
+///
+/// A plain `fn` item is `Send + Sync + 'static`, so the suite entry points take a
+/// function pointer. Each case asks for its own scenario, which keeps the suite
+/// independent of any one adapter's corpus format.
+pub type ScenarioFactory = fn(&str, ScenarioKind) -> Scenario;
 
 /// Run the whole adapter suite against `adapter` with `scenario_for` as the
 /// corpus.
@@ -306,8 +436,28 @@ pub fn check_model_adapter_contract_all(
     adapter: &dyn ModelAdapter,
     scenario_for: ScenarioFactory,
 ) -> Vec<Violation> {
+    check_model_adapter_cases(adapter, scenario_for, ADAPTER_CONFORMANCE_CASES)
+}
+
+/// Run the named cases against one adapter, in the given order.
+///
+/// The whole-suite entry point is this with [`ADAPTER_CONFORMANCE_CASES`]. It is
+/// public because a harness whose adapter is scripted *per case* cannot serve
+/// the whole-suite run with a per-case adapter: it needs one script holding every
+/// case's corpus, and the only way to pair a corpus with a case is to know which
+/// cases are being run and in what order. The [`conformance_tests_adapter`]
+/// macro's `full_suite` test passes exactly the list it names, so the harness's
+/// script and the suite's drive stay in step by construction.
+///
+/// Unknown case names yield a violation naming them, as on the per-case entry
+/// point.
+pub fn check_model_adapter_cases(
+    adapter: &dyn ModelAdapter,
+    scenario_for: ScenarioFactory,
+    cases: &[&str],
+) -> Vec<Violation> {
     let mut out = Vec::new();
-    for case in ADAPTER_CONFORMANCE_CASES {
+    for case in cases {
         check_case_into(adapter, scenario_for, case, &mut out);
     }
     out
@@ -340,7 +490,7 @@ fn check_case_into(
     // the provider misbehaving on the suite's input, and a panic is a
     // contract violation, never a crash.
     let scenario = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (scenario_for)(case)
+        (scenario_for)(case, ScenarioKind::for_case(case))
     })) {
         Ok(scenario) => scenario,
         Err(_) => {
@@ -365,7 +515,7 @@ fn check_case_into(
             context_overflow_canonical_code(adapter, &scenario, &mut cx)
         }
         "disjoint_usage" => disjoint_usage(adapter, &scenario, &mut cx),
-        "replay_state_ownership" => replay_state_ownership(adapter, &mut cx),
+        "replay_state_ownership" => replay_state_ownership(&scenario, adapter, &mut cx),
         "replay_alignment_is_emission_order" => {
             replay_alignment_is_emission_order(adapter, &scenario, &mut cx)
         }
@@ -527,6 +677,7 @@ fn describe(event: &StreamEvent) -> String {
 /// recorded as a throw, one that panics is recorded as a panic, and one
 /// that hangs is recorded as a stall.
 fn drive(adapter: &dyn ModelAdapter, scenario: &Scenario) -> Collected {
+
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         adapter.stream(
             harnless_seams::CallId(1),
@@ -1231,9 +1382,9 @@ fn disjoint_usage(adapter: &dyn ModelAdapter, scenario: &Scenario, cx: &mut Cx) 
 /// ([`Scenario::foreign_replay_state`]); the case asserts the adapter's
 /// `owns` agrees with the declaration. A provider whose `owns` ignores the
 /// marker — claiming everything — is the failure mode this case exists for.
-fn replay_state_ownership(adapter: &dyn ModelAdapter, cx: &mut Cx) {
-    let owned = Scenario::owned_replay_state();
-    let foreign = Scenario::foreign_replay_state();
+fn replay_state_ownership(scenario: &Scenario, adapter: &dyn ModelAdapter, cx: &mut Cx) {
+    let owned = scenario.owned_replay_state();
+    let foreign = scenario.foreign_replay_state();
     let bare = ReplayState::default();
 
     // `owns` is the one seam method the suite calls outside a stream, so it
@@ -1460,14 +1611,29 @@ mod tests {
 
     #[test]
     fn ownership_markers_are_distinguishable() {
+        let declared = Scenario::new(Vec::new()).ownership_marker("__provider", "me");
         assert_ne!(
-            Scenario::owned_response_metadata(),
-            Scenario::foreign_response_metadata()
+            declared.owned_response_metadata(),
+            declared.foreign_response_metadata()
         );
         assert_eq!(
-            Scenario::owned_replay_state().response,
-            Some(Scenario::owned_response_metadata())
+            declared.owned_replay_state().response,
+            Some(declared.owned_response_metadata())
         );
+        // The marker is the harness's own top-level field, not a suite wrapper.
+        assert_eq!(
+            declared.owned_response_metadata(),
+            serde_json::json!({ "__provider": "me" })
+        );
+        // A harness that declares nothing gets the placeholder, which no shipped
+        // adapter stamps — so an undeclared adapter fails the ownership case
+        // rather than passing it by accident.
+        let undeclared = Scenario::new(Vec::new());
+        assert_eq!(
+            undeclared.owned_response_metadata(),
+            serde_json::json!({ OWNED_STATE_KEY: OWNED_STATE_VALUE })
+        );
+        assert_ne!(undeclared.marker_key(), "__provider");
     }
 
     #[test]
@@ -1508,7 +1674,7 @@ mod tests {
                 panic!("provider exploded")
             }
         }
-        fn scenario_for(_case: &str) -> Scenario {
+        fn scenario_for(_case: &str, _kind: ScenarioKind) -> Scenario {
             Scenario::new(Vec::new())
         }
         let violations =
@@ -1539,7 +1705,7 @@ mod tests {
                 Err(harnless_seams::SeamError::code(ErrorCode::ProviderFailure))
             }
         }
-        fn scenario_for(_case: &str) -> Scenario {
+        fn scenario_for(_case: &str, _kind: ScenarioKind) -> Scenario {
             Scenario::new(Vec::new())
         }
         let violations = check_model_adapter_contract(&Noop, "not-a-case", scenario_for);
