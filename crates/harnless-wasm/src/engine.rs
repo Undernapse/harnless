@@ -88,8 +88,8 @@ pub fn build_linker(
         impl HasData for WasiIo {
             type Data<'a> = &'a mut wasmtime::component::ResourceTable;
         }
-        use wasmtime_wasi::p2::bindings as b;
         use wasmtime_wasi::filesystem::WasiFilesystemView as _;
+        use wasmtime_wasi::p2::bindings as b;
         use wasmtime_wasi::WasiView as _;
         wasmtime_wasi_io::bindings::wasi::io::error::add_to_linker::<PluginState, WasiIo>(
             &mut linker,

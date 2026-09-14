@@ -196,8 +196,7 @@ fn mount(manager: &WasmPluginManager, spine: &Spine, p: &mut FakePlugin) -> u64 
     let plugin_ctx = spine.ctx.extend();
     plugin_ctx.set_fiber(p.fiber.clone());
 
-    let entries: Arc<Mutex<Vec<(String, Arc<dyn ToolBody>)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let entries: Arc<Mutex<Vec<(String, Arc<dyn ToolBody>)>>> = Arc::new(Mutex::new(Vec::new()));
     for spec in &p.descriptor.tools {
         let name = format!("{}.{}", p.descriptor.name, spec.name);
         spine
@@ -214,7 +213,11 @@ fn mount(manager: &WasmPluginManager, spine: &Spine, p: &mut FakePlugin) -> u64 
         entries.lock().push((name, p.body.clone()));
     }
     let names = Arc::new(Mutex::new(
-        entries.lock().iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        entries
+            .lock()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect::<Vec<_>>(),
     ));
 
     // The shipped loader's reversibility: the handle's single strong owner is

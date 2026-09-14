@@ -228,9 +228,8 @@ impl WasmPluginManager {
         ctx: &Context,
         config: &PluginConfig,
     ) -> Result<Arc<ToolRegistry>, String> {
-        ctx.get::<ToolRegistry>().ok_or_else(|| {
-            format!("plugin {}: no ToolRegistry service on context", config.id)
-        })
+        ctx.get::<ToolRegistry>()
+            .ok_or_else(|| format!("plugin {}: no ToolRegistry service on context", config.id))
     }
 
     /// Mount one plugin on `ctx`, registering its tools on `registry` — the
@@ -308,8 +307,9 @@ impl WasmPluginManager {
                 .map_err(|e| format!("plugin {}: register {name}: {e:?}", config.id))?;
             entries.lock().push((name, body));
         }
-        let names: RegisteredTools =
-            Arc::new(Mutex::new(entries.lock().iter().map(|(n, _)| n.clone()).collect()));
+        let names: RegisteredTools = Arc::new(Mutex::new(
+            entries.lock().iter().map(|(n, _)| n.clone()).collect(),
+        ));
 
         // The reversible handle. `commit` gives its *single* strong owner to an
         // effect on the plugin's fiber, so the mount's tools disappear exactly
@@ -512,7 +512,9 @@ impl WasmPluginManager {
     pub fn reload_all(&self, ctx: &Context, configs: &[PluginConfig]) -> Result<(), String> {
         let registry = self.registry_from(
             ctx,
-            configs.first().ok_or_else(|| "no configs to reload".to_string())?,
+            configs
+                .first()
+                .ok_or_else(|| "no configs to reload".to_string())?,
         )?;
         // Phase 1: stage every config. On any failure, unwind the staged
         // mounts and leave the live tree exactly as it was.

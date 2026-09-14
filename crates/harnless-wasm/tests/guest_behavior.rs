@@ -133,9 +133,7 @@ fn a_component_tool_executes_end_to_end_through_the_guarded_pipeline() {
 fn a_guest_trap_is_isolated_to_its_own_plugin() {
     let (manager, config) = mount_fixture(Behavior::Boom, false);
     let h = Harness::new(SessionId(1502));
-    manager
-        .mount_on(&h.tools, &config)
-        .expect("boom mounts");
+    manager.mount_on(&h.tools, &config).expect("boom mounts");
     let _allow = h.allow_all();
 
     let err = h
@@ -292,9 +290,7 @@ fn the_fs_grant_is_the_only_filesystem_the_guest_can_reach() {
 fn a_real_mount_tears_down_its_own_fiber() {
     let (manager, config) = mount_fixture(Behavior::FsRead, false);
     let h = Harness::new(SessionId(1505));
-    manager
-        .mount_on(&h.tools, &config)
-        .expect("fs mounts");
+    manager.mount_on(&h.tools, &config).expect("fs mounts");
     let mounted = manager
         .mounted_fibers()
         .into_iter()
