@@ -267,9 +267,9 @@ impl Corpus {
     /// `marker` is the ownership-marker *value* stamped into the scenario:
     /// exactly [`PROVIDER`], which is what [`ReplayAdapter::owns`]
     /// exact-name-matches. The whole-suite harness routes a stream by the
-    /// running case's *index* — a process-wide slot the scenario factory
-    /// writes and the wrapper reads (see [`WholeSuite`]) — so the scenario
-    /// itself never carries harness state.
+    /// scenario's own identity — messages, tools, and replay state (see
+    /// [`WholeSuite`]) — so the scenario needs no harness state stamped into
+    /// it; `marker` is only ever [`PROVIDER`].
     fn scenario(&self, kind: ScenarioKind, marker: &str) -> Scenario {
         // The suite cannot know which key this adapter stamps into replay state,
         // so the harness declares it up front — before any ownership document is
@@ -392,7 +392,8 @@ fn scenario_for(case: &str, kind: ScenarioKind) -> Scenario {
     // identity, so the whole-suite adapter serves it to the stream this case
     // opens (see [`WholeSuite`]). Registration happens on the test thread
     // before the scenario leaves the factory, and the suite's drive thread only
-    // ever looks the key up after that.
+    // ever looks the key up after that; a lookup that misses is a harness bug
+    // and panics as a suite violation.
     WholeSuite::register(&scenario, restored);
     scenario
 }
@@ -452,12 +453,12 @@ fn make_adapter(case: &str) -> ReplayAdapter {
 /// failed-turn cases — share a recording too, which is exactly right: their
 /// corpora are the same.)
 ///
-/// A scenario this harness never registered (a hand-built scenario from a
-/// sibling suite's shared fixture) falls back to the text-turn corpus, which is
-/// what such a scenario describes.
+/// A scenario this harness never registered is a harness bug — the registry
+/// miss is reported as a violation (the suite catches the panic), never
+/// papered over by serving some other corpus: a fallback that replays *a*
+/// corpus turns "the pairing broke" into a green run, which is the exact
+/// failure mode this design exists to make impossible.
 struct WholeSuite {
-    /// The fallback corpus for foreign scenarios (see [`WholeSuite`]).
-    fallback: Recording,
     /// A replay adapter used only for its `owns` contract — ownership is
     /// identity-based, so any adapter under this provider's identity answers
     /// identically for every case.
@@ -466,9 +467,9 @@ struct WholeSuite {
 
 /// A scenario's observable identity: what `stream` is handed.
 ///
-/// JSON-serialising the pieces keeps the key total (the seam types are `Debug`
-/// and `PartialEq`, not `Hash`) and makes key equality exactly the scenarios'
-/// observable equality.
+/// Rendering the pieces with `Debug` keeps the key total (the seam types are
+/// `Debug` + `PartialEq`; `Value` hashing is not an equality contract here)
+/// and makes key equality the scenarios' observable equality.
 #[derive(PartialEq, Eq, Hash)]
 struct ScenarioKey(String);
 
@@ -476,12 +477,20 @@ struct ScenarioKey(String);
 ///
 /// Process-wide because the suite's scenario factory is a plain `fn` item — it
 /// receives no adapter to register with — so the only object the factory can
-/// reach is a static. Entries are keyed by scenario identity, so even the
-/// per-case tests' registrations (which the whole-suite run never looks up,
-/// since those scenarios drive their own per-case adapters) cannot mis-pair a
-/// case: a lookup returns the recording registered for *that scenario*.
+/// reach is a static. Entries are keyed by scenario identity, so the
+/// per-case tests' registrations cannot mis-pair a case: they write the same
+/// key→recording pair the whole-suite run writes for the same case (idempotent
+/// writes, not a race), and a lookup returns the recording registered for
+/// *that* scenario. The lock is taken with poison recovery (`into_inner`): the
+/// only mutation is a single `insert`, so a poisoned map is still consistent,
+/// and failing here names the real cause rather than a sibling test's lock.
 static ROUTES: LazyLock<Mutex<std::collections::HashMap<ScenarioKey, Recording>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// The route registry, with poison recovery at the call sites (see [`ROUTES`]).
+fn routes() -> &'static Mutex<std::collections::HashMap<ScenarioKey, Recording>> {
+    &ROUTES
+}
 
 impl WholeSuite {
     /// Register the recording a scenario drives, keyed by its identity.
@@ -491,7 +500,10 @@ impl WholeSuite {
             &scenario.tools,
             scenario.replay.as_ref(),
         );
-        ROUTES.lock().expect("route map").insert(key, recording);
+        routes()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, recording);
     }
 }
 
@@ -524,12 +536,16 @@ impl harnless_seams::llm::ModelAdapter for WholeSuite {
         replay: Option<ReplayState>,
     ) -> harnless_seams::error::Result<harnless_seams::llm::BoxStream> {
         let key = scenario_key(messages, tools, replay.as_ref());
-        let recording = ROUTES
+        let recording = routes()
             .lock()
-            .expect("route map")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&key)
             .cloned()
-            .unwrap_or_else(|| self.fallback.clone());
+            .expect(
+                "scenario_for registers every scenario it builds before the \
+                 suite drives it; a miss is a harness pairing bug, not a \
+                 provider violation",
+            );
         self.owner.stream_recording(&recording)
     }
 }
@@ -543,7 +559,6 @@ impl harnless_seams::llm::ModelAdapter for WholeSuite {
 /// builds scenarios.
 fn make_full_suite_adapter(_cases: &[&str]) -> WholeSuite {
     WholeSuite {
-        fallback: Corpus::text_turn().recording(),
         owner: ReplayAdapter::new(PROVIDER, Script::one(Corpus::text_turn().recording())),
     }
 }

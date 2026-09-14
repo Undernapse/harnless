@@ -419,6 +419,71 @@ mod tests {
         assert_eq!(err.code, ErrorCode::ProviderFailure);
     }
 
+    #[tokio::test]
+    async fn stream_recording_leaves_the_script_untouched() {
+        // The two properties that distinguish `stream_recording` from
+        // `stream`: the call counter never moves, and no script slot is
+        // consumed. A regression on either keeps a per-call-corpus harness
+        // green while silently breaking every script-ordered consumer, so
+        // the pin lives here, at the adapter.
+        let first = sample_recording();
+        let mut second = sample_recording();
+        let last = second.frames.len() - 1;
+        second.frames.insert(
+            last,
+            RecordedFrame::TextDelta {
+                index: 0,
+                text: " (second)".into(),
+            },
+        );
+        let adapter = ReplayAdapter::new("openai", Script::new(vec![first.clone(), second]));
+
+        // An out-of-band recording replays through the same rules...
+        let events: Vec<StreamEvent> = {
+            let mut stream = adapter
+                .stream_recording(&first)
+                .expect("valid recording streams");
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                events.push(event);
+            }
+            events
+        };
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Frame(StreamFrame::Finish))),
+            "a per-call recording must replay under the same terminal rules"
+        );
+        assert_eq!(adapter.calls(), 0, "the call counter must not move");
+
+        // ...and the script still answers from slot one.
+        let scripted_first = collect(&adapter).await;
+        let scripted_second = collect(&adapter).await;
+        assert_ne!(
+            scripted_first, scripted_second,
+            "the per-call stream must not have consumed a script slot"
+        );
+        assert_eq!(adapter.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_recording_throws_on_a_broken_corpus() {
+        // Same entry discipline as the scripted path: a corpus violating the
+        // protocol is a fixture mistake thrown at the entry, never an
+        // in-band outcome a caller could retry past.
+        let bad = Recording {
+            frames: vec![RecordedFrame::Finish, RecordedFrame::Finish],
+            ..Recording::default()
+        };
+        let adapter = ReplayAdapter::builder(sample_recording()).build();
+        let err = match adapter.stream_recording(&bad) {
+            Err(err) => err,
+            Ok(_) => panic!("a corpus with two terminals must throw"),
+        };
+        assert_eq!(err.code, ErrorCode::ProviderFailure);
+    }
+
     #[test]
     fn owns_state_stamped_with_the_provider_marker() {
         let adapter = ReplayAdapter::builder(sample_recording())
