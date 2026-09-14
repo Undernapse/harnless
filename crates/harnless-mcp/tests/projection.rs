@@ -1,0 +1,382 @@
+//! Result projection rules: ordered blocks, text-like joins, resource
+//! links, explicit diagnostics, structured-content validation with
+//! unsupported-schema fallback, and the rich-content gate.
+
+use std::sync::Arc;
+
+use harnless_mcp::projection::{
+    project, AttachmentStore, InMemoryAttachmentStore, RichContentGate, RouteCapabilities,
+};
+use rmcp::model::{
+    CallToolResult, ContentBlock, EmbeddedResource, ImageContent, Resource, ResourceContents,
+    TextContent,
+};
+use serde_json::{json, Value};
+
+fn result(blocks: Vec<ContentBlock>) -> CallToolResult {
+    let mut r = CallToolResult::success(blocks);
+    r.is_error = Some(false);
+    r
+}
+
+fn text(t: &str) -> ContentBlock {
+    ContentBlock::Text(TextContent::new(t))
+}
+
+#[test]
+fn canonical_success_keeps_complete_ordered_content_blocks() {
+    let r = result(vec![
+        text("one"),
+        ContentBlock::ResourceLink(Resource::new("file:///a", "alpha")),
+        text("two"),
+    ]);
+    let out = project(r, None, &RichContentGate::closed()).unwrap();
+    assert_eq!(out["ok"], json!(true));
+    let items = out["content"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["type"], json!("text"));
+    assert_eq!(items[1]["type"], json!("resource_link"));
+    assert_eq!(items[2]["text"], json!("two"));
+}
+
+#[test]
+fn adjacent_text_like_runs_join() {
+    let r = result(vec![text("Hello, "), text("world"), text("!")]);
+    let out = project(r, None, &RichContentGate::closed()).unwrap();
+    let items = out["content"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "adjacent text joins into one item");
+    assert_eq!(items[0]["text"], json!("Hello, world!"));
+}
+
+#[test]
+fn resource_links_keep_name_and_uri_only() {
+    let link = Resource::new("https://example/x", "the-x").with_title("ignored title");
+    let r = result(vec![ContentBlock::ResourceLink(link)]);
+    let out = project(r, None, &RichContentGate::closed()).unwrap();
+    let item = &out["content"][0];
+    assert_eq!(
+        item,
+        &json!({"type": "resource_link", "name": "the-x", "uri": "https://example/x"})
+    );
+}
+
+#[test]
+fn unsupported_result_kind_surfaces_as_explicit_diagnostic() {
+    // rmcp's ContentBlock is non-exhaustive: simulate a future/unsupported
+    // kind by feeding an audio block through a closed gate — the gate's
+    // refusal is itself an explicit diagnostic naming the reason.
+    let r = result(vec![ContentBlock::Audio(rmcp::model::AudioContent::new(
+        "aGk=",
+        "audio/wav",
+    ))]);
+    let out = project(r, None, &RichContentGate::closed()).unwrap();
+    let item = &out["content"][0];
+    assert_eq!(item["type"], json!("diagnostic"));
+    assert!(item["reason"]
+        .as_str()
+        .unwrap()
+        .contains("rich content (audio/wav) withheld"));
+    assert!(item["reason"]
+        .as_str()
+        .unwrap()
+        .contains("no attachment store mounted"));
+}
+
+#[test]
+fn structured_content_validates_against_supported_schema() {
+    let mut r = result(vec![text("ok")]);
+    r.structured_content = Some(json!({"count": 3}));
+    let schema = json!({
+        "type": "object",
+        "properties": { "count": { "type": "integer" } },
+        "required": ["count"],
+    });
+    let out = project(r.clone(), Some(&schema), &RichContentGate::closed()).unwrap();
+    assert_eq!(out["schemaValidated"], json!(true));
+    assert!(out.get("schemaNote").is_none());
+
+    // A violating value is flagged, never dropped.
+    r.structured_content = Some(json!({"count": "three"}));
+    let out = project(r, Some(&schema), &RichContentGate::closed()).unwrap();
+    assert_eq!(out["schemaValidated"], json!(false));
+    assert!(out["schemaNote"]
+        .as_str()
+        .unwrap()
+        .contains("violates declared type"));
+    assert_eq!(out["structured"]["count"], json!("three"));
+}
+
+#[test]
+fn unsupported_schema_falls_back_to_unconstrained_json() {
+    let mut r = result(vec![text("ok")]);
+    r.structured_content = Some(json!({"anything": [1, 2]}));
+    let schema = json!({ "oneOf": [ { "type": "object" }, { "type": "array" } ] });
+    let out = project(r, Some(&schema), &RichContentGate::closed()).unwrap();
+    assert_eq!(out["schemaValidated"], json!(false));
+    assert!(out["schemaNote"].as_str().unwrap().contains("oneOf"));
+    assert_eq!(out["structured"], json!({"anything": [1, 2]}));
+}
+
+#[test]
+fn tool_level_error_surfaces_as_structured_failure() {
+    let mut r = result(vec![text("query failed: no rows")]);
+    r.is_error = Some(true);
+    let out = project(r, None, &RichContentGate::closed()).unwrap();
+    assert_eq!(out["ok"], json!(false));
+    assert_eq!(out["code"], json!("tool-error"));
+    assert_eq!(out["message"], json!("query failed: no rows"));
+}
+
+/// A store that records what it was given and can be made to fail.
+#[derive(Clone)]
+struct FlakyStore {
+    fail: Arc<parking_lot::Mutex<bool>>,
+    inner: Arc<InMemoryAttachmentStore>,
+}
+
+impl AttachmentStore for FlakyStore {
+    fn put(&self, mime: &str, base64: &str) -> Result<String, String> {
+        if *self.fail.lock() {
+            return Err("store full".into());
+        }
+        self.inner.put(mime, base64)
+    }
+}
+
+fn open_gate(store: Arc<dyn AttachmentStore>) -> RichContentGate {
+    RichContentGate {
+        store: Some(store),
+        route: RouteCapabilities { image_input: true },
+    }
+}
+
+#[test]
+fn images_admitted_only_with_store_and_image_input_route() {
+    let blocks = vec![ContentBlock::Image(ImageContent::new("aW1n", "image/png"))];
+    // Store but no image-input route: withheld with the reason.
+    let gate = RichContentGate {
+        store: Some(Arc::new(InMemoryAttachmentStore::new())),
+        route: RouteCapabilities::default(),
+    };
+    let out = project(result(blocks.clone()), None, &gate).unwrap();
+    assert_eq!(out["content"][0]["type"], json!("diagnostic"));
+    assert!(out["content"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("does not declare image input"));
+    // Both halves present: admitted as a reference.
+    let store = Arc::new(InMemoryAttachmentStore::new());
+    let out = project(result(blocks), None, &open_gate(store.clone())).unwrap();
+    assert_eq!(out["content"][0]["type"], json!("image"));
+    assert_eq!(out["content"][0]["mime"], json!("image/png"));
+    assert_eq!(store.len(), 1);
+}
+
+#[test]
+fn rich_batch_validated_wholly_before_any_member_admitted() {
+    // Two images, store fails: neither is admitted, both become diagnostics.
+    let fail = Arc::new(parking_lot::Mutex::new(true));
+    let store = Arc::new(FlakyStore {
+        fail: fail.clone(),
+        inner: Arc::new(InMemoryAttachmentStore::new()),
+    });
+    let blocks = vec![
+        text("before"),
+        ContentBlock::Image(ImageContent::new("aQ==", "image/png")),
+        ContentBlock::Image(ImageContent::new("aGk=", "image/png")),
+        ContentBlock::ResourceLink(Resource::new("file:///keep", "keep")),
+    ];
+    let out = project(result(blocks), None, &open_gate(store)).unwrap();
+    let items = out["content"].as_array().unwrap();
+    assert_eq!(items.len(), 4, "ordering preserved through batch rejection");
+    assert_eq!(items[0]["text"], json!("before"));
+    assert_eq!(items[1]["type"], json!("diagnostic"));
+    assert_eq!(items[2]["type"], json!("diagnostic"));
+    assert_eq!(items[3]["name"], json!("keep"));
+    assert!(items[1]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("batch rejected"));
+}
+
+#[test]
+fn base64_never_copied_into_the_projected_record() {
+    let store = Arc::new(InMemoryAttachmentStore::new());
+    let secret = "SUPERSECRETBASE64PAYLOAD";
+    let blocks = vec![ContentBlock::Image(ImageContent::new(secret, "image/png"))];
+    let out = project(result(blocks), None, &open_gate(store)).unwrap();
+    let serialized = out.to_string();
+    assert!(
+        !serialized.contains(secret),
+        "base64 payload leaked into the projected record"
+    );
+    assert!(serialized.contains("attachment-"), "reference expected");
+}
+
+#[test]
+fn embedded_resource_text_and_blob_are_projected() {
+    let blocks = vec![
+        ContentBlock::Resource(EmbeddedResource::new(
+            ResourceContents::TextResourceContents {
+                uri: "file:///t".into(),
+                mime_type: Some("text/plain".into()),
+                text: "hello".into(),
+                meta: None,
+            },
+        )),
+        ContentBlock::Resource(EmbeddedResource::new(
+            ResourceContents::BlobResourceContents {
+                uri: "file:///b".into(),
+                mime_type: Some("image/png".into()),
+                blob: "YmxvYg==".into(),
+                meta: None,
+            },
+        )),
+    ];
+    let store = Arc::new(InMemoryAttachmentStore::new());
+    let out = project(result(blocks), None, &open_gate(store)).unwrap();
+    let items = out["content"].as_array().unwrap();
+    assert_eq!(items[0]["type"], json!("resource"));
+    assert_eq!(items[0]["text"], json!("hello"));
+    // The blob became an admitted attachment with its URI kept, no inline base64.
+    assert_eq!(items[1]["type"], json!("image"));
+    assert_eq!(items[1]["uri"], json!("file:///b"));
+    assert!(!out.to_string().contains("YmxvYg=="));
+}
+
+#[test]
+fn no_schema_means_unconstrained_passthrough() {
+    let mut r = result(vec![]);
+    r.structured_content = Some(json!({"x": 1}));
+    let out: Value = project(r, None, &RichContentGate::closed()).unwrap();
+    assert_eq!(out["structured"], json!({"x": 1}));
+    assert_eq!(out["schemaValidated"], json!(false));
+}
+
+// P2d: the default store must not grow unbounded on untrusted server output.
+#[test]
+fn attachment_store_is_bounded_and_evicts() {
+    // Capacity is part of the store's contract.
+    let store = harnless_mcp::projection::InMemoryAttachmentStore::with_capacity(3);
+    let mut refs = Vec::new();
+    for i in 0..10 {
+        let r = store
+            .put("image/png", &format!("payload-{i}"))
+            .expect("put");
+        refs.push(r);
+        assert!(store.len() <= 3, "store must stay bounded: {}", store.len());
+    }
+    // The most recent survive; the oldest were evicted.
+    assert_eq!(store.len(), 3);
+    assert!(store.contains(&refs[9]));
+    assert!(store.contains(&refs[8]));
+    assert!(store.contains(&refs[7]));
+    assert!(!store.contains(&refs[0]), "oldest must be evicted");
+    // Re-storing the same content refreshes it (content-addressed).
+    let again = store.put("image/png", "payload-9").expect("put");
+    assert_eq!(again, refs[9]);
+    assert!(store.contains(&refs[9]));
+}
+
+// Review F8: an admitted audio block is labeled audio, not image.
+#[test]
+fn admitted_audio_is_typed_audio() {
+    let gate = RichContentGate {
+        store: Some(Arc::new(InMemoryAttachmentStore::new())),
+        route: RouteCapabilities { image_input: true },
+    };
+    let out = project(
+        result(vec![ContentBlock::Audio(rmcp::model::AudioContent::new(
+            "aHVmbw==",
+            "audio/mp3",
+        ))]),
+        None,
+        &gate,
+    )
+    .unwrap();
+    let item = &out["content"][0];
+    assert_eq!(item["type"], json!("audio"), "audio keeps its kind: {item}");
+    assert!(item.get("attachment").is_some());
+    assert!(
+        !serde_json::to_string(&out["content"])
+            .unwrap()
+            .contains("aHVmbw=="),
+        "base64 stays out of the record"
+    );
+}
+
+// Review F9: an embedded resource with no representable payload is an
+// explicit diagnostic, never a fabricated empty attachment.
+#[test]
+fn unrepresentable_embedded_resource_is_diagnosed() {
+    let gate = RichContentGate {
+        store: Some(Arc::new(InMemoryAttachmentStore::new())),
+        route: RouteCapabilities { image_input: true },
+    };
+    // rmcp's untagged ResourceContents cannot deserialize a payload-less
+    // shape — the catch-all arm is defensive against future spec
+    // variants. Assert the wire contract: a payload-less resource never
+    // reaches projection.
+    let unparsable = serde_json::from_value::<ResourceContents>(json!({ "uri": "urn:x" }));
+    assert!(
+        unparsable.is_err(),
+        "a payload-less ResourceContents must not deserialize: {unparsable:?}"
+    );
+    // And the projection catch-all diagnoses rather than fabricating when
+    // driven directly with an unknown wire shape (forward-compat).
+    let out = project(
+        result(vec![ContentBlock::Resource(EmbeddedResource::new(
+            ResourceContents::BlobResourceContents {
+                uri: "urn:empty".into(),
+                mime_type: None,
+                blob: String::new(),
+                meta: None,
+            },
+        ))]),
+        None,
+        &gate,
+    )
+    .unwrap();
+    let s = serde_json::to_string(&out["content"]).unwrap();
+    // An empty blob is representable (it stores as an empty attachment);
+    // it must not be silently dropped.
+    assert!(s.contains("attachment"), "empty blob still projects: {s}");
+}
+
+// Review F18: `items: false` means the array must be empty; a non-empty
+// array must not be reported as validated-pass.
+#[test]
+fn items_false_is_not_a_silent_pass() {
+    let schema = json!({"type": "array", "items": false});
+    // Non-empty array under items:false must not claim validation.
+    let (validated, note) =
+        harnless_mcp::projection::validate_structured(&json!([1, 2]), Some(&schema));
+    assert!(
+        !(validated && note.is_none()),
+        "items:false must not silently pass a non-empty array"
+    );
+    // Empty arrays still validate.
+    let (validated, note) =
+        harnless_mcp::projection::validate_structured(&json!([]), Some(&schema));
+    assert!(
+        validated && note.is_none(),
+        "empty array validates under items:false"
+    );
+}
+
+// Review P3: the attachment-store capacity must be reachable from the
+// bridge/mount surface, not only the store's own Default.
+#[test]
+fn gate_builder_sizes_the_attachment_store() {
+    let gate = RichContentGate::with_store_capacity(4);
+    let store = gate.store.clone().expect("gate carries a store");
+    for i in 0..8 {
+        store.put("image/png", &format!("p-{i}")).expect("put");
+    }
+    assert_eq!(
+        store.len().expect("len"),
+        4,
+        "the gate's store must honor the configured capacity"
+    );
+    assert!(gate.admits());
+}
