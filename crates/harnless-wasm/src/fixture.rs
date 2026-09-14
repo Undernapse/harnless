@@ -217,8 +217,31 @@ fn encoded(locals: &[ValType], body: &[u8]) -> Function {
 
 /// The core module: memory 0, global 0 (bump ptr), import func 0 =
 /// `"h"."log"`, funcs 1=descriptor, 2=call, 3=alloc.
-fn core_module(behavior: Behavior) -> Module {
+/// The runtime module: memory + bump allocator + result store, no imports.
+///
+/// Instantiated first so its memory/alloc exist *before* the host log is
+/// lowered (lowering a string-param function requires memory + realloc, and
+/// the plugin module's own instantiation requires the lowered log — the
+/// runtime module breaks that cycle).
+///
+/// Layout: memory 0; global 0 = bump pointer (init `mem::HEAP_START`);
+/// func 0 = `alloc` (canonical realloc shape, bump); func 1 = `store_result`
+/// (writes the `{ptr=STRING_AREA, len}` result struct, leaves its address
+/// on the stack — the plugin's `call`/`descriptor` bodies tail-call it).
+fn runtime_module() -> Module {
     let mut module = Module::new();
+    let mut types = wasm_encoder::TypeSection::new();
+    types.ty().function(
+        [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        [ValType::I32],
+    ); // 0: alloc (canonical realloc shape)
+    types.ty().function([ValType::I32], [ValType::I32]); // 1: store_result
+    module.section(&types);
+
+    let mut funcs = FunctionSection::new();
+    funcs.function(0); // 0: alloc
+    funcs.function(1); // 1: store_result
+    module.section(&funcs);
 
     let mut memories = MemorySection::new();
     memories.memory(MemoryType {
@@ -230,34 +253,92 @@ fn core_module(behavior: Behavior) -> Module {
     });
     module.section(&memories);
 
+    let mut globals = GlobalSection::new();
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &wasm_encoder::ConstExpr::i32_const(mem::HEAP_START as i32),
+    );
+    module.section(&globals);
+
+    let mut exports = ExportSection::new();
+    exports.export("memory", ExportKind::Memory, 0);
+    exports.export("alloc", ExportKind::Func, 0);
+    exports.export("store_result", ExportKind::Func, 1);
+    module.section(&exports);
+
+    let mut code = CodeSection::new();
+    // alloc(orig_ptr, orig_len, new_align, new_size) -> ptr: bump the heap
+    // global by new_size (arg 3), return the pre-bump value.
+    let mut alloc_body = Vec::new();
+    alloc_body.extend([0x23, 0x00, 0x21, 0x04]); // local 4 = heap
+    alloc_body.extend([0x20, 0x00, 0x20, 0x03, 0x6a, 0x24, 0x00]); // heap += new_size
+    alloc_body.extend([0x20, 0x04, 0x0b]); // return old heap
+    code.function(&encoded(&[ValType::I32], &alloc_body));
+    // store_result(len) -> ptr: write {STRING_AREA, len} at RESULT_STRUCT,
+    // leave &RESULT_STRUCT on the stack.
+    let mut body = Vec::new();
+    body.extend(i32_const(mem::RESULT_STRUCT as i32));
+    body.extend(i32_const(mem::STRING_AREA as i32));
+    body.extend(i32_store_at(mem::RESULT_STRUCT)); // ptr field
+    body.extend([0x20, 0x00]); // len (value)
+    body.extend(i32_const((mem::RESULT_STRUCT + 4) as i32)); // addr
+    body.extend([0x36, 0x02, 0x00]); // i32.store offset=0
+    body.extend(i32_const(mem::RESULT_STRUCT as i32)); // push &RESULT_STRUCT
+    body.push(0x0b);
+    code.function(&encoded(&[ValType::I32], &body));
+    module.section(&code);
+
+    module
+}
+
+fn core_module(behavior: Behavior) -> Module {
+    let mut module = Module::new();
+
     // Type 0: (i32,i32)->() [host log]; type 1: ()->i32 [descriptor];
-    // type 2: (i32,i32)->i32 [call]; type 3: (i32,i32,i32,i32)->i32 [alloc].
+    // type 2: (i32,i32)->i32 [call]; type 3: (i32)->i32 [store_result].
     let mut types = wasm_encoder::TypeSection::new();
     types.ty().function([ValType::I32, ValType::I32], []);
     types.ty().function([], [ValType::I32]);
     types.ty().function([ValType::I32, ValType::I32], [ValType::I32]);
-    types.ty().function(
-        [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
-        [ValType::I32],
-    );
+    types.ty().function([ValType::I32], [ValType::I32]);
     module.section(&types);
 
     let mut imports = ImportSection::new();
-    imports.import("h", "log", wasm_encoder::EntityType::Function(0));
+    imports.import("h", "log", wasm_encoder::EntityType::Function(0)); // func 0
+    imports.import(
+        "h",
+        "mem",
+        wasm_encoder::EntityType::Memory(wasm_encoder::MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        }),
+    ); // memory 0
+    imports.import(
+        "h",
+        "store_result",
+        wasm_encoder::EntityType::Function(3),
+    ); // func 1
     module.section(&imports);
 
     let mut funcs = FunctionSection::new();
-    funcs.function(1); // 1: descriptor
-    funcs.function(2); // 2: call
-    funcs.function(3); // 3: alloc
+    funcs.function(1); // 2: descriptor
+    funcs.function(2); // 3: call
     module.section(&funcs);
 
     let mut code = CodeSection::new();
 
-    // descriptor() -> string literal.
+    // descriptor() -> string literal: write bytes, then store_result(len).
     let desc = descriptor_json(behavior);
     let mut body = write_bytes(desc.as_bytes());
-    body.extend(store_result(desc.len() as i32));
+    body.extend(i32_const(desc.len() as i32));
+    body.extend([0x10, 0x01]); // call 1 = h.store_result
     body.push(0x0b);
     code.function(&encoded(&[], &body));
 
@@ -265,7 +346,7 @@ fn core_module(behavior: Behavior) -> Module {
     let mut body = Vec::new();
     match behavior {
         Behavior::Echo => {
-            // log(ptr, len)
+            // log(ptr, len) - the host-import path, exercised end to end.
             body.extend([0x20, 0x00, 0x20, 0x01, 0x10, 0x00]);
             let prefix = b"{\"echo\":\"";
             let suffix = b"\"}";
@@ -307,16 +388,11 @@ fn core_module(behavior: Behavior) -> Module {
                 body.extend(i32_const(*b as i8 as i32));
                 body.extend(i32_store8_at(0));
             }
-            // Result struct: ptr = STRING_AREA, len = 8 + len + 2.
-            body.extend(i32_const(mem::RESULT_STRUCT as i32));
-            body.extend(i32_const(mem::STRING_AREA as i32));
-            body.extend(i32_store_at(mem::RESULT_STRUCT));
-            body.extend(i32_const(mem::RESULT_STRUCT as i32));
+            // Result: store_result(prefix.len + len + suffix.len).
             body.extend(i32_const((prefix.len() + suffix.len()) as i32));
-            body.extend([0x20, 0x01]); // local.get 1
+            body.extend([0x20, 0x01]); // local.get 1 (len)
             body.extend([0x6a]); //       i32.add
-            body.extend(i32_store_at(mem::RESULT_STRUCT + 4));
-            body.extend(i32_const(mem::RESULT_STRUCT as i32));
+            body.extend([0x10, 0x01]); // call 1 = h.store_result
         }
         Behavior::Boom => body.push(0x00),
         Behavior::Spin => {
@@ -327,78 +403,55 @@ fn core_module(behavior: Behavior) -> Module {
         Behavior::FsRead => {
             let r = b"{\"ok\":true}";
             body.extend(write_bytes(r));
-            body.extend(store_result(r.len() as i32));
+            body.extend(i32_const(r.len() as i32));
+            body.extend([0x10, 0x01]); // call 1 = h.store_result
         }
     }
     body.push(0x0b);
     code.function(&encoded(&[ValType::I32], &body));
 
-    // alloc(size, align, offset, src) -> bump allocator.
-    let mut body = Vec::new();
-    body.extend([0x23, 0x00]); // global.get 0 (result: old top)
-    body.extend([0x23, 0x00]); // global.get 0
-    body.extend([0x20, 0x00]); // local.get 0 (size)
-    body.extend([0x6a]); // i32.add
-    body.extend([0x24, 0x00]); // global.set 0
-    body.push(0x0b);
-    code.function(&encoded(&[], &body));
-    module.section(&code);
-
-    let mut globals = GlobalSection::new();
-    globals.global(
-        GlobalType {
-            val_type: ValType::I32,
-            mutable: true,
-            shared: false,
-        },
-        &wasm_encoder::ConstExpr::i32_const(mem::HEAP_START as i32),
-    );
-    module.section(&globals);
-
     let mut exports = ExportSection::new();
-    exports.export("memory", ExportKind::Memory, 0);
-    exports.export("descriptor", ExportKind::Func, 1);
-    exports.export("call", ExportKind::Func, 2);
-    exports.export("alloc", ExportKind::Func, 3);
+    exports.export("descriptor", ExportKind::Func, 2);
+    exports.export("call", ExportKind::Func, 3);
     module.section(&exports);
+
+    module.section(&code);
 
     module
 }
 
 /// Assemble the full component for `behavior`.
 ///
-/// Section order is load-bearing: component section ids must strictly
-/// increase, and each index space (component funcs, core funcs, core
-/// instances, …) grows monotonically as sections are added. The layout:
+/// The component is hand-assembled with `wasm-encoder` because no wasm
+/// component toolchain is available in this environment. Layout (section
+/// ids strictly increase; each index space grows monotonically):
 ///
-/// * types: 0 = host log func type, 1 = host instance type, 2 = `() ->
-///   string`, 3 = `(param "input" string) -> string`;
-/// * import 0: the host instance;
-/// * core module 0: the hand-rolled plugin module;
-/// * canon: core func 0 = `(canon lower)` of the host instance's `log`
-///   export (import-instance exports are addressable as func 0 directly —
-///   the import itself introduces it into the component func space);
-/// * instances: core instance 0 = the plugin module instantiated with a
-///   *probe* host (a pure export instance handing core func 0 as `"log"`);
-///   core instance 1 = the same module instantiated against the real shim
-///   (core instance 2 below). The probe instance's `memory`/`alloc` exports
-///   are aliased so the shim's canon options can reference them;
-/// * aliases: core memory 0 + core funcs 2/3 = the probe instance's
-///   `memory`/`alloc` plus the real instance's `descriptor`/`call`;
-/// * canon: core func 4 = `(canon lower)` of the host log against the
-///   probe's memory/realloc (the real wiring);
-/// * instances: core instance 2 = the shim export instance handing core
-///   func 4 as `"log"`; core instance 3 = the plugin wired to the shim;
-/// * canon: component funcs 2/3 = `(canon lift)` of the real instance's
-///   `descriptor`/`call` (core funcs 2/3);
-/// * exports: `descriptor` (component func 2), `call_<tool>` (3).
-///
-/// The probe instance is instantiated with the *lowered-at-probe-time*
-/// host log (core func 0, which itself lowers the real host `log`), so the
-/// probe's memory is live and shared with the real instance's module —
-/// both instances share the module's linear memory *type* and the host log
-/// path is identical, making the probe's memory/alloc indices valid
-/// canonical options for every wrapper in the component.
+/// * component types: 0 = host log `(string)`, 1 = host instance type
+///   (exports `log`), 2 = `() -> string` (descriptor), 3 =
+///   `(string) -> string` (tool call);
+/// * core module 0 = the plugin (imports `h`'s log/mem/store_result,
+///   exports `descriptor`/`call`); core module 1 = the runtime (memory,
+///   bump `alloc`, `store_result`, no-op `log_tramp`, `heap` global; no
+///   imports — instantiated first so its memory/alloc exist before the
+///   host log is lowered, breaking the lower-needs-memory /
+///   instantiate-needs-log cycle);
+/// * core instance 0 = the runtime module;
+/// * component import 0 = the host instance (`harnless:plugin/host`),
+///   whose `log` is component func 0;
+/// * aliases: runtime `memory` (core memory 0), `alloc` (core func 0),
+///   `store_result` (core func 1), `log_tramp` (core func 2), `heap`
+///   (core global 0);
+/// * canon: lower the host log -> core func 3 (the end-to-end host-import
+///   wiring);
+/// * core instance 1 = the shim: exports the *lowered* host log as `log`,
+///   plus the runtime's memory/store_result/heap under the names the
+///   plugin imports them by;
+/// * core instance 2 = the plugin, `h` linked to the shim;
+/// * aliases: the plugin's `descriptor` (core func 4) and `call` (core
+///   func 5);
+/// * canon: lift `descriptor`/`call` -> component funcs 1/2 (UTF-8
+///   strings over the runtime memory, bump `alloc` as realloc);
+/// * exports: `descriptor` (comp func 1), `call_<tool>` (comp func 2).
 pub fn component_bytes(behavior: Behavior) -> Vec<u8> {
     let mut component = Component::new();
 
@@ -411,7 +464,7 @@ pub fn component_bytes(behavior: Behavior) -> Vec<u8> {
             "s",
             wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
         )])
-        .result(None); // 0
+        .result(None); // 0: host log
     let mut host_ty = InstanceType::new();
     // The instance type's own type scope starts empty: re-declare the func
     // type locally so the export reference is self-contained.
@@ -424,131 +477,129 @@ pub fn component_bytes(behavior: Behavior) -> Vec<u8> {
         )])
         .result(None);
     host_ty.export("log", ComponentTypeRef::Func(0));
-    types.ty().instance(&host_ty); // 1
+    types.ty().instance(&host_ty); // 1: host instance
     {
         let empty: Vec<(&str, wasm_encoder::ComponentValType)> = Vec::new();
         types.ty().function().params(empty).result(Some(
             wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
-        )); // 2
+        )); // 2: descriptor
     }
     types.ty().function().params([("input", wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String))]).result(Some(
         wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
-    )); // 3
+    )); // 3: tool call
     component.section(&types);
 
-    // --- component import: the host instance (component func 0 = its log) ---
+    // --- component import: the host instance (its `log` is comp func 0) ---
     let mut imports = ComponentImportSection::new();
     imports.import(HOST_INSTANCE, ComponentTypeRef::Instance(1));
     component.section(&imports);
 
-    // --- core module 0 ---
+    // --- core modules: 0 = plugin, 1 = runtime (memory/alloc, no imports) ---
     let core = core_module(behavior);
     component.section(&ModuleSection(&core));
+    let runtime = runtime_module();
+    component.section(&ModuleSection(&runtime));
 
-    // --- canon: lower the host log (component func 0) for the shim.
-    // The lower needs memory/realloc, which only exist after an instance
-    // exists. The component format resolves this by allowing canon options
-    // to reference *module-level* exports via module aliases — but those
-    // aliases (id 7) must precede canon (id 8), and instances (id 9) must
-    // precede instance aliases. The format's actual rule: a canon section
-    // may reference memory/realloc aliased from a *previous* alias section;
-    // module aliases (CoreInstanceExport of the module's own instance… do
-    // not exist pre-instantiation). The canonical resolution real tooling
-    // uses: instantiate the module ONCE with an empty host, alias its
-    // memory/alloc, then do everything else. An empty host instance is a
-    // pure export instance with zero exports (core instance 0). ---
-    let mut empty_host = InstanceSection::new();
-    empty_host.export_items::<_, &str>([]);
-    component.section(&empty_host); // core instance 0: empty host
+    // --- core instance 0: the runtime module (no imports) ---
+    let mut rt_inst = InstanceSection::new();
+    rt_inst.instantiate::<[(&str, wasm_encoder::ModuleArg); 0], &str>(1, []);
+    component.section(&rt_inst);
 
-    let mut probe = InstanceSection::new();
-    probe.instantiate(0, [("h", wasm_encoder::ModuleArg::Instance(0))]);
-    component.section(&probe); // core instance 1: probe plugin
-
-    // --- aliases: probe memory/alloc + component func 0 (host log) ---
+    // --- aliases: runtime exports + the host log ---
     let mut aliases = ComponentAliasSection::new();
-    aliases.alias(Alias::InstanceExport {
-        instance: 0,
-        kind: ComponentExportKind::Func,
-        name: "log",
-    }); // component func 0
     aliases.alias(Alias::CoreInstanceExport {
-        instance: 1,
+        instance: 0,
         kind: ExportKind::Memory,
         name: "memory",
     }); // core memory 0
     aliases.alias(Alias::CoreInstanceExport {
-        instance: 1,
+        instance: 0,
         kind: ExportKind::Func,
         name: "alloc",
-    }); // core func 1
+    }); // core func 0
     aliases.alias(Alias::CoreInstanceExport {
-        instance: 1,
+        instance: 0,
+        kind: ExportKind::Func,
+        name: "store_result",
+    }); // core func 1
+    aliases.alias(Alias::InstanceExport {
+        instance: 0,
+        kind: ComponentExportKind::Func,
+        name: "log",
+    }); // component func 1 = host log
+    component.section(&aliases);
+
+    // --- canon: lower the host log -> core func 2 ---
+    let mut canon = CanonicalFunctionSection::new();
+    canon.lower(
+        1,
+        [
+            CanonicalOption::Memory(0),
+            CanonicalOption::Realloc(0),
+            CanonicalOption::UTF8,
+        ],
+    ); // core func 2
+    component.section(&canon);
+
+    // --- core instance 1: the shim (log/mem/store_result/heap) ---
+    // "log" is the lowered host log: the plugin's host-import path crosses
+    // the component boundary end to end.
+    let mut shim = InstanceSection::new();
+    shim.export_items([
+        ("log", ExportKind::Func, 2), // lowered host log
+        ("mem", ExportKind::Memory, 0), // runtime memory
+        ("store_result", ExportKind::Func, 1), // runtime store_result
+    ]);
+    component.section(&shim);
+
+    // --- core instance 2: the plugin, wired to the shim ---
+    let mut plugin_inst = InstanceSection::new();
+    plugin_inst.instantiate(0, [("h", wasm_encoder::ModuleArg::Instance(1))]);
+    component.section(&plugin_inst);
+
+    // --- aliases: the plugin's descriptor/call ---
+    let mut aliases = ComponentAliasSection::new();
+    aliases.alias(Alias::CoreInstanceExport {
+        instance: 2,
         kind: ExportKind::Func,
         name: "descriptor",
     }); // core func 3
     aliases.alias(Alias::CoreInstanceExport {
-        instance: 1,
+        instance: 2,
         kind: ExportKind::Func,
         name: "call",
     }); // core func 4
     component.section(&aliases);
 
-    // --- canon: lower the host log against the probe's memory/alloc ---
-    let mut canon = CanonicalFunctionSection::new();
-    canon.lower(0, [CanonicalOption::Memory(0), CanonicalOption::Realloc(1)]); // core func 2
-    component.section(&canon);
-
-    // --- instances: the shim (core instance 2), the real plugin (3) ---
-    let mut shim = InstanceSection::new();
-    shim.export_items([("log", ExportKind::Func, 2)]);
-    component.section(&shim); // core instance 2
-
-    let mut plugin_inst = InstanceSection::new();
-    plugin_inst.instantiate(0, [("h", wasm_encoder::ModuleArg::Instance(2))]);
-    component.section(&plugin_inst); // core instance 3
-
-    // --- aliases: the real instance's descriptor/call (core funcs 3/4) ---
-    // A second alias section is legal: alias id 7 already appeared, but the
-    // format requires *strictly increasing* ids, so aliases cannot repeat
-    // after canon/instances. Real components therefore declare ALL aliases
-    // in one section — but instance-export aliases of *later* instances are
-    // illegal. The resolution real toolchains use: the lifts reference the
-    // probe instance's descriptor/call exports (same module, same memory),
-    // aliased in the one alias section above. Add them there. ---
-    // (see the single alias section above — descriptor/call are aliased
-    // from the probe instance, whose memory is the module's memory; the
-    // real instance shares the module and its functions are pure over that
-    // memory, so lifting the probe's exports is behaviourally identical
-    // for this fixture.)
+    // --- canon: lift descriptor/call -> component funcs 2/3 ---
     let mut canon = CanonicalFunctionSection::new();
     canon.lift(
-        3, // core func 3 = probe instance export "descriptor" (aliased below — see note)
+        3,
         2,
         [
             CanonicalOption::Memory(0),
-            CanonicalOption::Realloc(1),
-            CanonicalOption::UTF8,
-        ],
-    ); // component func 1
-    canon.lift(
-        4, // core func 4 = probe instance export "call"
-        3,
-        [
-            CanonicalOption::Memory(0),
-            CanonicalOption::Realloc(1),
+            CanonicalOption::Realloc(0),
             CanonicalOption::UTF8,
         ],
     ); // component func 2
+    canon.lift(
+        4,
+        3,
+        [
+            CanonicalOption::Memory(0),
+            CanonicalOption::Realloc(0),
+            CanonicalOption::UTF8,
+        ],
+    ); // component func 3
     component.section(&canon);
 
     // --- component exports ---
     let mut exports = ComponentExportSection::new();
-    exports.export("descriptor", ComponentExportKind::Func, 1, None);
+    exports.export("descriptor", ComponentExportKind::Func, 2, None);
     exports.export(
         format!("call_{}", tool_name(behavior)),
         ComponentExportKind::Func,
-        2,
+        3,
         None,
     );
     component.section(&exports);
