@@ -67,6 +67,59 @@ impl ReplayAdapter {
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+
+    /// Stream `recording` once, independently of this adapter's script.
+    ///
+    /// Same decoding, validation, and terminal-event rules as [`stream`]
+    /// (Self::stream), but the recording is supplied per call: no script slot
+    /// is consumed and the internal call counter never moves. A harness that
+    /// multiplexes one adapter object across several corpora (e.g. a
+    /// conformance harness routing each case to its own recording) needs this,
+    /// because the seam gives a provider no way to be told *which* case a
+    /// `stream()` call belongs to — the harness decides that and must be able
+    /// to hand the right corpus over without racing the script counter.
+    ///
+    /// [`stream`]: Self::stream
+    pub fn stream_recording(&self, recording: &Recording) -> Result<BoxStream> {
+        replay_stream(recording)
+    }
+}
+
+/// Decode `recording` and build its event stream — the body shared by
+/// [`ReplayAdapter::stream`] and [`ReplayAdapter::stream_recording`].
+fn replay_stream(recording: &Recording) -> Result<BoxStream> {
+    // Decoding happens at the entry: a corpus that fails to restore or
+    // violates the stream protocol is a broken fixture, thrown as the
+    // first sanctioned failure path — never disguised as a provider
+    // failure the caller might retry.
+    recording
+        .validate()
+        .map_err(|e| SeamError::new(ErrorCode::ProviderFailure, e))?;
+    let frames = recording
+        .to_frames()
+        .map_err(|e| SeamError::new(ErrorCode::ProviderFailure, e))?;
+    let failure = recording.failure.clone();
+    let empty = !has_content(&frames);
+
+    let stream = stream! {
+        for frame in frames {
+            yield StreamEvent::Frame(frame);
+        }
+        // A recording captured from a failed stream ends in-band with
+        // the original terminal failure, after whatever it emitted.
+        if let Some(failure) = failure {
+            yield StreamEvent::Failed(failure);
+        } else if empty {
+            // An empty completion is a retryable failure, not a success
+            // — same classification as a live provider that went silent.
+            yield StreamEvent::Failed(ProviderFailure {
+                code: ErrorCode::EmptyCompletion,
+                message: "recording contains no content".into(),
+            });
+        }
+    };
+
+    Ok(Box::pin(stream))
 }
 
 /// Whether a recording's frames carry any content: a block boundary or a
@@ -112,40 +165,9 @@ impl ModelAdapter for ReplayAdapter {
         _tools: &[ToolSchema],
         _replay: Option<ReplayState>,
     ) -> Result<BoxStream> {
-        // Decoding happens at the entry: a corpus that fails to restore or
-        // violates the stream protocol is a broken fixture, thrown as the
-        // first sanctioned failure path — never disguised as a provider
-        // failure the caller might retry.
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         let recording: &Recording = self.script.get(n);
-        recording
-            .validate()
-            .map_err(|e| SeamError::new(ErrorCode::ProviderFailure, e))?;
-        let frames = recording
-            .to_frames()
-            .map_err(|e| SeamError::new(ErrorCode::ProviderFailure, e))?;
-        let failure = recording.failure.clone();
-        let empty = !has_content(&frames);
-
-        let stream = stream! {
-            for frame in frames {
-                yield StreamEvent::Frame(frame);
-            }
-            // A recording captured from a failed stream ends in-band with
-            // the original terminal failure, after whatever it emitted.
-            if let Some(failure) = failure {
-                yield StreamEvent::Failed(failure);
-            } else if empty {
-                // An empty completion is a retryable failure, not a success
-                // — same classification as a live provider that went silent.
-                yield StreamEvent::Failed(ProviderFailure {
-                    code: ErrorCode::EmptyCompletion,
-                    message: "recording contains no content".into(),
-                });
-            }
-        };
-
-        Ok(Box::pin(stream))
+        replay_stream(recording)
     }
 }
 
@@ -297,12 +319,14 @@ mod tests {
         assert_eq!(events.len(), finish_at + 1);
     }
 
-    #[tokio::test]
-    async fn script_serves_recordings_in_order() {
+    /// A two-recording script fixture: the sample recording, then the same
+    /// with one extra delta.
+    ///
+    /// The extra delta goes *before* the terminal frame — a delta after
+    /// `Finish` would be a protocol violation the entry now rejects.
+    fn two_recordings() -> (Recording, Recording) {
         let first = sample_recording();
         let mut second = sample_recording();
-        // Insert before the terminal frame: a delta after Finish would be a
-        // protocol violation the entry now rejects.
         let last = second.frames.len() - 1;
         second.frames.insert(
             last,
@@ -311,7 +335,13 @@ mod tests {
                 text: " (second)".into(),
             },
         );
-        let adapter = ReplayAdapter::new("openai", Script::new(vec![first.clone(), second]));
+        (first, second)
+    }
+
+    #[tokio::test]
+    async fn script_serves_recordings_in_order() {
+        let (first, second) = two_recordings();
+        let adapter = ReplayAdapter::new("openai", Script::new(vec![first, second]));
         let a = collect(&adapter).await;
         let b = collect(&adapter).await;
         assert_ne!(a, b, "second call replays the second recording");
@@ -393,6 +423,77 @@ mod tests {
         let err = match adapter.stream(CallId(1), &[], &[], None) {
             Err(err) => err,
             Ok(_) => panic!("broken corpus must throw"),
+        };
+        assert_eq!(err.code, ErrorCode::ProviderFailure);
+    }
+
+    #[tokio::test]
+    async fn stream_recording_leaves_the_script_untouched() {
+        // The two properties that distinguish `stream_recording` from
+        // `stream`: the call counter never moves, and no script slot is
+        // consumed. A regression on either keeps a per-call-corpus harness
+        // green while silently breaking every script-ordered consumer, so
+        // the pin lives here, at the adapter.
+        let (first, second) = two_recordings();
+        let adapter = ReplayAdapter::new("openai", Script::new(vec![first.clone(), second]));
+
+        // An out-of-band recording replays its terminal frame...
+        let events: Vec<StreamEvent> = {
+            let mut stream = adapter
+                .stream_recording(&first)
+                .expect("valid recording streams");
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                events.push(event);
+            }
+            events
+        };
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Frame(StreamFrame::Finish))),
+            "a per-call recording must replay its terminal frame"
+        );
+        assert_eq!(adapter.calls(), 0, "the call counter must not move");
+
+        // ...and the script still answers from slot one.
+        let scripted_first = collect(&adapter).await;
+        let scripted_second = collect(&adapter).await;
+        assert_ne!(
+            scripted_first, scripted_second,
+            "the per-call stream must not have consumed a script slot"
+        );
+        assert_eq!(adapter.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_recording_derives_empty_completion() {
+        // The emptiness rule is shared too: a contentless per-call recording
+        // is the retryable empty-completion failure, not a silent success.
+        let adapter = ReplayAdapter::builder(sample_recording()).build();
+        let mut stream = adapter
+            .stream_recording(&Recording::default())
+            .expect("an empty recording is a valid recording");
+        let event = stream.next().await.expect("one event");
+        match event {
+            StreamEvent::Failed(f) => assert_eq!(f.code, ErrorCode::EmptyCompletion),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_recording_throws_on_a_broken_corpus() {
+        // Same entry discipline as the scripted path: a corpus violating the
+        // protocol is a fixture mistake thrown at the entry, never an
+        // in-band outcome a caller could retry past.
+        let bad = Recording {
+            frames: vec![RecordedFrame::Finish, RecordedFrame::Finish],
+            ..Recording::default()
+        };
+        let adapter = ReplayAdapter::builder(sample_recording()).build();
+        let err = match adapter.stream_recording(&bad) {
+            Err(err) => err,
+            Ok(_) => panic!("a corpus with two terminals must throw"),
         };
         assert_eq!(err.code, ErrorCode::ProviderFailure);
     }
