@@ -64,10 +64,20 @@ impl Response {
 }
 
 /// A tool definition shorthand for tests.
+///
+/// The description is the model-facing text the supervisor is expected to
+/// carry through to the registered definition, so the shorthand supplies a
+/// distinguishable one rather than leaving the field unset.
 pub fn tool(name: &str) -> Tool {
+    tool_with(name, &format!("the {name} tool"))
+}
+
+/// A tool definition with an explicit description — including, for tests,
+/// the empty description a server that omits the field yields.
+pub fn tool_with(name: &str, description: &str) -> Tool {
     Tool::new(
         name.to_string(),
-        format!("the {name} tool"),
+        description.to_string(),
         serde_json::Map::from_iter(
             (json!({ "type": "object", "properties": {} }))
                 .as_object()

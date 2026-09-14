@@ -255,4 +255,68 @@ mod tests {
         assert_eq!(built[0]["function"]["parameters"], json!({"type":"object"}));
         assert_eq!(built[0]["function"]["strict"], true);
     }
+
+    /// The description is model-facing allowlisted text, so the request
+    /// builder must put it on the wire verbatim — and the `function` object
+    /// must carry nothing the allowlist did not authorize. `strict` appears
+    /// only when the schema asked for it: an unset flag is an absent key,
+    /// not a `false` the provider has to reason about.
+    #[test]
+    fn function_object_key_set_is_the_allowlist() {
+        let built = tools(&[
+            ToolSchema::new("plain", "No strict here", json!({"type":"object"})),
+            ToolSchema::new("strict_one", "Strict here", json!({"type":"object"})).strict(true),
+        ])
+        .unwrap();
+        fn keys(v: &Value) -> Vec<&str> {
+            let mut k: Vec<&str> = v["function"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            k.sort_unstable();
+            k
+        }
+        assert_eq!(keys(&built[0]), ["description", "name", "parameters"]);
+        assert_eq!(
+            keys(&built[1]),
+            ["description", "name", "parameters", "strict"]
+        );
+        assert_eq!(built[0].get("strict"), None);
+        assert_eq!(built[0]["function"].get("strict"), None);
+    }
+
+    /// End to end at the seam that matters: a description set on a registry
+    /// definition reaches the wire through the one projection the allowlist
+    /// permits, byte for byte.
+    #[test]
+    fn a_definitions_description_reaches_the_wire_via_the_projection() {
+        use harnless_seams::tools::ToolDefinition;
+        let def = ToolDefinition {
+            name: "search".into(),
+            description: "Search the index for a query.".into(),
+            schema: json!({"type":"object","properties":{"q":{"type":"string"}}}),
+            serialized: true,
+        };
+        let built = tools(&[def.to_schema()]).unwrap();
+        assert_eq!(
+            built[0]["function"]["description"],
+            "Search the index for a query."
+        );
+        assert_eq!(built[0]["function"]["name"], "search");
+        assert_eq!(
+            built[0]["function"]["parameters"],
+            json!({"type":"object","properties":{"q":{"type":"string"}}})
+        );
+        // The definition's internal scheduling flag is nowhere on the wire.
+        let function_keys: Vec<&str> = built[0]["function"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(!function_keys.contains(&"serialized"));
+        assert_eq!(built[0]["function"].get("strict"), None);
+    }
 }

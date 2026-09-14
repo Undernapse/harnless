@@ -314,6 +314,10 @@ impl WasmPluginManager {
             let name = format!("{}.{}", staged.descriptor.name, spec.name);
             let def = ToolDefinition {
                 name: name.clone(),
+                // The guest declared it, so the guest's text is what the
+                // model sees — including the empty string a descriptor
+                // without the key defaults to. The loader never invents one.
+                description: spec.description.clone(),
                 schema: spec.schema.clone(),
                 serialized: spec.serialized,
             };

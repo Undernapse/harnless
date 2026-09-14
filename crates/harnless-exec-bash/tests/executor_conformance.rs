@@ -2,8 +2,12 @@
 //! sandbox is byte-identical to the argv spawned, and a denied command
 //! surfaces an auditable enforced result — never a silent pass.
 //!
-//! These assertions are what the conformance kit's `check_executor` will
-//! mirror later.
+//! These are the crate-local, hand-written form of obligations the conformance
+//! kit now also checks generically — see `harnless_conformance::executor_suite`
+//! and the `conformance_tests_executor!` instantiation in
+//! `tests/executor_conformance_v2.rs`. They stay because they pin the shipped
+//! provider's exact wiring, which the generic suite reaches only through a
+//! harness-declared constructor.
 
 use std::sync::Arc;
 

@@ -92,6 +92,7 @@ impl TransportFactory for ScriptedFactory {
                             name.clone(),
                             harnless_seams::ToolDefinition {
                                 name,
+                                description: "scripted test tool".into(),
                                 schema: serde_json::json!({"type": "object"}),
                                 serialized: false,
                             },

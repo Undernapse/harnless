@@ -29,4 +29,6 @@ pub use persistence::{LoadedLog, SessionPersistence};
 pub use prompt::{assemble, in_prompt, SystemPrompt};
 pub use session::{LogSnapshot, SessionLog};
 pub use spine::Spine;
-pub use tools::{MonotonicGuard, PostExecute, PreExecute, ToolRegistry};
+pub use tools::{
+    BridgeNext, MonotonicGuard, PostExecute, PostExecuteOutcome, PreExecute, ToolRegistry,
+};

@@ -433,6 +433,9 @@ unsafe extern "C" {
 /// `ExecCancelled` after cancel, best-effort process-group kill.
 struct ConfinedHandle {
     child: Arc<parking_lot::Mutex<std::process::Child>>,
+    /// The child's pid, cached at spawn so `cancel` can signal the process group
+    /// without taking the child lock (which `output` holds across `wait`).
+    child_pid: i32,
     stdout: Reader,
     stderr: Reader,
     cancelled: std::sync::atomic::AtomicBool,
@@ -442,8 +445,10 @@ impl ConfinedHandle {
     fn new(mut child: std::process::Child) -> Box<dyn SpawnHandle> {
         let stdout = Reader::start(child.stdout.take());
         let stderr = Reader::start(child.stderr.take());
+        let child_pid = child.id() as i32;
         Box::new(Self {
             child: Arc::new(parking_lot::Mutex::new(child)),
+            child_pid,
             stdout,
             stderr,
             cancelled: std::sync::atomic::AtomicBool::new(false),
@@ -461,14 +466,18 @@ impl SpawnHandle for ConfinedHandle {
         };
         let mut out = self.stdout.collect();
         out.push_str(&self.stderr.collect());
-        if status.success() {
-            return Ok(out);
-        }
+        // Cancellation is checked *before* the exit status: a cancelled child can
+        // exit 0 (the signal races an exit already under way, or the command traps
+        // TERM), and reporting that as `Ok` would hand a caller a completed run it
+        // asked to stop.
         if self.cancelled.load(Ordering::SeqCst) {
             return Err(SeamError::new(
                 ErrorCode::ExecCancelled,
                 format!("process cancelled ({}); {}", exit_label(&status), out),
             ));
+        }
+        if status.success() {
+            return Ok(out);
         }
         // A non-zero/signal exit is a seam failure the command tool
         // surfaces, with the captured output attached — this is also how a
@@ -483,23 +492,49 @@ impl SpawnHandle for ConfinedHandle {
     fn cancel(&self) {
         use std::sync::atomic::Ordering;
         self.cancelled.store(true, Ordering::SeqCst);
-        let Some(mut child) = self.child.try_lock() else {
-            return;
-        };
         // Prefer the whole process group (the child leads its own via
         // setsid); fall back to a direct kill.
         #[cfg(unix)]
         {
-            let pid = child.id() as i32;
+            // The pid is read from the spawn-time cache, never from the locked
+            // child. `output` holds the child across `wait`, and a caller
+            // cancelling a run it is blocked waiting on — the shape of any "stop
+            // this command" caller — would otherwise deadlock against that wait
+            // (or, with a try-lock that gives up, have its cancellation dropped
+            // and be handed the completed run as success). Signalling a
+            // since-exited group is harmless: the signal simply does not land,
+            // and `output` reports the real exit.
+            let pid = self.child_pid;
             if unsafe { kill(-pid, harnless_exec_subprocess::SIGTERM) } != 0 {
-                let _ = child.kill();
+                // The group is gone or was never led by the child. The direct kill
+                // needs the child, so it is best-effort under a try-lock — gated on
+                // `try_wait` proving the child is still running, not on the lock
+                // merely being free. A since-reaped child's pid can be recycled by
+                // an unrelated process, and killing it would signal a stranger.
+                if let Some(mut child) = self.child.try_lock() {
+                    match child.try_wait() {
+                        Ok(None) => {
+                            let _ = child.kill();
+                        }
+                        Ok(Some(_)) | Err(_) => {}
+                    }
+                }
             }
         }
         #[cfg(not(unix))]
-        let _ = child.kill();
+        if let Some(mut child) = self.child.try_lock() {
+            match child.try_wait() {
+                Ok(None) => {
+                    let _ = child.kill();
+                }
+                Ok(Some(_)) | Err(_) => {}
+            }
+        }
     }
 }
 
+// `kill(2)` without a libc crate dependency (same trick the plain subprocess
+// provider uses).
 #[cfg(unix)]
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;

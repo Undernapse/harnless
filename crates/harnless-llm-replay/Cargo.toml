@@ -15,5 +15,6 @@ serde_json = "1"
 
 [dev-dependencies]
 harnless-agent = { path = "../harnless-agent" }
+harnless-conformance = { path = "../harnless-conformance" }
 harnless-runtime = { path = "../harnless-runtime" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

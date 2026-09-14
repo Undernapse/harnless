@@ -16,4 +16,5 @@ parking_lot = "0.12"
 libc = "0.2"
 
 [dev-dependencies]
+harnless-conformance = { path = "../harnless-conformance" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
