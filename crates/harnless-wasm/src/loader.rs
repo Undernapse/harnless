@@ -57,20 +57,21 @@ fn fiber_key(fiber: &Arc<Fiber>) -> usize {
     Arc::as_ptr(fiber).addr()
 }
 
-/// A fully-prepared mount that has not yet been committed to the live tree.
+/// A prepared mount that has not yet been committed to the live tree.
 ///
 /// [`WasmPluginManager::stage`] produces one — component compiled, guest
-/// instantiated, tools registered on the seam, reversible handle built — and
-/// [`WasmPluginManager::commit`] is the only step that touches the manager's
-/// mounted list. Splitting the mount this way is what lets
-/// [`WasmPluginManager::reload_all`] validate and prepare *every* config before
-/// any live state changes: a config that fails to stage leaves the last-good
-/// tree entirely untouched.
+/// instantiated under its grants, valid descriptor read — and
+/// [`WasmPluginManager::commit`] is the only step that touches anything
+/// outside this value: it registers the descriptor's tools on the seam and
+/// touches the manager's mounted list. Splitting the mount this way is what
+/// lets [`WasmPluginManager::reload_all`] prepare *every* config before any
+/// live state changes: registering only at commitment means a config that
+/// fails to stage never wrote to the registry at all, so the rollback cannot
+/// reach the last-good tree.
 pub struct StagedMount {
     fiber: Arc<Fiber>,
     live: Arc<Mutex<LiveInstance>>,
-    names: RegisteredTools,
-    handle: Arc<Mutex<Registration>>,
+    descriptor: Descriptor,
     config: PluginConfig,
 }
 
@@ -254,26 +255,22 @@ impl WasmPluginManager {
         registry: &Arc<ToolRegistry>,
         config: &PluginConfig,
     ) -> Result<u64, String> {
-        let staged = self.stage(registry, config)?;
-        Ok(self.commit(&staged))
+        let staged = self.stage(config)?;
+        Ok(self.commit(registry, &staged))
     }
 
-    /// Prepare a mount without touching the live tree: compile the component,
-    /// instantiate the guest under its grants, register its tools on the seam,
-    /// and build the reversible handle. Everything that can fail about a mount
-    /// fails here; [`Self::commit`] is infallible.
+    /// Prepare a mount without touching anything outside it: compile the
+    /// component, instantiate the guest under its grants, and read its
+    /// descriptor. Everything that can fail about a mount fails here;
+    /// [`Self::commit`] cannot fail.
     ///
     /// This is the transactional primitive behind [`Self::reload_all`]: staging
     /// every config before committing any means a config that fails to stage
-    /// leaves the last-good tree entirely untouched.
-    pub fn stage(
-        &self,
-        registry: &Arc<ToolRegistry>,
-        config: &PluginConfig,
-    ) -> Result<StagedMount, String> {
+    /// leaves the last-good tree entirely untouched — it never wrote a tool
+    /// name to the registry, so unwinding it has nothing to undo.
+    pub fn stage(&self, config: &PluginConfig) -> Result<StagedMount, String> {
         let (component, descriptor) = self.prepare(config)?;
         let fiber = Fiber::pending();
-
         let live = Arc::new(Mutex::new(
             LiveInstance::new(
                 &self.engine,
@@ -283,62 +280,71 @@ impl WasmPluginManager {
             )
             .map_err(|e| format!("plugin {}: instantiate failed: {e}", config.id))?,
         ));
+        fiber.set_state(FiberState::Active);
+        Ok(StagedMount {
+            fiber,
+            live,
+            descriptor,
+            config: config.clone(),
+        })
+    }
 
+    /// Commit a staged mount to the live tree: register its tools on the seam,
+    /// record its row, and hand the reversible handle's sole strong owner to
+    /// the plugin's fiber.
+    ///
+    /// Registration happens *here*, not in [`Self::stage`], and that ordering is
+    /// the transactional guarantee. Once `stage` succeeded — the component
+    /// compiled, the guest instantiated under its grants, the descriptor
+    /// parsed — registering its declared tools cannot fail: the only names that
+    /// could collide are names this tree itself owns (a reload's own new
+    /// generation, or another config in the same tree), and the registry's
+    /// `register` overwrites those. So `commit` is infallible, which in turn
+    /// means the rollback in [`Self::reload_all`] — dispose the staged fibers —
+    /// structurally cannot touch a tool the live tree was serving: a staged
+    /// mount that never committed registered nothing.
+    fn commit(&self, registry: &Arc<ToolRegistry>, staged: &StagedMount) -> u64 {
         // Register each declared tool through the seam (the same
         // `ctx.tools` surface a native tool uses). Each `(name, body)` pair is
         // recorded so the fiber-owned Registration handle removes exactly these
         // registrations — and only those still owned by this mount.
         let entries: Arc<Mutex<Vec<(String, Arc<dyn ToolBody>)>>> =
             Arc::new(Mutex::new(Vec::new()));
-        for spec in &descriptor.tools {
-            let name = format!("{}.{}", descriptor.name, spec.name);
+        for spec in &staged.descriptor.tools {
+            let name = format!("{}.{}", staged.descriptor.name, spec.name);
             let def = ToolDefinition {
                 name: name.clone(),
                 schema: spec.schema.clone(),
                 serialized: spec.serialized,
             };
             let body: Arc<dyn ToolBody> = Arc::new(GuestBody {
-                live: live.clone(),
+                live: staged.live.clone(),
                 export: format!("call_{}", spec.name),
-                fuel: config.fuel_per_call,
+                fuel: staged.config.fuel_per_call,
             });
             registry
                 .register(def, body.clone())
-                .map_err(|e| format!("plugin {}: register {name}: {e:?}", config.id))?;
+                .expect("a staged mount's tool registers");
             entries.lock().push((name, body));
         }
         let names: RegisteredTools = Arc::new(Mutex::new(
             entries.lock().iter().map(|(n, _)| n.clone()).collect(),
         ));
 
-        // The reversible handle. `commit` gives its *single* strong owner to an
-        // effect on the plugin's fiber, so the mount's tools disappear exactly
-        // when that fiber tears down — whether the manager unmounts the row or
-        // the fiber is disposed on its own.
+        // The reversible handle. Its *single* strong owner becomes an effect on
+        // the plugin's fiber, so the mount's tools disappear exactly when that
+        // fiber tears down — whether the manager unmounts the row or the fiber
+        // is disposed on its own.
         let handle = Arc::new(Mutex::new(Registration {
             registry: registry.clone(),
             entries,
         }));
-        fiber.set_state(FiberState::Active);
-        Ok(StagedMount {
-            fiber,
-            live,
-            names,
-            handle,
-            config: config.clone(),
-        })
-    }
-
-    /// Commit a staged mount to the live tree: record its row and hand the
-    /// reversible handle's sole strong owner to the plugin's fiber. Infallible —
-    /// every fallible step happened in [`Self::stage`].
-    fn commit(&self, staged: &StagedMount) -> u64 {
         self.record_mount(
             &staged.config,
             &staged.fiber,
-            &staged.names,
+            &names,
             Some(staged.live.clone()),
-            staged.handle.clone(),
+            handle,
         )
     }
 
@@ -459,7 +465,7 @@ impl WasmPluginManager {
         registry: &Arc<ToolRegistry>,
         config: &PluginConfig,
     ) -> Result<u64, String> {
-        let generation = self.commit(&self.stage(registry, config)?);
+        let generation = self.commit(registry, &self.stage(config)?);
         self.retire_older(config);
         Ok(generation)
     }
@@ -498,11 +504,12 @@ impl WasmPluginManager {
     /// Transactional reload of the whole tree.
     ///
     /// **Every** config is fully staged — compiled, instantiated under its
-    /// grants, and registered — *before* any live row is touched. If any config
-    /// fails to stage, the already-staged mounts are rolled back (their fibers
-    /// disposed, unwinding their registrations) and the last-good tree stands
-    /// entirely untouched: no config is half-swapped. Only once every config has
-    /// staged does the tree commit — each id's new generation committed, each old
+    /// grants, and validated against its descriptor — *before* any live state is
+    /// touched. Nothing is registered during staging: a config that fails to
+    /// stage never wrote a tool name to the registry, so the rollback (dispose
+    /// the already-staged fibers) has nothing to undo and cannot reach a tool the
+    /// last-good tree was serving. Only once every config has staged does the
+    /// tree commit — each id's new generation registered and committed, each old
     /// generation retired, and ids dropped from config unmounted.
     ///
     /// Staging is stronger than [`Self::prepare`] validation: a config whose
@@ -520,7 +527,7 @@ impl WasmPluginManager {
         // mounts and leave the live tree exactly as it was.
         let mut staged = Vec::with_capacity(configs.len());
         for cfg in configs {
-            match self.stage(&registry, cfg) {
+            match self.stage(cfg) {
                 Ok(s) => staged.push(s),
                 Err(e) => {
                     for s in staged {
@@ -534,7 +541,7 @@ impl WasmPluginManager {
         // generation of each id. Commitment cannot fail, so the tree is never
         // observed half-swapped.
         for s in &staged {
-            self.commit(s);
+            self.commit(&registry, s);
         }
         for cfg in configs {
             self.retire_older(cfg);

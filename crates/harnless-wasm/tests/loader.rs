@@ -680,3 +680,50 @@ fn a_successful_reload_all_leaves_every_config_mounted() {
         "the reloaded mount carries its own wired capability"
     );
 }
+
+/// Acceptance: a *failed* `reload_all` leaves the surviving plugin serving.
+///
+/// The transactional guarantee config depends on is not "the tool list looks
+/// right" — it is "the plugin that was working still answers calls". A bad
+/// component in the new tree must not be able to retire the tools of a
+/// plugin whose own row is perfectly good.
+#[test]
+fn failed_reload_all_leaves_the_surviving_plugin_serving() {
+    let manager = WasmPluginManager::new();
+    let spine = Spine::new();
+    mount_real(&manager, &spine.registry, "fs", Behavior::FsRead);
+    assert_eq!(manager.generations(), vec![("fs".into(), 1u64)]);
+    assert_eq!(spine.names(), vec!["fs.read"]);
+
+    // The new tree: the same good `fs` row plus a component that does not
+    // compile at all. `fs` itself is unchanged, so nothing about it moves.
+    let fs_good = PluginConfig::sandboxed(
+        "fs",
+        fixture::fixture_path(Behavior::FsRead)
+            .display()
+            .to_string(),
+    );
+    let broken = PluginConfig::sandboxed("broken", "/nonexistent/definitely-missing.wasm");
+    manager
+        .reload_all(&spine.ctx, &[fs_good, broken])
+        .expect_err("an unreadable component fails the reload");
+
+    assert_eq!(
+        manager.generations(),
+        vec![("fs".into(), 1u64)],
+        "a failed reload_all leaves the last-good tree mounted"
+    );
+    assert_eq!(
+        spine.names(),
+        vec!["fs.read"],
+        "the surviving plugin's tools are still registered"
+    );
+
+    // And they are not decoration: the surviving plugin still serves.
+    let _allow = spine.allow_all();
+    let frozen = spine
+        .registry
+        .execute(CallId(7), "fs.read", b"{}")
+        .unwrap_or_else(|e| panic!("the surviving plugin must still serve calls: {e:?}"));
+    assert_eq!(frozen.value, json!({"ok": true}));
+}

@@ -253,6 +253,39 @@ mod tests {
     }
 
     #[test]
+    fn provide_shared_get_returns_the_callers_handle() {
+        let ctx = Context::root();
+        let fiber = Fiber::active();
+        let owner = Arc::new(Greeter { greeting: "shared" });
+        let _keep = ctx.provide_shared(&fiber, owner.clone()).unwrap();
+        // The service is visible under `T`, not under `Arc<T>` — and the
+        // handle handed back aliases the owner's, so both views see one
+        // object (a registry shared this way cannot fork state).
+        let svc = ctx.get::<Greeter>().expect("shared service is keyed by T");
+        assert!(
+            Arc::ptr_eq(&owner, &svc),
+            "get::<T>() must return an Arc aliasing the caller's handle"
+        );
+        assert_eq!(svc.greeting, "shared");
+    }
+
+    #[test]
+    fn fiber_unload_removes_shared_service() {
+        let ctx = Context::root();
+        let fiber = Fiber::pending();
+        let _keep = ctx
+            .provide_shared(&fiber, Arc::new(ProbeService))
+            .expect("provide shared");
+        assert!(ctx.has::<ProbeService>());
+        fiber.dispose();
+        assert!(
+            !ctx.has::<ProbeService>(),
+            "the shared service's disposer must remove T's key on unload"
+        );
+        assert!(ctx.get::<ProbeService>().is_none());
+    }
+
+    #[test]
     fn guard_drop_detaches_service_cleanup_to_fiber() {
         let ctx = Context::root();
         let fiber = Fiber::pending();

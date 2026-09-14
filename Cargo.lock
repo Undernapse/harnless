@@ -1004,6 +1004,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "wasmparser 0.227.1",
  "wasmtime",
