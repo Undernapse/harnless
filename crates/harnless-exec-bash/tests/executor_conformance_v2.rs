@@ -37,7 +37,7 @@ use harnless_conformance::executor_suite::{
 use harnless_exec_bash::{BashLocal, ConfinedSpawner};
 use harnless_exec_sandbox::LocalSandbox;
 use harnless_exec_subprocess::SubprocessLocal;
-use harnless_seams::exec::{Shell, Sandbox, Subprocess};
+use harnless_seams::exec::{Sandbox, Shell, Subprocess};
 
 /// The cases the instantiation below names.
 ///
@@ -62,10 +62,8 @@ const CASES: &[&str] = &[
 /// case is still running commands in it. The OS reclaims the temp entries.
 fn scratch_root() -> &'static Path {
     static ROOT: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
-        let root = std::env::temp_dir().join(format!(
-            "harnless-exec-conformance-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("harnless-exec-conformance-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create scratch root");
         root.canonicalize().expect("canonical scratch root")
     });

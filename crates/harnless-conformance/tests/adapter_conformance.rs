@@ -218,9 +218,8 @@ impl Corpus {
         match defect {
             Defect::IndexOrderAlignment => {
                 let mut blocks = self.blocks.clone();
-                blocks.sort_by_key(|entry| {
-                    entry.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
-                });
+                blocks
+                    .sort_by_key(|entry| entry.get("index").and_then(|v| v.as_u64()).unwrap_or(0));
                 blocks
             }
             _ => self.blocks.clone(),
@@ -675,7 +674,6 @@ mod suite_passes_reference {
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].case, "not-a-real-case");
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -739,12 +737,18 @@ mod negative {
 
     #[test]
     fn bites_silent_completion_as_success() {
-        assert_bites(Defect::SilentIsSuccess, "empty_completion_is_retryable_failure");
+        assert_bites(
+            Defect::SilentIsSuccess,
+            "empty_completion_is_retryable_failure",
+        );
     }
 
     #[test]
     fn bites_miscoded_empty_completion() {
-        assert_bites(Defect::MiscodedEmpty, "empty_completion_is_retryable_failure");
+        assert_bites(
+            Defect::MiscodedEmpty,
+            "empty_completion_is_retryable_failure",
+        );
     }
 
     #[test]
@@ -769,7 +773,10 @@ mod negative {
 
     #[test]
     fn bites_index_order_alignment() {
-        assert_bites(Defect::IndexOrderAlignment, "replay_alignment_is_emission_order");
+        assert_bites(
+            Defect::IndexOrderAlignment,
+            "replay_alignment_is_emission_order",
+        );
     }
 
     #[test]
@@ -854,9 +861,7 @@ mod negative {
     fn a_panicking_provider_is_a_violation_not_a_crash() {
         let violations = bites(Defect::Panics, "usage_before_finish");
         assert!(
-            violations
-                .iter()
-                .any(|v| v.detail.contains("panicked")),
+            violations.iter().any(|v| v.detail.contains("panicked")),
             "panicking provider was not reported: {violations:?}"
         );
     }

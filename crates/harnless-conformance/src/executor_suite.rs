@@ -106,8 +106,7 @@ pub struct Executors {
 /// the shipped shell, but taking the legs as arguments so the suite can hand it
 /// the recorders. Build the shell the way production does — same wiring, same
 /// types — and pass the legs through.
-pub type ShellOver =
-    fn(Arc<dyn Sandbox>, Arc<dyn Subprocess>) -> Arc<dyn Shell>;
+pub type ShellOver = fn(Arc<dyn Sandbox>, Arc<dyn Subprocess>) -> Arc<dyn Shell>;
 
 impl Executors {
     /// A bundle with no legs set; fill the ones the provider has.
@@ -230,11 +229,7 @@ impl ExecFixture {
 
     /// Declare the injected proof/control pair.
     #[must_use]
-    pub fn proof_vars(
-        mut self,
-        proof: impl Into<String>,
-        control: impl Into<String>,
-    ) -> Self {
+    pub fn proof_vars(mut self, proof: impl Into<String>, control: impl Into<String>) -> Self {
         self.proof_var = Some((proof.into(), PROOF_ENV_VALUE.to_string()));
         self.control_var = Some((control.into(), CONTROL_ENV_VALUE.to_string()));
         self
@@ -312,18 +307,17 @@ fn check_case_into(
     }
     // The fixture is the harness's own construction; a factory that panics
     // is the provider misbehaving on the suite's input.
-    let fixture = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (fixture_for)(case)
-    })) {
-        Ok(fixture) => fixture,
-        Err(_) => {
-            out.push(Violation::new(
-                case.to_string(),
-                "the fixture factory panicked while building this case's fixtures",
-            ));
-            return;
-        }
-    };
+    let fixture =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (fixture_for)(case))) {
+            Ok(fixture) => fixture,
+            Err(_) => {
+                out.push(Violation::new(
+                    case.to_string(),
+                    "the fixture factory panicked while building this case's fixtures",
+                ));
+                return;
+            }
+        };
     let mut cx = Cx::default();
     match case {
         "sandbox_sees_exact_argv" => sandbox_sees_exact_argv(providers, &fixture, &mut cx),
@@ -434,9 +428,7 @@ impl Ran {
 }
 
 fn run(shell: &dyn Shell, command: &str, policy: &PolicyHome) -> Ran {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        shell.exec(command, policy)
-    })) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shell.exec(command, policy))) {
         Ok(Ok(out)) => Ran::Ok(out),
         Ok(Err(err)) => Ran::Err(err.code, err.message.clone()),
         Err(_) => Ran::Panicked,
@@ -514,7 +506,10 @@ fn sandbox_sees_exact_argv(providers: &Executors, fixture: &ExecFixture, cx: &mu
         spawned: spawned.clone(),
     });
     let shell = match providers.shell_over {
-        Some(over) => over(Arc::clone(&recording_sandbox), Arc::clone(&recording_subprocess)),
+        Some(over) => over(
+            Arc::clone(&recording_sandbox),
+            Arc::clone(&recording_subprocess),
+        ),
         None => Arc::clone(providers.shell.as_ref().expect("checked by cx.leg")),
     };
     let recording_shell = Arc::new(LoggingShell {
@@ -625,11 +620,7 @@ fn enforced_reason_is_never_blank(providers: &Executors, fixture: &ExecFixture, 
     let Some(root) = cx.root(fixture) else {
         return;
     };
-    let argv = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        "true".to_string(),
-    ];
+    let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()];
     for (label, confined) in [("permitted", false), ("confined", true)] {
         let policy = PolicyHome {
             workspace_root: root.display().to_string(),
@@ -683,11 +674,7 @@ fn refusal_is_never_reported_as_confined(
     let Some(root) = cx.root(fixture) else {
         return;
     };
-    let argv = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        "true".to_string(),
-    ];
+    let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()];
     // A refusing fixture is the harness's to build: a root that cannot be
     // entered is the portable way to ask a sandbox for a refusal.
     let missing = root.join("harnless-conformance-vanished-root");
@@ -753,7 +740,9 @@ fn consumer_routes_on_allowed(providers: &Executors, fixture: &ExecFixture, cx: 
         cx.skip("harness provisioned no scratch workspace root");
         return;
     };
-    if cx.leg(&providers.shell, "shell").is_none() || cx.leg(&providers.subprocess, "subprocess").is_none() {
+    if cx.leg(&providers.shell, "shell").is_none()
+        || cx.leg(&providers.subprocess, "subprocess").is_none()
+    {
         return;
     }
     let marker = marker_in(
@@ -911,16 +900,15 @@ fn await_sentinel(subprocess: &dyn Subprocess, cwd: &str) -> std::result::Result
         cwd: Some(cwd.to_string()),
         confine: None,
     };
-    let handle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        subprocess.spawn(&spawn)
-    }))
-    .map_err(|_| "the subprocess panicked spawning a plain command".to_string())?
-    .map_err(|err| {
-        format!(
-            "subprocess refused the cancellation fixture (`{}`)",
-            err.code.as_str()
-        )
-    })?;
+    let handle =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| subprocess.spawn(&spawn)))
+            .map_err(|_| "the subprocess panicked spawning a plain command".to_string())?
+            .map_err(|err| {
+                format!(
+                    "subprocess refused the cancellation fixture (`{}`)",
+                    err.code.as_str()
+                )
+            })?;
     // `output()` blocks for the child's whole life, so the announcement is read on
     // a worker. The handle moves in and comes back on the way out, so the probe can
     // be stopped whether or not the announcement ever arrived.
@@ -991,7 +979,10 @@ fn denied_command_never_runs(providers: &Executors, fixture: &ExecFixture, cx: &
     let _ = std::fs::remove_file(&marker);
 
     let denied_policy = PolicyHome {
-        workspace_root: root.join("harnless-conformance-vanished-root").display().to_string(),
+        workspace_root: root
+            .join("harnless-conformance-vanished-root")
+            .display()
+            .to_string(),
         default_confined: true,
     };
     let verdict = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1070,11 +1061,7 @@ fn denied_command_never_runs(providers: &Executors, fixture: &ExecFixture, cx: &
 /// was in the child's spawn environment — a provider whose spawner cannot
 /// inject one skips that half rather than asserting on a variable it cannot
 /// place.
-fn confined_run_is_actually_confined(
-    providers: &Executors,
-    fixture: &ExecFixture,
-    cx: &mut Cx,
-) {
+fn confined_run_is_actually_confined(providers: &Executors, fixture: &ExecFixture, cx: &mut Cx) {
     let Some(policy) = fixture.policy() else {
         cx.skip("harness provisioned no scratch workspace root");
         return;
@@ -1109,7 +1096,11 @@ fn confined_run_is_actually_confined(
     };
     let verdict = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sandbox.enforce(
-            &vec!["/bin/sh".to_string(), "-c".to_string(), inspect_command().to_string()],
+            &vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                inspect_command().to_string(),
+            ],
             &policy,
         )
     })) {
@@ -1227,22 +1218,21 @@ fn cancellation_is_honoured(providers: &Executors, fixture: &ExecFixture, cx: &m
         cwd: Some(policy.workspace_root.clone()),
         confine: None,
     };
-    let handle = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        subprocess.spawn(&spawn)
-    })) {
-        Ok(Ok(handle)) => handle,
-        Ok(Err(err)) => {
-            cx.skip(format!(
-                "subprocess refused the cancellation fixture (`{}`)",
-                err.code.as_str()
-            ));
-            return;
-        }
-        Err(_) => {
-            cx.fail("the subprocess panicked spawning a plain command");
-            return;
-        }
-    };
+    let handle =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| subprocess.spawn(&spawn))) {
+            Ok(Ok(handle)) => handle,
+            Ok(Err(err)) => {
+                cx.skip(format!(
+                    "subprocess refused the cancellation fixture (`{}`)",
+                    err.code.as_str()
+                ));
+                return;
+            }
+            Err(_) => {
+                cx.fail("the subprocess panicked spawning a plain command");
+                return;
+            }
+        };
 
     // Let the child reach the state `cancel` is meant to interrupt before
     // signalling it. A provider that kills a process still in `exec` can leave a
@@ -1415,7 +1405,6 @@ mod recorder {
                 .last()
                 .cloned()
         }
-
     }
 }
 
@@ -1503,20 +1492,13 @@ pub fn injected_verdict() -> Option<Enforced> {
 
 /// Install `verdict` as the sandbox's answer for the duration of one case.
 fn inject(verdict: Enforced) {
-    INJECTED.with(|slot| {
-        *slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(verdict)
-    });
+    INJECTED
+        .with(|slot| *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(verdict));
 }
 
 /// Clear any installed verdict.
 fn clear_injection() {
-    INJECTED.with(|slot| {
-        *slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None
-    });
+    INJECTED.with(|slot| *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None);
 }
 
 /// The reason every injected verdict carries (see [`INJECTED_MARKER`]).

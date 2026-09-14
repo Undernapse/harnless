@@ -677,7 +677,6 @@ fn describe(event: &StreamEvent) -> String {
 /// recorded as a throw, one that panics is recorded as a panic, and one
 /// that hangs is recorded as a stall.
 fn drive(adapter: &dyn ModelAdapter, scenario: &Scenario) -> Collected {
-
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         adapter.stream(
             harnless_seams::CallId(1),
@@ -800,16 +799,14 @@ async fn pump(mut stream: BoxStream, sender: mpsc::Sender<Step>, stop: std::sync
         }
         // Race the provider's next event against the stop flag so a stream
         // that awaits forever still observes the bound.
-        let polled = futures_lite::future::or(
-            async { stream.next().await.map(Step::Event) },
-            async {
+        let polled =
+            futures_lite::future::or(async { stream.next().await.map(Step::Event) }, async {
                 while !stop.load(Ordering::SeqCst) {
                     futures_lite::future::yield_now().await;
                 }
                 Some(Step::End)
-            },
-        )
-        .await;
+            })
+            .await;
         match polled {
             Some(step) => {
                 let terminal = matches!(step, Step::End);
@@ -941,7 +938,10 @@ fn usage_before_finish(adapter: &dyn ModelAdapter, scenario: &Scenario, cx: &mut
     if collected.panic_note(cx, "usage before finish") || collected.refused(cx) {
         return;
     }
-    let finish = collected.frames.iter().position(|f| *f == StreamFrame::Finish);
+    let finish = collected
+        .frames
+        .iter()
+        .position(|f| *f == StreamFrame::Finish);
     let usage = collected
         .frames
         .iter()
@@ -1008,7 +1008,10 @@ fn nothing_after_finish(adapter: &dyn ModelAdapter, scenario: &Scenario, cx: &mu
         cx.skip("scenario scripts a failed stream; its terminal shape is the failure case's job");
         return;
     }
-    let finish = collected.frames.iter().position(|f| *f == StreamFrame::Finish);
+    let finish = collected
+        .frames
+        .iter()
+        .position(|f| *f == StreamFrame::Finish);
     match finish {
         Some(pos) if pos + 1 == collected.frames.len() => {}
         Some(pos) => cx.fail(format!(
@@ -1554,10 +1557,7 @@ fn replay_alignment_is_emission_order(
     }
     // Stored metadata must survive the keep-or-drop decision too.
     if assembler.truncated() {
-        if blocks
-            .iter()
-            .any(|block| block.kind == BlockKind::ToolCall)
-        {
+        if blocks.iter().any(|block| block.kind == BlockKind::ToolCall) {
             cx.fail(
                 "truncated stream kept tool-call blocks; a partial call is unsafe to \
                  execute",
@@ -1650,7 +1650,10 @@ mod tests {
         drop(stream);
         let pending = Box::pin(futures_lite::stream::pending::<StreamEvent>());
         let collected = collect_stream(pending, Duration::from_millis(120));
-        assert!(collected.stalled, "stalled stream was not reported: {collected:?}");
+        assert!(
+            collected.stalled,
+            "stalled stream was not reported: {collected:?}"
+        );
         drop(receiver);
     }
 
@@ -1677,8 +1680,7 @@ mod tests {
         fn scenario_for(_case: &str, _kind: ScenarioKind) -> Scenario {
             Scenario::new(Vec::new())
         }
-        let violations =
-            check_model_adapter_contract(&Panics, "usage_before_finish", scenario_for);
+        let violations = check_model_adapter_contract(&Panics, "usage_before_finish", scenario_for);
         assert!(
             violations.iter().any(|v| v.detail.contains("panicked")),
             "panicking provider was not reported as a violation: {violations:?}"

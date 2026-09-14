@@ -484,13 +484,7 @@ impl harnless_seams::llm::ModelAdapter for WholeSuite {
         static EMPTY: std::sync::LazyLock<(Vec<Message>, Vec<ToolSchema>)> =
             std::sync::LazyLock::new(|| (Vec::new(), Vec::new()));
         let (messages, tools) = &*EMPTY;
-        harnless_seams::llm::ModelAdapter::stream(
-            self.active(),
-            call_id,
-            messages,
-            tools,
-            replay,
-        )
+        harnless_seams::llm::ModelAdapter::stream(self.active(), call_id, messages, tools, replay)
     }
 }
 
@@ -601,9 +595,7 @@ async fn a_broken_corpus_throws_rather_than_failing_in_band() {
             while let Some(event) = stream.next().await {
                 events.push(event);
             }
-            let failed = events
-                .iter()
-                .any(|e| matches!(e, StreamEvent::Failed(_)));
+            let failed = events.iter().any(|e| matches!(e, StreamEvent::Failed(_)));
             assert!(
                 failed,
                 "a corpus violating the stream protocol replayed as a normal completion: \
@@ -632,12 +624,7 @@ async fn an_empty_recording_fails_with_the_retryable_code() {
 
     let adapter = make_adapter_for("empty_completion_is_retryable_failure");
     let mut stream = adapter
-        .stream(
-            harnless_seams::CallId(1),
-            &[user_message()],
-            &[],
-            None,
-        )
+        .stream(harnless_seams::CallId(1), &[user_message()], &[], None)
         .expect("empty corpus is a valid corpus");
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
@@ -658,9 +645,9 @@ async fn an_empty_recording_fails_with_the_retryable_code() {
         failure.code.as_str()
     );
     assert!(
-        !events.iter().any(|e| matches!(e, StreamEvent::Frame(StreamFrame::Finish))),
+        !events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Frame(StreamFrame::Finish))),
         "an empty completion also finished; a stream ends exactly one way"
     );
 }
-
-

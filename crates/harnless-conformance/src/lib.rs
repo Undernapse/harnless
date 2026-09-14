@@ -58,12 +58,11 @@ pub mod types;
 
 pub use adapter_suite::{
     check_model_adapter_cases, check_model_adapter_contract, check_model_adapter_contract_all,
-    ADAPTER_CONFORMANCE_CASES,
-    Scenario, ScenarioFactory, ScenarioKind,
+    Scenario, ScenarioFactory, ScenarioKind, ADAPTER_CONFORMANCE_CASES,
 };
 pub use executor_suite::{
-    check_executor_contract, check_executor_contract_all, injected_verdict, EXECUTOR_CONFORMANCE_CASES,
-    ExecFixture, ExecutorFixtureFactory, Executors, INJECTED_MARKER,
+    check_executor_contract, check_executor_contract_all, injected_verdict, ExecFixture,
+    ExecutorFixtureFactory, Executors, EXECUTOR_CONFORMANCE_CASES, INJECTED_MARKER,
 };
 pub use fs_suite::{check_case, check_file_system, CONFORMANCE_CASES};
 pub use stubs::{check_credentials, check_settings, check_storage};

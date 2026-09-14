@@ -279,7 +279,10 @@ mod tests {
             k
         }
         assert_eq!(keys(&built[0]), ["description", "name", "parameters"]);
-        assert_eq!(keys(&built[1]), ["description", "name", "parameters", "strict"]);
+        assert_eq!(
+            keys(&built[1]),
+            ["description", "name", "parameters", "strict"]
+        );
         assert_eq!(built[0].get("strict"), None);
         assert_eq!(built[0]["function"].get("strict"), None);
     }

@@ -31,11 +31,7 @@ struct SpyRegistry {
 
 impl SpyRegistry {
     fn definition(&self, name: &str) -> Option<ToolDefinition> {
-        self.tools
-            .lock()
-            .iter()
-            .find(|d| d.name == name)
-            .cloned()
+        self.tools.lock().iter().find(|d| d.name == name).cloned()
     }
 
     fn registrations(&self, name: &str) -> usize {
@@ -217,7 +213,9 @@ mod over_the_wire {
                 .collect();
             let responder = scripted(tools, |req| {
                 let name = req.params["name"].as_str().unwrap_or("?");
-                Response::Result(json!({"content": [{"type": "text", "text": format!("{name} ok")}]}))
+                Response::Result(
+                    json!({"content": [{"type": "text", "text": format!("{name} ok")}]}),
+                )
             });
             let fake = fake_server(responder);
             harnless_mcp::supervisor::serve_fake(

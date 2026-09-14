@@ -12,9 +12,9 @@
 //! skip rule, which is itself asserted here.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use harnless_conformance::executor_suite::{
     check_executor_contract, check_executor_contract_all, ExecFixture, Executors,
@@ -318,11 +318,10 @@ impl SpawnHandle for ReferenceHandle {
             ));
         }
         let (stdout, stderr) = reader;
-        let mut out = stdout
-            .map_err(|_| SeamError::new(ErrorCode::IoError, "output reader panicked"))??;
+        let mut out =
+            stdout.map_err(|_| SeamError::new(ErrorCode::IoError, "output reader panicked"))??;
         out.push_str(
-            &stderr
-                .map_err(|_| SeamError::new(ErrorCode::IoError, "output reader panicked"))??,
+            &stderr.map_err(|_| SeamError::new(ErrorCode::IoError, "output reader panicked"))??,
         );
         if status.success() {
             return Ok(out);
@@ -381,11 +380,7 @@ struct ReferenceShell {
 impl ReferenceShell {
     /// The exact argv a command line spawns with.
     fn argv_for(&self, command: &str) -> Vec<String> {
-        vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            command.to_string(),
-        ]
+        vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()]
     }
 }
 
@@ -520,10 +515,7 @@ impl World {
     /// The suite needs a `fn` pointer, so the defect and the proof variables
     /// come from the world the driver installed rather than a captured `self`.
     /// This is the same construction [`World::executors_over`] performs.
-    fn build_shell(
-        sandbox: Arc<dyn Sandbox>,
-        subprocess: Arc<dyn Subprocess>,
-    ) -> Arc<dyn Shell> {
+    fn build_shell(sandbox: Arc<dyn Sandbox>, subprocess: Arc<dyn Subprocess>) -> Arc<dyn Shell> {
         let state = WORLD
             .with(|slot| {
                 slot.lock()
@@ -590,14 +582,21 @@ impl World {
     /// and every spawn it hands is a call the suite's recorders will see on
     /// top. This is the wiring the handover case requires of any harness: the
     /// legs handed to the suite must be the legs the shell uses.
-    fn executors_over(&self, sandbox: Arc<dyn Sandbox>, subprocess: Arc<dyn Subprocess>) -> Executors {
+    fn executors_over(
+        &self,
+        sandbox: Arc<dyn Sandbox>,
+        subprocess: Arc<dyn Subprocess>,
+    ) -> Executors {
         let shell = World::shell_for(
             self.defect,
             self.proof_vars(),
             Arc::clone(&sandbox),
             Arc::clone(&subprocess),
         );
-        Executors::new().shell(shell).sandbox(sandbox).subprocess(subprocess)
+        Executors::new()
+            .shell(shell)
+            .sandbox(sandbox)
+            .subprocess(subprocess)
     }
 
     /// The proof/control variables, when this world's spawner places them.
@@ -797,11 +796,7 @@ struct IgnoringRefusalShell {
 
 impl Shell for IgnoringRefusalShell {
     fn exec(&self, command: &str, policy: &PolicyHome) -> Result<String> {
-        let argv = vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            command.to_string(),
-        ];
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()];
         // The fixture's sandbox replays the injected verdict (see
         // `ReferenceSandbox::enforce`), so the shell under test sees the same
         // verdict here as the reference shell does. Reading `confined` instead
@@ -829,8 +824,14 @@ impl Shell for IgnoringRefusalShell {
         // disobedience; the suite's injected verdicts — recognisable by the
         // reason the suite stamps on them — are decided by the buggy field,
         // which is the behaviour the routing case exists to catch.
-        let injected = enforced.reason.contains(harnless_conformance::INJECTED_MARKER);
-        let permitted = if injected { enforced.confined } else { enforced.allowed };
+        let injected = enforced
+            .reason
+            .contains(harnless_conformance::INJECTED_MARKER);
+        let permitted = if injected {
+            enforced.confined
+        } else {
+            enforced.allowed
+        };
         if !permitted && !injected {
             let spawn = Spawn {
                 argv,
@@ -868,11 +869,7 @@ struct UnconsultedShell {
 impl Shell for UnconsultedShell {
     fn exec(&self, command: &str, policy: &PolicyHome) -> Result<String> {
         let spawn = Spawn {
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                command.to_string(),
-            ],
+            argv: vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()],
             cwd: Some(policy.workspace_root.clone()),
             confine: None,
         };
@@ -888,11 +885,7 @@ impl Shell for FabricatingShell {
     fn exec(&self, command: &str, policy: &PolicyHome) -> Result<String> {
         let reference = ReferenceSubprocess::new();
         let spawn = Spawn {
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                command.to_string(),
-            ],
+            argv: vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()],
             cwd: Some(policy.workspace_root.clone()),
             confine: None,
         };
@@ -911,11 +904,7 @@ impl Shell for RelabelingShell {
     fn exec(&self, command: &str, policy: &PolicyHome) -> Result<String> {
         let reference = ReferenceSubprocess::new();
         let spawn = Spawn {
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                command.to_string(),
-            ],
+            argv: vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()],
             cwd: Some(policy.workspace_root.clone()),
             confine: None,
         };
@@ -961,9 +950,7 @@ thread_local! {
 /// borrows only its path, so no second owner can remove it early.
 fn install(world: &World) {
     WORLD.with(|slot| {
-        *slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(WorldState {
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(WorldState {
             root: world.scratch.path().to_path_buf(),
             defect: world.defect,
             injects: world.injects,
@@ -1068,7 +1055,10 @@ mod negative {
 
     #[test]
     fn bites_refusal_reported_as_confinement() {
-        assert_bites(Defect::RefusalLooksConfined, "refusal_is_never_reported_as_confined");
+        assert_bites(
+            Defect::RefusalLooksConfined,
+            "refusal_is_never_reported_as_confined",
+        );
     }
 
     #[test]
@@ -1083,7 +1073,10 @@ mod negative {
 
     #[test]
     fn bites_confinement_that_is_not_applied() {
-        assert_bites(Defect::ClaimsConfinement, "confined_run_is_actually_confined");
+        assert_bites(
+            Defect::ClaimsConfinement,
+            "confined_run_is_actually_confined",
+        );
     }
 
     #[test]
@@ -1109,7 +1102,9 @@ mod negative {
         let world = World::new("never", Defect::RefusesBeforeSandbox);
         let violations = check(&world, "sandbox_sees_exact_argv");
         assert!(
-            violations.iter().all(|v| v.case == "sandbox_sees_exact_argv"),
+            violations
+                .iter()
+                .all(|v| v.case == "sandbox_sees_exact_argv"),
             "unexpected attributions: {violations:?}"
         );
     }
@@ -1121,7 +1116,10 @@ mod negative {
         struct EarlyRefusal;
         impl Shell for EarlyRefusal {
             fn exec(&self, _command: &str, _policy: &PolicyHome) -> Result<String> {
-                Err(SeamError::new(ErrorCode::ToolDenied, "policy refuses everything"))
+                Err(SeamError::new(
+                    ErrorCode::ToolDenied,
+                    "policy refuses everything",
+                ))
             }
         }
         // The world's shell constructor is replaced with one that builds the
@@ -1170,9 +1168,8 @@ mod negative {
         for case in EXECUTOR_CONFORMANCE_CASES {
             for defect in defects {
                 let world = World::new("nopanic", defect);
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    check(&world, case)
-                }));
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&world, case)));
                 assert!(
                     outcome.is_ok(),
                     "defect {defect:?} crashed the suite on case `{case}`"

@@ -545,8 +545,13 @@ fn guarded_pipeline_runs_every_stage_in_locked_order() {
         ],
     );
     let tool = CountingTool::new(r#"{"echo":"1"}"#);
-    h.register_tool("echo", "test tool", serde_json::json!({"type":"object"}), tool.clone())
-        .unwrap();
+    h.register_tool(
+        "echo",
+        "test tool",
+        serde_json::json!({"type":"object"}),
+        tool.clone(),
+    )
+    .unwrap();
 
     // 1. Pre-execute: allow (and record the stage).
     {
@@ -932,8 +937,13 @@ fn post_execute_listener_runs_in_the_locked_order() {
         ],
     );
     let tool = CountingTool::new(r#"{"echo":"1"}"#);
-    h.register_tool("echo", "test tool", serde_json::json!({"type":"object"}), tool.clone())
-        .unwrap();
+    h.register_tool(
+        "echo",
+        "test tool",
+        serde_json::json!({"type":"object"}),
+        tool.clone(),
+    )
+    .unwrap();
     h.allow_all().unwrap();
     let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     {
@@ -971,8 +981,13 @@ fn tool_exchange_harness(session: u64) -> (Harness, Arc<CountingTool>) {
         ],
     );
     let tool = CountingTool::new(r#"{"echo":"1"}"#);
-    h.register_tool("echo", "test tool", serde_json::json!({"type":"object"}), tool.clone())
-        .unwrap();
+    h.register_tool(
+        "echo",
+        "test tool",
+        serde_json::json!({"type":"object"}),
+        tool.clone(),
+    )
+    .unwrap();
     h.allow_all().unwrap();
     (h, tool)
 }
@@ -997,9 +1012,11 @@ fn post_execute_replace_changes_the_logged_tool_result() {
     let (h, tool) = tool_exchange_harness(1932);
     let _post = h
         .tools
-        .on_post_execute(|_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
-            PostDecision::Replace(serde_json::json!({"redacted": true}))
-        })
+        .on_post_execute(
+            |_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
+                PostDecision::Replace(serde_json::json!({"redacted": true}))
+            },
+        )
         .unwrap();
     let _ = h.run_tool_turn();
     assert_eq!(tool.invocations(), 1, "the body still ran");
@@ -1023,9 +1040,11 @@ fn post_execute_block_logs_the_denial_code() {
     let (h, tool) = tool_exchange_harness(1933);
     let _post = h
         .tools
-        .on_post_execute(|_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
-            PostDecision::Block("policy says no".into())
-        })
+        .on_post_execute(
+            |_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
+                PostDecision::Block("policy says no".into())
+            },
+        )
         .unwrap();
     let _ = h.run_tool_turn();
     assert_eq!(tool.invocations(), 1, "the body ran before the post stage");
@@ -1042,9 +1061,11 @@ fn post_execute_add_context_keeps_the_result_and_surfaces_context() {
     let (h, _tool) = tool_exchange_harness(1934);
     let _post = h
         .tools
-        .on_post_execute(|_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
-            PostDecision::AddContext(vec![serde_json::json!({"note": "extra"})])
-        })
+        .on_post_execute(
+            |_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
+                PostDecision::AddContext(vec![serde_json::json!({"note": "extra"})])
+            },
+        )
         .unwrap();
     let _ = h.run_tool_turn();
     // Both records are in the log, in order: the sink's context record is
@@ -1085,17 +1106,21 @@ fn post_execute_veto_hides_later_listeners_and_the_built_in() {
     let later_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _outer = h
         .tools
-        .on_post_execute(|_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
-            PostDecision::Replace(serde_json::json!({"vetoed": true}))
-        })
+        .on_post_execute(
+            |_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
+                PostDecision::Replace(serde_json::json!({"vetoed": true}))
+            },
+        )
         .unwrap();
     let ran = later_ran.clone();
     let _inner = h
         .tools
-        .on_post_execute(move |_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
-            ran.store(true, std::sync::atomic::Ordering::SeqCst);
-            PostDecision::Replace(serde_json::json!({"inner": true}))
-        })
+        .on_post_execute(
+            move |_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                PostDecision::Replace(serde_json::json!({"inner": true}))
+            },
+        )
         .unwrap();
     let _ = h.run_tool_turn();
     assert!(
@@ -1119,25 +1144,29 @@ fn post_execute_listeners_compose_outermost_first_through_the_log() {
     let trace = order.clone();
     let _outer = h
         .tools
-        .on_post_execute(move |e: &mut PostExecute, next: &mut harnless_agent::BridgeNext| {
-            trace.lock().unwrap().push("outer".into());
-            match next.call((e.0, e.1.clone())) {
-                PostDecision::Replace(v) => {
-                    let mut obj = v.as_object().cloned().unwrap_or_default();
-                    obj.insert("outer".into(), serde_json::json!(true));
-                    PostDecision::Replace(serde_json::Value::Object(obj))
+        .on_post_execute(
+            move |e: &mut PostExecute, next: &mut harnless_agent::BridgeNext| {
+                trace.lock().unwrap().push("outer".into());
+                match next.call((e.0, e.1.clone())) {
+                    PostDecision::Replace(v) => {
+                        let mut obj = v.as_object().cloned().unwrap_or_default();
+                        obj.insert("outer".into(), serde_json::json!(true));
+                        PostDecision::Replace(serde_json::Value::Object(obj))
+                    }
+                    other => other,
                 }
-                other => other,
-            }
-        })
+            },
+        )
         .unwrap();
     let trace = order.clone();
     let _inner = h
         .tools
-        .on_post_execute(move |_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
-            trace.lock().unwrap().push("inner".into());
-            PostDecision::Replace(serde_json::json!({"inner": true}))
-        })
+        .on_post_execute(
+            move |_: &mut PostExecute, _next: &mut harnless_agent::BridgeNext| {
+                trace.lock().unwrap().push("inner".into());
+                PostDecision::Replace(serde_json::json!({"inner": true}))
+            },
+        )
         .unwrap();
     let _ = h.run_tool_turn();
     assert_eq!(
