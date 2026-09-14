@@ -17,11 +17,10 @@
 //! is about. So the corpus here is produced the way a live corpus is produced,
 //! round-tripped through golden JSON, and only then handed to the adapter.
 
-use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use harnless_conformance::adapter_suite::{Scenario, ScenarioKind, ADAPTER_CONFORMANCE_CASES};
+use harnless_conformance::adapter_suite::{Scenario, ScenarioKind};
 use harnless_llm_replay::{Recording, ReplayAdapter, Script};
 use harnless_seams::error::ErrorCode;
 use harnless_seams::ids::MessageId;
@@ -264,7 +263,14 @@ impl Corpus {
     }
 
     /// The scenario a provider harness builds for this corpus.
-    fn scenario(&self, kind: ScenarioKind) -> Scenario {
+    ///
+    /// `marker` is the ownership-marker *value* stamped into the scenario:
+    /// exactly [`PROVIDER`], which is what [`ReplayAdapter::owns`]
+    /// exact-name-matches. The whole-suite harness routes a stream by the
+    /// running case's *index* — a process-wide slot the scenario factory
+    /// writes and the wrapper reads (see [`WholeSuite`]) — so the scenario
+    /// itself never carries harness state.
+    fn scenario(&self, kind: ScenarioKind, marker: &str) -> Scenario {
         // The suite cannot know which key this adapter stamps into replay state,
         // so the harness declares it up front — before any ownership document is
         // built, and once, in the single place scenarios are constructed. The key
@@ -273,7 +279,7 @@ impl Corpus {
         // `owns()` with a document this adapter has no reason to recognise, and a
         // pass would prove nothing about the real handoff.
         let scenario = Scenario::new(vec![user_message()])
-            .ownership_marker(REPLAY_OWNER_KEY, PROVIDER)
+            .ownership_marker(REPLAY_OWNER_KEY, marker)
             .expected(self.frames.clone())
             // The replay adapter appends exactly what the recording carries, in
             // the order the recording carries it. Declaring this (rather than
@@ -289,7 +295,7 @@ impl Corpus {
             Some(failure) => scenario.failure(failure.clone()),
             None => scenario,
         };
-        if kind == ScenarioKind::TextTurn {
+        if Corpus::carries_replay(kind) {
             // The ownership case is the one that hands `stream()` state this
             // adapter claims; it drives the plain text corpus. `with_owned_replay`
             // builds the document from the marker declared on this scenario, so
@@ -359,21 +365,7 @@ fn foreign_state() -> ReplayState {
 /// corpus survives in, and the replay adapter restores frames from it — so a
 /// case that skipped the round-trip would pass on a capture path that no real
 /// corpus ever takes.
-/// Build the scenario for one case: capture its corpus, round-trip it through
-/// golden JSON, and describe what the adapter owes back.
-///
-/// The JSON round-trip is not decoration. A golden file is the only form a
-/// corpus survives in, and the replay adapter restores frames from it — so a
-/// case that skipped the round-trip would pass on a capture path that no real
-/// corpus ever takes.
 fn scenario_for(case: &str, kind: ScenarioKind) -> Scenario {
-    // Tell the whole-suite adapter which case is about to be driven. The suite
-    // builds the scenario before it drives the stream, so the right corpus is
-    // installed by the time the adapter is touched. No effect on the per-case
-    // tests, which never build a `WholeSuite`.
-    if let Some(index) = ADAPTER_CONFORMANCE_CASES.iter().position(|c| *c == case) {
-        *WHOLE_SUITE.lock().expect("whole-suite slot") = index;
-    }
     let corpus = Corpus::for_case(case);
     let recording = corpus.recording();
     // The suite cannot know which key this adapter stamps into replay state, so
@@ -383,7 +375,6 @@ fn scenario_for(case: &str, kind: ScenarioKind) -> Scenario {
     // Without the declaration the ownership case would drive `owns()` with a
     // document this adapter has no reason to recognise, and a pass would mean
     // nothing.
-    let _ = &recording;
     let restored = Recording::from_json(&recording.to_json().expect("serialize recording"))
         .expect("restore recording");
     // The restored recording must still be the corpus the case is about; a lossy
@@ -393,10 +384,17 @@ fn scenario_for(case: &str, kind: ScenarioKind) -> Scenario {
         corpus.frames,
         "the golden round-trip changed the {kind:?} corpus"
     );
-    let scenario = corpus.scenario(kind);
+    let mut scenario = corpus.scenario(kind, PROVIDER);
     // The suite's stall bound is generous for a local replay, but a provider
     // that never yields would otherwise hang the run for the full window.
-    scenario.stall_timeout(Duration::from_secs(5))
+    scenario.stall_timeout = Duration::from_secs(5);
+    // Register the corpus this scenario drives, keyed by the scenario's own
+    // identity, so the whole-suite adapter serves it to the stream this case
+    // opens (see [`WholeSuite`]). Registration happens on the test thread
+    // before the scenario leaves the factory, and the suite's drive thread only
+    // ever looks the key up after that.
+    WholeSuite::register(&scenario, restored);
+    scenario
 }
 
 /// An adapter scripted with one case's captured recording.
@@ -418,7 +416,7 @@ fn make_adapter(case: &str) -> ReplayAdapter {
     ReplayAdapter::new(PROVIDER, Script::one(Corpus::for_case(case).recording()))
 }
 
-/// The whole-suite adapter: a fresh per-case adapter behind one seam object.
+/// The whole-suite adapter: every case's corpus behind one seam object.
 ///
 /// # Why not one script of ten recordings
 ///
@@ -433,35 +431,80 @@ fn make_adapter(case: &str) -> ReplayAdapter {
 /// onto the wrong corpus. The suite then reports a violation blaming the provider
 /// for a mix-up that lives in the harness.
 ///
-/// So this holds one *single-recording* adapter per case and routes each stream to
-/// the adapter scripted with the running case's corpus. The case is known because
-/// the suite builds the scenario before it drives the stream, and [`scenario_for`]
-/// — the only code that sees the case name — records it in [`WHOLE_SUITE`].
+/// # Why route by scenario identity
 ///
-/// # Why the arguments are replaced
+/// A process-wide "current case" slot is also unsafe, and was the original
+/// flake: the suite's drive thread is released at its next await point rather
+/// than killed, so a late `stream()` call from a dead case's worker can read
+/// whatever slot the *next* case has written and serve the wrong corpus. This
+/// harness instead keys each recording by the *scenario* it belongs to:
+/// [`scenario_for`] registers the scenario it builds, and `stream` rebuilds the
+/// key from the arguments it was handed — the suite passes the scenario's own
+/// messages, tools, and replay state through verbatim, so the key the wrapper
+/// computes is the key the factory registered. A late or mis-ordered call can
+/// only ever replay the corpus its scenario describes.
 ///
-/// The seam borrows `messages` and `tools`, so calling the inner adapter through
-/// `self` would tie the returned stream to this wrapper's borrow, which the suite
-/// releases before it finishes polling. The replay adapter ignores both arguments
-/// — its corpus is its script, and it does not even read the replay state — so
-/// handing it `'static` empty slices severs the borrow without changing what it
-/// emits. A provider that *reads* its inputs cannot be wrapped this way; it needs
-/// a per-case adapter handed over directly, which is what the per-case tests do.
+/// The key is the scenario's observable identity: its messages, tools, and
+/// replay state. Those are distinct per case here because the corpora are
+/// distinct — the tool case's scenario carries the tool set, the ownership
+/// case's carries replay state, the rest carry the plain user message with no
+/// tools and no state. (Cases sharing a corpus *and* a scenario — the two
+/// failed-turn cases — share a recording too, which is exactly right: their
+/// corpora are the same.)
+///
+/// A scenario this harness never registered (a hand-built scenario from a
+/// sibling suite's shared fixture) falls back to the text-turn corpus, which is
+/// what such a scenario describes.
 struct WholeSuite {
-    /// One adapter per case, in the order the instantiation names them.
-    adapters: Vec<ReplayAdapter>,
+    /// The fallback corpus for foreign scenarios (see [`WholeSuite`]).
+    fallback: Recording,
+    /// A replay adapter used only for its `owns` contract — ownership is
+    /// identity-based, so any adapter under this provider's identity answers
+    /// identically for every case.
+    owner: ReplayAdapter,
 }
 
+/// A scenario's observable identity: what `stream` is handed.
+///
+/// JSON-serialising the pieces keeps the key total (the seam types are `Debug`
+/// and `PartialEq`, not `Hash`) and makes key equality exactly the scenarios'
+/// observable equality.
+#[derive(PartialEq, Eq, Hash)]
+struct ScenarioKey(String);
+
+/// The scenario→recording registry, shared by every [`WholeSuite`].
+///
+/// Process-wide because the suite's scenario factory is a plain `fn` item — it
+/// receives no adapter to register with — so the only object the factory can
+/// reach is a static. Entries are keyed by scenario identity, so even the
+/// per-case tests' registrations (which the whole-suite run never looks up,
+/// since those scenarios drive their own per-case adapters) cannot mis-pair a
+/// case: a lookup returns the recording registered for *that scenario*.
+static ROUTES: LazyLock<Mutex<std::collections::HashMap<ScenarioKey, Recording>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
 impl WholeSuite {
-    /// The adapter the running case drives.
-    ///
-    /// Falls back to the first adapter when no scenario has been built yet — a
-    /// harness driving this adapter directly rather than through the suite — so
-    /// the call answers a real corpus instead of panicking.
-    fn active(&self) -> &ReplayAdapter {
-        let index = *WHOLE_SUITE.lock().expect("whole-suite lock");
-        &self.adapters[index.min(self.adapters.len() - 1)]
+    /// Register the recording a scenario drives, keyed by its identity.
+    fn register(scenario: &Scenario, recording: Recording) {
+        let key = scenario_key(
+            &scenario.messages,
+            &scenario.tools,
+            scenario.replay.as_ref(),
+        );
+        ROUTES.lock().expect("route map").insert(key, recording);
     }
+}
+
+/// The identity key of a scenario's stream arguments.
+fn scenario_key(
+    messages: &[Message],
+    tools: &[ToolSchema],
+    replay: Option<&ReplayState>,
+) -> ScenarioKey {
+    // `Debug` is the total, deterministic rendering these types carry; the key
+    // only ever compares renderings of the same type, so the format is an
+    // implementation detail, not a contract.
+    ScenarioKey(format!("{messages:?} | {tools:?} | {replay:?}"))
 }
 
 impl harnless_seams::llm::ModelAdapter for WholeSuite {
@@ -469,46 +512,41 @@ impl harnless_seams::llm::ModelAdapter for WholeSuite {
         PROVIDER
     }
 
-    fn owns(&self, replay_state: &harnless_seams::llm::ReplayState) -> bool {
-        self.active().owns(replay_state)
+    fn owns(&self, replay_state: &ReplayState) -> bool {
+        self.owner.owns(replay_state)
     }
 
     fn stream(
         &self,
-        call_id: harnless_seams::CallId,
+        _call_id: harnless_seams::CallId,
         messages: &[Message],
         tools: &[ToolSchema],
-        replay: Option<harnless_seams::llm::ReplayState>,
+        replay: Option<ReplayState>,
     ) -> harnless_seams::error::Result<harnless_seams::llm::BoxStream> {
-        let _ = (messages, tools);
-        static EMPTY: std::sync::LazyLock<(Vec<Message>, Vec<ToolSchema>)> =
-            std::sync::LazyLock::new(|| (Vec::new(), Vec::new()));
-        let (messages, tools) = &*EMPTY;
-        harnless_seams::llm::ModelAdapter::stream(self.active(), call_id, messages, tools, replay)
+        let key = scenario_key(messages, tools, replay.as_ref());
+        let recording = ROUTES
+            .lock()
+            .expect("route map")
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| self.fallback.clone());
+        self.owner.stream_recording(&recording)
     }
 }
 
-/// The whole-suite factory: one [`WholeSuite`] holding a per-case adapter each.
-fn make_full_suite_adapter(cases: &[&str]) -> WholeSuite {
-    WholeSuite {
-        adapters: cases
-            .iter()
-            .map(|case| {
-                ReplayAdapter::new(PROVIDER, Script::one(Corpus::for_case(case).recording()))
-            })
-            .collect(),
-    }
-}
-
-/// The slot [`scenario_for`] uses to tell the running [`WholeSuite`] which case
-/// is being checked.
+/// The whole-suite factory.
 ///
-/// A process-wide slot rather than a thread-local one because the suite drives the
-/// stream on a *worker* thread: a thread-local written by the scenario factory on
-/// the test thread would be invisible to the adapter. The suite runs one case at a
-/// time, so a single slot suffices, and `Mutex` — not a `Cell` — is what makes it
-/// shareable across those threads.
-static WHOLE_SUITE: Mutex<usize> = Mutex::new(0);
+/// The route registry fills as [`scenario_for`] builds each case's scenario,
+/// which the suite does immediately before it drives that case — so by the time
+/// a stream is opened, its recording is registered. The factory cannot
+/// pre-register: scenario identity is what the key names, and only the factory
+/// builds scenarios.
+fn make_full_suite_adapter(_cases: &[&str]) -> WholeSuite {
+    WholeSuite {
+        fallback: Corpus::text_turn().recording(),
+        owner: ReplayAdapter::new(PROVIDER, Script::one(Corpus::text_turn().recording())),
+    }
+}
 
 harnless_conformance::conformance_tests_adapter! {
     replay,
