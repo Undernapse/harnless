@@ -62,15 +62,58 @@ impl WasiView for PluginState {
     }
 }
 
-/// Build the linker for a plugin config: WASI iff `fs` is granted, host
-/// `log` iff `log` is granted. Nothing else is ever wired.
+/// Build the linker for a plugin config. Only the interfaces a grant actually
+/// covers are registered — nothing else is ever wired.
+///
+/// * an `fs` grant registers **only** the WASI filesystem interface (plus the
+///   `wasi:io` plumbing it is written against). It deliberately does *not* use
+///   [`wasmtime_wasi::p2::add_to_linker_sync`], which registers the whole
+///   `wasi:cli/command` world — sockets, clocks, random, and CLI — because a
+///   filesystem grant must not silently hand the guest a network or a clock. A
+///   guest that imports `wasi:sockets/*` fails to *instantiate*, and that
+///   import-resolution failure is the capability boundary, not a runtime policy.
+/// * a `log` grant registers the host `log` import.
 pub fn build_linker(
     engine: &Engine,
     config: &PluginConfig,
 ) -> wasmtime::Result<Linker<PluginState>> {
     let mut linker = Linker::<PluginState>::new(engine);
     if config.fs_dir().is_some() {
-        wasmtime_wasi::p2::add_to_linker_sync::<PluginState>(&mut linker)?;
+        // Filesystem only. `wasi:io/error`, `poll`, and `streams` are the
+        // interfaces `wasi:filesystem/types` is typed against, so they must be
+        // present for the filesystem import to resolve; none of them reaches the
+        // network. Sockets, clocks, random, and CLI are left unregistered.
+        use wasmtime::component::HasData;
+        struct WasiIo;
+        impl HasData for WasiIo {
+            type Data<'a> = &'a mut wasmtime::component::ResourceTable;
+        }
+        use wasmtime_wasi::p2::bindings as b;
+        use wasmtime_wasi::filesystem::WasiFilesystemView as _;
+        use wasmtime_wasi::WasiView as _;
+        wasmtime_wasi_io::bindings::wasi::io::error::add_to_linker::<PluginState, WasiIo>(
+            &mut linker,
+            |t| {
+                let wasmtime_wasi::WasiCtxView { table, .. } = t.ctx();
+                table
+            },
+        )?;
+        b::sync::io::poll::add_to_linker::<PluginState, WasiIo>(&mut linker, |t| {
+            let wasmtime_wasi::WasiCtxView { table, .. } = t.ctx();
+            table
+        })?;
+        b::sync::io::streams::add_to_linker::<PluginState, WasiIo>(&mut linker, |t| {
+            let wasmtime_wasi::WasiCtxView { table, .. } = t.ctx();
+            table
+        })?;
+        b::sync::filesystem::types::add_to_linker::<
+            PluginState,
+            wasmtime_wasi::filesystem::WasiFilesystem,
+        >(&mut linker, PluginState::filesystem)?;
+        b::filesystem::preopens::add_to_linker::<
+            PluginState,
+            wasmtime_wasi::filesystem::WasiFilesystem,
+        >(&mut linker, PluginState::filesystem)?;
     }
     if config.can_log() {
         let mut inst = linker.instance(crate::fixture::HOST_INSTANCE)?;

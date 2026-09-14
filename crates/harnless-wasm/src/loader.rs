@@ -57,6 +57,23 @@ fn fiber_key(fiber: &Arc<Fiber>) -> usize {
     Arc::as_ptr(fiber).addr()
 }
 
+/// A fully-prepared mount that has not yet been committed to the live tree.
+///
+/// [`WasmPluginManager::stage`] produces one — component compiled, guest
+/// instantiated, tools registered on the seam, reversible handle built — and
+/// [`WasmPluginManager::commit`] is the only step that touches the manager's
+/// mounted list. Splitting the mount this way is what lets
+/// [`WasmPluginManager::reload_all`] validate and prepare *every* config before
+/// any live state changes: a config that fails to stage leaves the last-good
+/// tree entirely untouched.
+pub struct StagedMount {
+    fiber: Arc<Fiber>,
+    live: Arc<Mutex<LiveInstance>>,
+    names: RegisteredTools,
+    handle: Arc<Mutex<Registration>>,
+    config: PluginConfig,
+}
+
 /// A tool body that crosses into the guest: `call_<tool>(raw-json)`.
 struct GuestBody {
     live: Arc<Mutex<LiveInstance>>,
@@ -96,15 +113,16 @@ impl ToolBody for GuestBody {
 pub struct Registration {
     /// The registry the names were registered on.
     pub registry: Arc<ToolRegistry>,
-    /// The registered names, in registration order.
-    pub names: RegisteredTools,
-    /// The bodies this mount registered, in the same order as [`Self::names`].
-    pub bodies: Arc<Mutex<Vec<Arc<dyn ToolBody>>>>,
+    /// The `(name, body)` pairs this mount registered, in registration order.
+    /// A single vector so the name and body of one registration can never
+    /// drift apart (a `zip` over two independently-locked vectors would
+    /// silently drop the tail on any length mismatch).
+    pub entries: Arc<Mutex<Vec<(String, Arc<dyn ToolBody>)>>>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        for (name, body) in self.names.lock().iter().zip(self.bodies.lock().iter()) {
+        for (name, body) in self.entries.lock().iter() {
             // `remove` reports whether the slot was occupied; the registry
             // entry is superseded when its body is not this mount's.
             if self.registry.body_is(name, body) {
@@ -199,10 +217,20 @@ impl WasmPluginManager {
     /// Returns the generation. The registrations unwind when the plugin is
     /// [`Self::unmount`]ed.
     pub fn mount(&self, ctx: &Context, config: &PluginConfig) -> Result<u64, String> {
-        let registry: Arc<ToolRegistry> = ctx
-            .get::<ToolRegistry>()
-            .ok_or_else(|| format!("plugin {}: no ToolRegistry service on context", config.id))?;
-        self.mount_on(ctx, &registry, config)
+        let registry = self.registry_from(ctx, config)?;
+        self.mount_on(&registry, config)
+    }
+
+    /// The [`ToolRegistry`] service `ctx` provides, or the error every
+    /// context-driven mount reports when it is missing.
+    fn registry_from(
+        &self,
+        ctx: &Context,
+        config: &PluginConfig,
+    ) -> Result<Arc<ToolRegistry>, String> {
+        ctx.get::<ToolRegistry>().ok_or_else(|| {
+            format!("plugin {}: no ToolRegistry service on context", config.id)
+        })
     }
 
     /// Mount one plugin on `ctx`, registering its tools on `registry` — the
@@ -216,23 +244,36 @@ impl WasmPluginManager {
     /// it is the same registry the native tools registered on.
     pub fn mount_on(
         &self,
-        ctx: &Context,
         registry: &Arc<ToolRegistry>,
         config: &PluginConfig,
     ) -> Result<u64, String> {
-        self.mount_inner(ctx, registry, config)
+        self.mount_inner(registry, config)
     }
 
     fn mount_inner(
         &self,
-        ctx: &Context,
         registry: &Arc<ToolRegistry>,
         config: &PluginConfig,
     ) -> Result<u64, String> {
+        let staged = self.stage(registry, config)?;
+        Ok(self.commit(&staged))
+    }
+
+    /// Prepare a mount without touching the live tree: compile the component,
+    /// instantiate the guest under its grants, register its tools on the seam,
+    /// and build the reversible handle. Everything that can fail about a mount
+    /// fails here; [`Self::commit`] is infallible.
+    ///
+    /// This is the transactional primitive behind [`Self::reload_all`]: staging
+    /// every config before committing any means a config that fails to stage
+    /// leaves the last-good tree entirely untouched.
+    pub fn stage(
+        &self,
+        registry: &Arc<ToolRegistry>,
+        config: &PluginConfig,
+    ) -> Result<StagedMount, String> {
         let (component, descriptor) = self.prepare(config)?;
         let fiber = Fiber::pending();
-        let plugin_ctx = ctx.extend();
-        plugin_ctx.set_fiber(fiber.clone());
 
         let live = Arc::new(Mutex::new(
             LiveInstance::new(
@@ -245,11 +286,11 @@ impl WasmPluginManager {
         ));
 
         // Register each declared tool through the seam (the same
-        // `ctx.tools` surface a native tool uses). Names *and* bodies are
-        // recorded so the fiber-owned Registration handle removes exactly
-        // these registrations — and only those still owned by this mount.
-        let names: RegisteredTools = Arc::new(Mutex::new(Vec::new()));
-        let bodies: Arc<Mutex<Vec<Arc<dyn ToolBody>>>> = Arc::new(Mutex::new(Vec::new()));
+        // `ctx.tools` surface a native tool uses). Each `(name, body)` pair is
+        // recorded so the fiber-owned Registration handle removes exactly these
+        // registrations — and only those still owned by this mount.
+        let entries: Arc<Mutex<Vec<(String, Arc<dyn ToolBody>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
         for spec in &descriptor.tools {
             let name = format!("{}.{}", descriptor.name, spec.name);
             let def = ToolDefinition {
@@ -265,21 +306,40 @@ impl WasmPluginManager {
             registry
                 .register(def, body.clone())
                 .map_err(|e| format!("plugin {}: register {name}: {e:?}", config.id))?;
-            names.lock().push(name);
-            bodies.lock().push(body);
+            entries.lock().push((name, body));
         }
+        let names: RegisteredTools =
+            Arc::new(Mutex::new(entries.lock().iter().map(|(n, _)| n.clone()).collect()));
 
-        // The reversible handle. `record_mount` gives its *single* strong
-        // owner to an effect on the plugin's fiber, so the mount's tools
-        // disappear exactly when that fiber tears down — whether the manager
-        // unmounts the row or the fiber is disposed on its own.
+        // The reversible handle. `commit` gives its *single* strong owner to an
+        // effect on the plugin's fiber, so the mount's tools disappear exactly
+        // when that fiber tears down — whether the manager unmounts the row or
+        // the fiber is disposed on its own.
         let handle = Arc::new(Mutex::new(Registration {
             registry: registry.clone(),
-            names: names.clone(),
-            bodies,
+            entries,
         }));
         fiber.set_state(FiberState::Active);
-        Ok(self.record_mount(config, &fiber, &names, Some(live), handle))
+        Ok(StagedMount {
+            fiber,
+            live,
+            names,
+            handle,
+            config: config.clone(),
+        })
+    }
+
+    /// Commit a staged mount to the live tree: record its row and hand the
+    /// reversible handle's sole strong owner to the plugin's fiber. Infallible —
+    /// every fallible step happened in [`Self::stage`].
+    fn commit(&self, staged: &StagedMount) -> u64 {
+        self.record_mount(
+            &staged.config,
+            &staged.fiber,
+            &staged.names,
+            Some(staged.live.clone()),
+            staged.handle.clone(),
+        )
     }
 
     /// The bookkeeping half of a mount, for a mount that carries its own
@@ -384,45 +444,98 @@ impl WasmPluginManager {
         }
     }
 
-    /// Reload one plugin: mount the new generation first, then unwind the
-    /// old one. The tool set swaps; it never accumulates duplicates.
+    /// Reload one plugin: mount the new generation first, then unwind every
+    /// older one. The tool set swaps; it never accumulates duplicates and the
+    /// new generation always stands mounted afterwards.
     pub fn reload(&self, ctx: &Context, config: &PluginConfig) -> Result<u64, String> {
-        let generation = self.mount(ctx, config)?;
-        // Unwind every older generation of this id.
+        let registry = self.registry_from(ctx, config)?;
+        self.reload_on(&registry, config)
+    }
+
+    /// Reload one plugin registering on a caller-held registry — the
+    /// [`Self::mount_on`] counterpart of [`Self::reload`].
+    pub fn reload_on(
+        &self,
+        registry: &Arc<ToolRegistry>,
+        config: &PluginConfig,
+    ) -> Result<u64, String> {
+        let generation = self.commit(&self.stage(registry, config)?);
+        self.retire_older(config);
+        Ok(generation)
+    }
+
+    /// Retire every generation of `config`'s id except the newest, disposing
+    /// their fibers so their registrations unwind. Partition by generation
+    /// number, not list position: an in-place `remove` loop that re-tests the
+    /// shifted element would also drop the just-mounted generation once its
+    /// index slides below the scan cursor.
+    fn retire_older(&self, config: &PluginConfig) {
         let victims: Vec<MountedPlugin> = {
             let mut mounted = self.mounted.lock();
             let newest = mounted
                 .iter()
-                .rposition(|m| m.config.id == config.id)
-                .unwrap_or(usize::MAX);
-            let mut i = 0;
+                .filter(|m| m.config.id == config.id)
+                .map(|m| m.generation)
+                .max()
+                .unwrap_or(0);
+            let mut keep = Vec::with_capacity(mounted.len());
             let mut out = Vec::new();
-            while i < mounted.len() {
-                if i != newest && mounted[i].config.id == config.id {
-                    out.push(mounted.remove(i));
+            for m in std::mem::take(&mut *mounted) {
+                if m.config.id == config.id && m.generation != newest {
+                    out.push(m);
                 } else {
-                    i += 1;
+                    keep.push(m);
                 }
             }
+            *mounted = keep;
             out
         };
         for v in victims {
             v.fiber.dispose();
         }
-        Ok(generation)
     }
 
-    /// Transactional reload of the whole tree: validate every config first;
-    /// on any failure the last good tree stands untouched. Configs absent
-    /// from the new list are unmounted (their registrations unwind).
+    /// Transactional reload of the whole tree.
+    ///
+    /// **Every** config is fully staged — compiled, instantiated under its
+    /// grants, and registered — *before* any live row is touched. If any config
+    /// fails to stage, the already-staged mounts are rolled back (their fibers
+    /// disposed, unwinding their registrations) and the last-good tree stands
+    /// entirely untouched: no config is half-swapped. Only once every config has
+    /// staged does the tree commit — each id's new generation committed, each old
+    /// generation retired, and ids dropped from config unmounted.
+    ///
+    /// Staging is stronger than [`Self::prepare`] validation: a config whose
+    /// component compiles but whose guest fails to instantiate (e.g. an `fs`
+    /// grant whose directory vanished between validation and mount) fails here,
+    /// before the tree moves.
     pub fn reload_all(&self, ctx: &Context, configs: &[PluginConfig]) -> Result<(), String> {
-        // Phase 1: validate everything before touching the live tree.
+        let registry = self.registry_from(
+            ctx,
+            configs.first().ok_or_else(|| "no configs to reload".to_string())?,
+        )?;
+        // Phase 1: stage every config. On any failure, unwind the staged
+        // mounts and leave the live tree exactly as it was.
+        let mut staged = Vec::with_capacity(configs.len());
         for cfg in configs {
-            self.prepare(cfg)?;
+            match self.stage(&registry, cfg) {
+                Ok(s) => staged.push(s),
+                Err(e) => {
+                    for s in staged {
+                        s.fiber.dispose();
+                    }
+                    return Err(e);
+                }
+            }
         }
-        // Phase 2: swap in the new generation of each config.
+        // Phase 2: commit every staged mount, then retire the superseded
+        // generation of each id. Commitment cannot fail, so the tree is never
+        // observed half-swapped.
+        for s in &staged {
+            self.commit(s);
+        }
         for cfg in configs {
-            self.reload(ctx, cfg)?;
+            self.retire_older(cfg);
         }
         // Phase 3: drop plugins removed from config entirely.
         let keep: Vec<&str> = configs.iter().map(|c| c.id.as_str()).collect();

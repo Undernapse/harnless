@@ -196,8 +196,8 @@ fn mount(manager: &WasmPluginManager, spine: &Spine, p: &mut FakePlugin) -> u64 
     let plugin_ctx = spine.ctx.extend();
     plugin_ctx.set_fiber(p.fiber.clone());
 
-    let names = Arc::new(Mutex::new(Vec::<String>::new()));
-    let bodies = Arc::new(Mutex::new(Vec::<Arc<dyn ToolBody>>::new()));
+    let entries: Arc<Mutex<Vec<(String, Arc<dyn ToolBody>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     for spec in &p.descriptor.tools {
         let name = format!("{}.{}", p.descriptor.name, spec.name);
         spine
@@ -211,9 +211,11 @@ fn mount(manager: &WasmPluginManager, spine: &Spine, p: &mut FakePlugin) -> u64 
                 p.body.clone(),
             )
             .unwrap_or_else(|e| panic!("register {name}: {e:?}"));
-        names.lock().push(name);
-        bodies.lock().push(p.body.clone());
+        entries.lock().push((name, p.body.clone()));
     }
+    let names = Arc::new(Mutex::new(
+        entries.lock().iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+    ));
 
     // The shipped loader's reversibility: the handle's single strong owner is
     // an effect on the plugin's fiber, which `record_mount` installs. Fiber
@@ -221,8 +223,7 @@ fn mount(manager: &WasmPluginManager, spine: &Spine, p: &mut FakePlugin) -> u64 
     // handle, and its `Drop` removes exactly these registrations.
     let handle = Arc::new(Mutex::new(Registration {
         registry: spine.registry.clone(),
-        names: names.clone(),
-        bodies,
+        entries,
     }));
     p.fiber.set_state(FiberState::Active);
     // The shipped manager records the same mount, so `generations` and

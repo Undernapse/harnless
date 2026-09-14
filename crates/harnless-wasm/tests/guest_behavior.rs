@@ -22,7 +22,6 @@
 use std::sync::Arc;
 
 use harnless_agent::testsupport::{text_recording, tool_recording, Harness, ScriptedCall};
-use harnless_runtime::context::Context;
 use harnless_runtime::fiber::FiberState;
 use harnless_seams::error::ErrorCode;
 use harnless_seams::tools::Tools as _;
@@ -72,9 +71,8 @@ fn a_component_tool_executes_end_to_end_through_the_guarded_pipeline() {
 
     // Mount through the seam: the harness context carries the ToolRegistry the
     // loader registers on.
-    let ctx = seam_context(&h);
     let generation = manager
-        .mount_on(&ctx, &h.tools, &config)
+        .mount_on(&h.tools, &config)
         .expect("the echo fixture mounts");
     assert_eq!(generation, 1);
 
@@ -135,9 +133,8 @@ fn a_component_tool_executes_end_to_end_through_the_guarded_pipeline() {
 fn a_guest_trap_is_isolated_to_its_own_plugin() {
     let (manager, config) = mount_fixture(Behavior::Boom, false);
     let h = Harness::new(SessionId(1502));
-    let ctx = seam_context(&h);
     manager
-        .mount_on(&ctx, &h.tools, &config)
+        .mount_on(&h.tools, &config)
         .expect("boom mounts");
     let _allow = h.allow_all();
 
@@ -181,9 +178,8 @@ fn a_runaway_guest_is_stopped_by_its_fuel_budget() {
     // only thing that ends the call.
     config.fuel_per_call = 10_000;
     let h = Harness::new(SessionId(1503));
-    let ctx = seam_context(&h);
     manager_ref
-        .mount_on(&ctx, &h.tools, &config)
+        .mount_on(&h.tools, &config)
         .expect("spin mounts");
     let _allow = h.allow_all();
 
@@ -219,9 +215,8 @@ fn a_plugin_gets_no_host_capability_it_was_not_granted() {
     // is registered.
     let (manager, config) = mount_fixture(Behavior::Echo, false);
     let h = Harness::new(SessionId(1504));
-    let ctx = seam_context(&h);
     let err = manager
-        .mount_on(&ctx, &h.tools, &config)
+        .mount_on(&h.tools, &config)
         .expect_err("an ungranted host import must refuse the mount");
     assert!(
         err.contains("harnless:plugin/host") || err.contains("log"),
@@ -232,16 +227,6 @@ fn a_plugin_gets_no_host_capability_it_was_not_granted() {
         "a refused mount registers nothing"
     );
     assert!(manager.generations().is_empty());
-}
-
-/// A context rooted at the harness's owning fiber. The loader mounts each
-/// plugin as a child of it and registers on the harness's own registry (passed
-/// to [`WasmPluginManager::mount_on`]), so the plugin's tools land on the same
-/// guarded pipeline the native tools registered on.
-fn seam_context(h: &Harness) -> Context {
-    let ctx = Context::root();
-    ctx.set_fiber(h.fiber.clone());
-    ctx
 }
 
 /// The engine-level guarantee the seam tests lean on: an `fs`-granted fixture
@@ -307,9 +292,8 @@ fn the_fs_grant_is_the_only_filesystem_the_guest_can_reach() {
 fn a_real_mount_tears_down_its_own_fiber() {
     let (manager, config) = mount_fixture(Behavior::FsRead, false);
     let h = Harness::new(SessionId(1505));
-    let ctx = seam_context(&h);
     manager
-        .mount_on(&ctx, &h.tools, &config)
+        .mount_on(&h.tools, &config)
         .expect("fs mounts");
     let mounted = manager
         .mounted_fibers()

@@ -1008,6 +1008,7 @@ dependencies = [
  "wasmparser 0.227.1",
  "wasmtime",
  "wasmtime-wasi",
+ "wasmtime-wasi-io",
  "wat",
  "wit-component",
  "wit-parser 0.227.1",
