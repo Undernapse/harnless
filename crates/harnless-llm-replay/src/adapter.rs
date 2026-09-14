@@ -319,12 +319,14 @@ mod tests {
         assert_eq!(events.len(), finish_at + 1);
     }
 
-    #[tokio::test]
-    async fn script_serves_recordings_in_order() {
+    /// A two-recording script fixture: the sample recording, then the same
+    /// with one extra delta.
+    ///
+    /// The extra delta goes *before* the terminal frame — a delta after
+    /// `Finish` would be a protocol violation the entry now rejects.
+    fn two_recordings() -> (Recording, Recording) {
         let first = sample_recording();
         let mut second = sample_recording();
-        // Insert before the terminal frame: a delta after Finish would be a
-        // protocol violation the entry now rejects.
         let last = second.frames.len() - 1;
         second.frames.insert(
             last,
@@ -333,7 +335,13 @@ mod tests {
                 text: " (second)".into(),
             },
         );
-        let adapter = ReplayAdapter::new("openai", Script::new(vec![first.clone(), second]));
+        (first, second)
+    }
+
+    #[tokio::test]
+    async fn script_serves_recordings_in_order() {
+        let (first, second) = two_recordings();
+        let adapter = ReplayAdapter::new("openai", Script::new(vec![first, second]));
         let a = collect(&adapter).await;
         let b = collect(&adapter).await;
         assert_ne!(a, b, "second call replays the second recording");
@@ -426,19 +434,10 @@ mod tests {
         // consumed. A regression on either keeps a per-call-corpus harness
         // green while silently breaking every script-ordered consumer, so
         // the pin lives here, at the adapter.
-        let first = sample_recording();
-        let mut second = sample_recording();
-        let last = second.frames.len() - 1;
-        second.frames.insert(
-            last,
-            RecordedFrame::TextDelta {
-                index: 0,
-                text: " (second)".into(),
-            },
-        );
+        let (first, second) = two_recordings();
         let adapter = ReplayAdapter::new("openai", Script::new(vec![first.clone(), second]));
 
-        // An out-of-band recording replays through the same rules...
+        // An out-of-band recording replays its terminal frame...
         let events: Vec<StreamEvent> = {
             let mut stream = adapter
                 .stream_recording(&first)
@@ -453,7 +452,7 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, StreamEvent::Frame(StreamFrame::Finish))),
-            "a per-call recording must replay under the same terminal rules"
+            "a per-call recording must replay its terminal frame"
         );
         assert_eq!(adapter.calls(), 0, "the call counter must not move");
 
@@ -465,6 +464,21 @@ mod tests {
             "the per-call stream must not have consumed a script slot"
         );
         assert_eq!(adapter.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_recording_derives_empty_completion() {
+        // The emptiness rule is shared too: a contentless per-call recording
+        // is the retryable empty-completion failure, not a silent success.
+        let adapter = ReplayAdapter::builder(sample_recording()).build();
+        let mut stream = adapter
+            .stream_recording(&Recording::default())
+            .expect("an empty recording is a valid recording");
+        let event = stream.next().await.expect("one event");
+        match event {
+            StreamEvent::Failed(f) => assert_eq!(f.code, ErrorCode::EmptyCompletion),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[tokio::test]

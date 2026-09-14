@@ -264,13 +264,13 @@ impl Corpus {
 
     /// The scenario a provider harness builds for this corpus.
     ///
-    /// `marker` is the ownership-marker *value* stamped into the scenario:
-    /// exactly [`PROVIDER`], which is what [`ReplayAdapter::owns`]
+    /// The ownership marker is stamped with [`PROVIDER`] here — the single
+    /// place scenarios are constructed — which is what [`ReplayAdapter::owns`]
     /// exact-name-matches. The whole-suite harness routes a stream by the
     /// scenario's own identity — messages, tools, and replay state (see
     /// [`WholeSuite`]) — so the scenario needs no harness state stamped into
-    /// it; `marker` is only ever [`PROVIDER`].
-    fn scenario(&self, kind: ScenarioKind, marker: &str) -> Scenario {
+    /// it.
+    fn scenario(&self, kind: ScenarioKind) -> Scenario {
         // The suite cannot know which key this adapter stamps into replay state,
         // so the harness declares it up front — before any ownership document is
         // built, and once, in the single place scenarios are constructed. The key
@@ -279,7 +279,7 @@ impl Corpus {
         // `owns()` with a document this adapter has no reason to recognise, and a
         // pass would prove nothing about the real handoff.
         let scenario = Scenario::new(vec![user_message()])
-            .ownership_marker(REPLAY_OWNER_KEY, marker)
+            .ownership_marker(REPLAY_OWNER_KEY, PROVIDER)
             .expected(self.frames.clone())
             // The replay adapter appends exactly what the recording carries, in
             // the order the recording carries it. Declaring this (rather than
@@ -295,7 +295,7 @@ impl Corpus {
             Some(failure) => scenario.failure(failure.clone()),
             None => scenario,
         };
-        if Corpus::carries_replay(kind) {
+        if self.carries_replay(kind) {
             // The ownership case is the one that hands `stream()` state this
             // adapter claims; it drives the plain text corpus. `with_owned_replay`
             // builds the document from the marker declared on this scenario, so
@@ -307,14 +307,15 @@ impl Corpus {
         }
     }
 
-    /// Whether this corpus is the one the ownership case drives.
+    /// Whether a scenario of this kind is handed replay state.
     ///
     /// The ownership case needs `stream()` to be handed state the adapter
-    /// claims, and it drives a plain text turn — so only that corpus carries
-    /// replay state. Asserting the shape rather than the case name is what keeps
-    /// the harness honest if the suite ever moves the case to another corpus.
-    fn carries_replay(kind: ScenarioKind) -> bool {
-        kind == ScenarioKind::TextTurn
+    /// claims, and it drives a plain text turn whose corpus carries response
+    /// metadata — so only that shape gets `with_owned_replay`. A text-turn
+    /// corpus without response metadata (there is none today) would have
+    /// nothing to stamp, so the check covers the state it actually relies on.
+    fn carries_replay(&self, kind: ScenarioKind) -> bool {
+        kind == ScenarioKind::TextTurn && self.response.is_some()
     }
 }
 
@@ -384,26 +385,16 @@ fn scenario_for(case: &str, kind: ScenarioKind) -> Scenario {
         corpus.frames,
         "the golden round-trip changed the {kind:?} corpus"
     );
-    let mut scenario = corpus.scenario(kind, PROVIDER);
-    // The suite's stall bound is generous for a local replay, but a provider
-    // that never yields would otherwise hang the run for the full window.
-    scenario.stall_timeout = Duration::from_secs(5);
+    let mut scenario = corpus.scenario(kind);
     // Register the corpus this scenario drives, keyed by the scenario's own
     // identity, so the whole-suite adapter serves it to the stream this case
     // opens (see [`WholeSuite`]). Registration happens on the test thread
     // before the scenario leaves the factory, and the suite's drive thread only
-    // ever looks the key up after that; a lookup that misses is a harness bug
-    // and panics as a suite violation.
+    // ever looks the key up after that.
     WholeSuite::register(&scenario, restored);
-    scenario
-}
-
-/// An adapter scripted with one case's captured recording.
-///
-/// Used by the provider-specific pins below, which name their case rather than
-/// going through the suite's factory.
-fn make_adapter_for(case: &str) -> ReplayAdapter {
-    make_adapter(case)
+    // The suite's stall bound is generous for a local replay, but a provider
+    // that never yields would otherwise hang the run for the full window.
+    scenario.stall_timeout(Duration::from_secs(5))
 }
 
 /// The macro's adapter factory: a plain `fn` item, as the macro requires.
@@ -453,15 +444,18 @@ fn make_adapter(case: &str) -> ReplayAdapter {
 /// failed-turn cases — share a recording too, which is exactly right: their
 /// corpora are the same.)
 ///
-/// A scenario this harness never registered is a harness bug — the registry
-/// miss is reported as a violation (the suite catches the panic), never
-/// papered over by serving some other corpus: a fallback that replays *a*
-/// corpus turns "the pairing broke" into a green run, which is the exact
-/// failure mode this design exists to make impossible.
+/// A scenario this harness never registered is a harness bug: the miss
+/// surfaces as a panic, which the suite reports as a violation. The key is
+/// printed by the harness before the panic because the suite discards panic
+/// payloads — the violation text alone would not name the scenario. A
+/// fallback that served *some* corpus instead would turn "the pairing broke"
+/// into a green run, the exact failure mode this design exists to kill.
 struct WholeSuite {
     /// A replay adapter used only for its `owns` contract — ownership is
     /// identity-based, so any adapter under this provider's identity answers
-    /// identically for every case.
+    /// identically for every case. Its script is never served: every stream
+    /// this adapter opens goes through `stream_recording` with a registered
+    /// corpus (see [`ReplayAdapter::stream_recording`]).
     owner: ReplayAdapter,
 }
 
@@ -469,7 +463,10 @@ struct WholeSuite {
 ///
 /// Rendering the pieces with `Debug` keeps the key total (the seam types are
 /// `Debug` + `PartialEq`; `Value` hashing is not an equality contract here)
-/// and makes key equality the scenarios' observable equality.
+/// and makes key equality the scenarios' observable equality. Caveat:
+/// `serde_json::Number` renders via `Display`, so a float-bearing replay
+/// state is out of scope for this key — this harness's state carries strings
+/// only.
 #[derive(PartialEq, Eq, Hash)]
 struct ScenarioKey(String);
 
@@ -487,11 +484,6 @@ struct ScenarioKey(String);
 static ROUTES: LazyLock<Mutex<std::collections::HashMap<ScenarioKey, Recording>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// The route registry, with poison recovery at the call sites (see [`ROUTES`]).
-fn routes() -> &'static Mutex<std::collections::HashMap<ScenarioKey, Recording>> {
-    &ROUTES
-}
-
 impl WholeSuite {
     /// Register the recording a scenario drives, keyed by its identity.
     fn register(scenario: &Scenario, recording: Recording) {
@@ -500,7 +492,7 @@ impl WholeSuite {
             &scenario.tools,
             scenario.replay.as_ref(),
         );
-        routes()
+        ROUTES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(key, recording);
@@ -536,16 +528,21 @@ impl harnless_seams::llm::ModelAdapter for WholeSuite {
         replay: Option<ReplayState>,
     ) -> harnless_seams::error::Result<harnless_seams::llm::BoxStream> {
         let key = scenario_key(messages, tools, replay.as_ref());
-        let recording = routes()
+        let guard = ROUTES
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&key)
-            .cloned()
-            .expect(
-                "scenario_for registers every scenario it builds before the \
-                 suite drives it; a miss is a harness pairing bug, not a \
-                 provider violation",
-            );
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let recording = guard.get(&key).cloned().unwrap_or_else(|| {
+            // The suite discards panic payloads, so name the scenario here.
+            // Truncated: the key renders the whole scenario.
+            let shown = if key.0.len() > 200 {
+                &key.0[..200]
+            } else {
+                &key.0
+            };
+            eprintln!("harnless-llm-replay: unregistered scenario key: {shown}…");
+            panic!("scenario_for never registered this scenario; a miss is a harness pairing bug, not a provider violation");
+        });
+        drop(guard);
         self.owner.stream_recording(&recording)
     }
 }
@@ -559,6 +556,8 @@ impl harnless_seams::llm::ModelAdapter for WholeSuite {
 /// builds scenarios.
 fn make_full_suite_adapter(_cases: &[&str]) -> WholeSuite {
     WholeSuite {
+        // The script exists only because `ReplayAdapter` requires one; this
+        // adapter's `stream` never serves it (see [`WholeSuite::owner`]).
         owner: ReplayAdapter::new(PROVIDER, Script::one(Corpus::text_turn().recording())),
     }
 }
@@ -595,7 +594,7 @@ harnless_conformance::conformance_tests_adapter! {
 fn owns_only_state_stamped_with_its_own_identity() {
     use harnless_seams::llm::ModelAdapter;
 
-    let adapter = make_adapter_for("replay_state_ownership");
+    let adapter = make_adapter("replay_state_ownership");
     assert!(
         adapter.owns(&owned_state()),
         "the adapter refused replay state stamped with its own provider identity"
@@ -675,7 +674,7 @@ async fn an_empty_recording_fails_with_the_retryable_code() {
     use futures::StreamExt;
     use harnless_seams::llm::{ModelAdapter, StreamEvent};
 
-    let adapter = make_adapter_for("empty_completion_is_retryable_failure");
+    let adapter = make_adapter("empty_completion_is_retryable_failure");
     let mut stream = adapter
         .stream(harnless_seams::CallId(1), &[user_message()], &[], None)
         .expect("empty corpus is a valid corpus");
