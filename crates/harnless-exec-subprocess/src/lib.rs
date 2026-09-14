@@ -171,15 +171,20 @@ impl SpawnHandle for ChildHandle {
                 stderr.dropped
             ));
         }
-        if status.success() {
-            return Ok(out);
-        }
-        // A cancelled process reports cancellation, not a plain failure.
+        // Cancellation is checked *before* the exit status. A run the caller
+        // cancelled must never be handed back as a completed success, and a
+        // cancelled child can well exit 0 — the signal races an exit that was
+        // already happening, or the command traps TERM and exits clean. Reading
+        // `success()` first would report that as `Ok`, which is the one thing
+        // this handle's contract forbids.
         if self.inner.cancelled.load(Ordering::SeqCst) {
             return Err(SeamError::new(
                 ErrorCode::ExecCancelled,
                 format!("process cancelled ({}); {}", exit_label(&status), out),
             ));
+        }
+        if status.success() {
+            return Ok(out);
         }
         // A non-zero exit is a seam failure the command tool surfaces, with
         // the captured output attached.
@@ -205,17 +210,41 @@ impl SpawnHandle for ChildHandle {
             // not land, and `output` reports the real exit.
             let pid = self.inner.child_pid;
             // kill(-pid) targets the process group led by the child.
-            if unsafe { kill(-pid, SIGTERM) } != 0 {
-                // The group is gone or was never led by the child; the direct
-                // kill needs the child, so it is best-effort under a try-lock.
+            let group_signalled = unsafe { kill(-pid, SIGTERM) } == 0;
+            if !group_signalled {
+                // The group is gone or was never led by the child. The direct
+                // kill needs the child, so it is best-effort under a try-lock —
+                // but it is gated on the child still being ours to kill, not on
+                // the lock merely being free. If the child was already reaped,
+                // `child_pid` may since have been recycled by an unrelated
+                // process, and a `kill()` on it would be signalling a stranger.
+                // `try_wait()` answers the question the lock answers better: it
+                // reaps nothing that is not our child and reports `Ok(Some(_))`
+                // once the child is gone, so a recycled pid is never signalled.
                 if let Ok(mut child) = self.inner.child.try_lock() {
-                    let _ = child.kill();
+                    match child.try_wait() {
+                        Ok(None) => {
+                            // Still running and still ours: signal it directly.
+                            let _ = child.kill();
+                        }
+                        // Exited (reaped here or by `output()`), or the wait
+                        // itself failed: nothing to signal, and signalling the
+                        // pid would be unsafe.
+                        Ok(Some(_)) | Err(_) => {}
+                    }
                 }
             }
         }
         #[cfg(not(unix))]
         if let Ok(mut child) = self.inner.child.try_lock() {
-            let _ = child.kill();
+            // Same gate as the unix path: only signal a child `try_wait` says is
+            // still running.
+            match child.try_wait() {
+                Ok(None) => {
+                    let _ = child.kill();
+                }
+                Ok(Some(_)) | Err(_) => {}
+            }
         }
     }
 }

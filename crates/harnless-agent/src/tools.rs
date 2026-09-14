@@ -418,19 +418,24 @@ impl ToolRegistry {
     /// order the moment it is installed, so a spine that wires the log after
     /// a first tool exchange still sees every record.
     pub fn set_post_execute_context_sink(&self, sink: ContextSink) {
-        // Take, install, and flush in ONE `context` critical section. Splitting
-        // them lets a concurrent `deliver_post_execute_context` read the old
-        // (absent) sink between the install and the flush, then push into
-        // `pending` after the drain loop already ran — that context would sit
-        // in `pending` forever with a sink mounted, which is the silent loss
-        // this method's own contract forbids.
+        // Install and drain atomically with respect to
+        // [`Self::deliver_post_execute_context`]. Both take `pending` and
+        // `context` together, so a delivery either lands entirely before this
+        // critical section (its value is in `held` and is flushed here) or
+        // entirely after it (it sees the mounted sink and delivers directly).
+        // No interleaving can leave a value in `pending` while a sink is
+        // mounted, which is the silent loss this method's contract forbids.
         //
-        // Lock order is `context` before `pending` here and in
-        // [`Self::deliver_post_execute_context`], so it cannot deadlock.
-        let mut context = self.context.write();
-        let held = std::mem::take(&mut *self.pending.write());
-        *context = Some(sink.clone());
-        drop(context);
+        // `pending` is taken first and `context` second in BOTH functions, so
+        // the order is consistent and cannot deadlock. The sink is cloned out
+        // and the locks dropped before the flush loop, so no sink callback
+        // ever runs while the registry's own locks are held.
+        let held = {
+            let mut pending = self.pending.write();
+            let mut context = self.context.write();
+            *context = Some(sink.clone());
+            std::mem::take(&mut *pending)
+        };
         for (call_id, value) in held {
             sink(call_id, value);
         }
@@ -568,10 +573,18 @@ impl ToolRegistry {
     /// was decided, and a pipeline that silently loses a plugin's context is
     /// the same class of bug this stage fixes.
     fn deliver_post_execute_context(&self, call_id: CallId, value: Value) {
+        // Both locks, same order as `set_post_execute_context_sink`, and the
+        // sink is cloned out so its callback never runs under them. Reading
+        // `context` without holding `pending` would let a sink install slip in
+        // between the read and the push, stranding this value.
+        let mut pending = self.pending.write();
         let sink = self.context.read().clone();
         match sink {
-            Some(sink) => sink(call_id, value),
-            None => self.pending.write().push((call_id, value)),
+            Some(sink) => {
+                drop(pending);
+                sink(call_id, value);
+            }
+            None => pending.push((call_id, value)),
         }
     }
 

@@ -466,14 +466,18 @@ impl SpawnHandle for ConfinedHandle {
         };
         let mut out = self.stdout.collect();
         out.push_str(&self.stderr.collect());
-        if status.success() {
-            return Ok(out);
-        }
+        // Cancellation is checked *before* the exit status: a cancelled child can
+        // exit 0 (the signal races an exit already under way, or the command traps
+        // TERM), and reporting that as `Ok` would hand a caller a completed run it
+        // asked to stop.
         if self.cancelled.load(Ordering::SeqCst) {
             return Err(SeamError::new(
                 ErrorCode::ExecCancelled,
                 format!("process cancelled ({}); {}", exit_label(&status), out),
             ));
+        }
+        if status.success() {
+            return Ok(out);
         }
         // A non-zero/signal exit is a seam failure the command tool
         // surfaces, with the captured output attached — this is also how a
@@ -502,20 +506,35 @@ impl SpawnHandle for ConfinedHandle {
             // and `output` reports the real exit.
             let pid = self.child_pid;
             if unsafe { kill(-pid, harnless_exec_subprocess::SIGTERM) } != 0 {
-                // The group is gone or was never led by the child; the direct
-                // kill needs the child, so it is best-effort under a try-lock.
+                // The group is gone or was never led by the child. The direct kill
+                // needs the child, so it is best-effort under a try-lock — gated on
+                // `try_wait` proving the child is still running, not on the lock
+                // merely being free. A since-reaped child's pid can be recycled by
+                // an unrelated process, and killing it would signal a stranger.
                 if let Some(mut child) = self.child.try_lock() {
-                    let _ = child.kill();
+                    match child.try_wait() {
+                        Ok(None) => {
+                            let _ = child.kill();
+                        }
+                        Ok(Some(_)) | Err(_) => {}
+                    }
                 }
             }
         }
         #[cfg(not(unix))]
         if let Some(mut child) = self.child.try_lock() {
-            let _ = child.kill();
+            match child.try_wait() {
+                Ok(None) => {
+                    let _ = child.kill();
+                }
+                Ok(Some(_)) | Err(_) => {}
+            }
         }
     }
 }
 
+// `kill(2)` without a libc crate dependency (same trick the plain subprocess
+// provider uses).
 #[cfg(unix)]
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
