@@ -227,10 +227,16 @@ fn a_plugin_gets_no_host_capability_it_was_not_granted() {
     assert!(manager.generations().is_empty());
 }
 
-/// The engine-level guarantee the seam tests lean on: an `fs`-granted fixture
-/// instantiates with its scoped directory, and the same component without the
-/// grant does not. Kept at the engine boundary because the guest bodies do not
-/// themselves read the scope — WASI wiring is the boundary under test.
+/// The engine-level half of the capability boundary: an `fs`-granted fixture
+/// instantiates with its scoped directory, and the same component with no grant
+/// still instantiates because it imports no WASI at all — so the only view of
+/// the host filesystem it could ever have had is the scope the config opened.
+///
+/// The behavioural half — a guest that really reads through `/scope` and really
+/// fails to escape it — is
+/// [`the_guest_reads_its_scope_and_cannot_escape_it`], which needs the
+/// `cargo-component` fixture; this one pins the wiring this file's seam tests
+/// lean on.
 #[test]
 fn the_fs_grant_is_the_only_filesystem_the_guest_can_reach() {
     let engine = harnless_wasm::engine::build_engine().unwrap();
@@ -282,6 +288,102 @@ fn the_fs_grant_is_the_only_filesystem_the_guest_can_reach() {
         .instantiate(&mut store, &component)
         .expect("an ungranted fixture imports no WASI");
     assert!(inst.get_func(&mut store, "call-read").is_some());
+}
+
+/// The checked-in real guest that performs genuine WASI filesystem I/O
+/// (see `fixtures/fsread_guest/BUILD.md`). Unlike the WAT fixtures, its body
+/// actually calls `open_at` / `read-via-stream`, so it is the only guest that
+/// can prove what the `/scope` grant *does*.
+const FSREAD_FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/fsread_plugin.wasm");
+
+/// Acceptance: the `/scope` grant is a real filesystem the guest reaches, and
+/// a sandbox escape is refused *at the WASI layer*.
+///
+/// The WAT fixtures' bodies never touch WASI, so their fs test could only pin
+/// instantiation. This guest opens its argument path under the first preopen
+/// and reads it to EOF:
+///
+/// * `note.txt` — a host-written file — comes back byte-for-byte through the
+///   guarded pipeline, which means the preopen, the fd mapping, and the
+///   canonical-ABI string round-trip all work end to end;
+/// * `../../../../etc/passwd` — the classic escape — fails with WASI
+///   `not-permitted` (EPERM). The guest never sees a file descriptor outside
+///   the grant: path traversal is refused by the component model's sandbox,
+///   not by anything the plugin's own code chose to check.
+#[test]
+fn the_guest_reads_its_scope_and_cannot_escape_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("note.txt"), b"hello-scope").unwrap();
+
+    let manager = WasmPluginManager::new();
+    let mut config = PluginConfig::sandboxed("fsreal", FSREAD_FIXTURE);
+    config.capabilities.push(Capability::Fs {
+        dir: dir.path().display().to_string(),
+        read_only: true,
+    });
+
+    let h = Harness::new(SessionId(1507));
+    manager
+        .mount_on(&h.tools, &config)
+        .expect("the real fs guest mounts with its grant");
+    let _allow = h.allow_all();
+
+    // 1. The read through /scope returns the host file's bytes.
+    let frozen = h
+        .tools
+        .execute(
+            harnless_seams::CallId(1),
+            "fsreal.read",
+            br#"{"path":"note.txt"}"#,
+        )
+        .expect("the guest reads through its scope");
+    assert_eq!(
+        frozen.value,
+        json!({"content": "hello-scope"}),
+        "the bytes the host wrote are the bytes the guest read"
+    );
+
+    // 2. The escape is refused below the guest's own logic: the tool call
+    //    succeeds, and the guest reports the WASI error it was handed.
+    let escaped = h
+        .tools
+        .execute(
+            harnless_seams::CallId(2),
+            "fsreal.read",
+            br#"{"path":"../../../../etc/passwd"}"#,
+        )
+        .expect("the escape attempt itself runs");
+    let error = escaped.value["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the escape must not open a file: {:?}", escaped.value));
+    assert!(
+        error.contains("not-permitted"),
+        "WASI refuses the traversal: {error}"
+    );
+
+    // 3. The refusal is the *grant*, not the guest: with no fs capability the
+    //    component (which imports wasi:filesystem) cannot even be instantiated.
+    let ungranted = PluginConfig::sandboxed("fsreal", FSREAD_FIXTURE);
+    let engine = harnless_wasm::engine::build_engine().unwrap();
+    let component =
+        wasmtime::component::Component::new(&engine, std::fs::read(FSREAD_FIXTURE).unwrap())
+            .unwrap();
+    let err = LiveInstance::new(
+        &engine,
+        component,
+        &ungranted,
+        Arc::new(parking_lot::Mutex::new(Vec::new())),
+    )
+    .err()
+    .expect("a filesystem-importing guest without the grant cannot instantiate");
+    // The linker refuses the *first* unimplemented import it resolves, which is
+    // the `wasi:io` plumbing the filesystem interfaces are typed against — the
+    // whole WASI surface is absent without the grant, not just one interface.
+    assert!(
+        err.to_string()
+            .contains("but a matching implementation was not found"),
+        "the refusal is import resolution against the ungranted linker: {err}"
+    );
 }
 
 /// Acceptance: an `fs` grant never wires the network.
