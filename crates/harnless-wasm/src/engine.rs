@@ -159,11 +159,18 @@ impl LiveInstance {
         })
     }
 
-    /// Call an exported `(param string) -> string` function.
+    /// Call an exported component function that returns a `string`, passing
+    /// `input` when the export takes a `string` parameter.
+    ///
+    /// The ABI distinguishes the two shapes the plugin interface uses —
+    /// `descriptor: func() -> string` and `call-<tool>: func(input: string) ->
+    /// string` — so the call is built from the export's own parameter list
+    /// rather than assuming one. Passing an argument a lifted export does not
+    /// declare is a wasmtime-level type error, not a plugin bug.
     ///
     /// A guest trap is mapped to a structured `ToolPanicked` seam error; the
-    /// poisoned instance is replaced (fresh store + instance) so the next
-    /// call runs clean — the isolation contract.
+    /// poisoned instance is replaced (fresh store + instance) so the next call
+    /// runs clean — the isolation contract.
     pub fn call_string_fn(
         &mut self,
         name: &str,
@@ -171,14 +178,39 @@ impl LiveInstance {
         fuel: u64,
     ) -> harnless_seams::Result<String> {
         self.store.set_fuel(fuel).map_err(seam_wrap)?;
+        // WIT identifiers are kebab-case, so a component built from a WIT world
+        // exports `call-echo` while the loader asks for `call_echo`. Both
+        // spellings name the same export; try the requested one, then its
+        // kebab form.
+        let kebab = name.replace('_', "-");
         let func = self
             .instance
             .get_func(&mut self.store, name)
+            .or_else(|| {
+                if kebab == *name {
+                    None
+                } else {
+                    self.instance.get_func(&mut self.store, kebab.as_str())
+                }
+            })
             .ok_or_else(|| {
                 SeamError::new(ErrorCode::ToolNotFound, format!("export {name} missing"))
             })?;
+        // A `()`-taking export gets nothing; a `(string)`-taking one gets the
+        // raw payload. Anything else is not the plugin ABI.
+        let mut args = Vec::new();
+        match func.ty(&self.store).params().len() {
+            0 => {}
+            1 => args.push(Val::String(input.to_string())),
+            n => {
+                return Err(SeamError::new(
+                    ErrorCode::ToolNotFound,
+                    format!("export {name} takes {n} parameters, not 0 or 1"),
+                ))
+            }
+        }
         let mut results = [Val::String(String::new())];
-        match func.call(&mut self.store, &[Val::String(input.to_string())], &mut results) {
+        match func.call(&mut self.store, &args, &mut results) {
             Ok(()) => match results.into_iter().next() {
                 Some(Val::String(s)) => Ok(s),
                 _ => Err(SeamError::new(

@@ -4,25 +4,23 @@
 //! [`ToolRegistry`] pipeline, and reversibility is observable as the
 //! registry's tool set.
 //!
-//! # What is shipped here and what stands in for a component
+//! # Why these tests use a stand-in guest body
 //!
-//! ISSUE-15: the checked-in fixture corpus (`src/fixture.rs`) is a
-//! hand-rolled `wasm-encoder` assembly whose bytes were never brought to a
-//! state `wasmtime::component::Component::new` accepts — see the ignored
-//! `every_fixture_loads_as_a_component` in `tests/fixture_build.rs`. Until
-//! that corpus comes off a real component toolchain, the *guest call* is the
-//! only part of a mount these tests cannot drive. So [`mount`] performs the
+//! The corpus (`src/fixture.rs`) is now real, loadable components, and
+//! `tests/guest_behavior.rs` drives the *component* end to end at the primary
+//! seam (host cross-import, guest-trap isolation, the fuel kill of a runaway
+//! guest, capability denial). Those are the guarantees only a loaded component
+//! can prove.
+//!
+//! What this file owns is narrower and does not need a component: the loader's
+//! *mount / unmount / reload / generation bookkeeping*. [`mount`] performs the
 //! same sequence the shipped loader does — its own fiber, tools registered
 //! through the seam, a fiber-owned reversible handle with the loader's `Drop`
-//! contract, a generation counter — with a [`ScopedGuest`] body in place of
-//! the component, and pairs each assertion with the shipped
-//! [`WasmPluginManager`] bookkeeping (`generations`, `unmount`) so the two
-//! views cannot drift.
-//!
-//! Behaviour that genuinely needs a loadable component — the host
-//! cross-import executing end to end, guest-trap isolation, and the
-//! fuel kill of a runaway guest — is pinned by the ignored tests in
-//! `tests/guest_behavior.rs`, which turn green the moment the corpus loads.
+//! contract, a generation counter — with a [`ScopedGuest`] body in place of the
+//! component, and pairs each assertion with the shipped [`WasmPluginManager`]
+//! bookkeeping (`generations`, `unmount`, `unmount_generation`) so the two views
+//! cannot drift. Keeping the lifecycle matrix here (rather than mounting four
+//! components per test) isolates reversibility failures from guest behaviour.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -132,8 +130,9 @@ impl Spine {
     fn allow_all(&self) -> Disposer {
         self.registry
             .on_pre_execute(
-                |_: &mut PreExecute,
-                 _next: &mut Next<'_, PreExecute, PreDecision>| PreDecision::Allow,
+                |_: &mut PreExecute, _next: &mut Next<'_, PreExecute, PreDecision>| {
+                    PreDecision::Allow
+                },
             )
             .unwrap()
     }
@@ -158,12 +157,7 @@ impl FakePlugin {
         Self::build(id, "read", capabilities, Some(dir))
     }
 
-    fn build(
-        id: &str,
-        tool: &str,
-        capabilities: Vec<Capability>,
-        dir: Option<&Path>,
-    ) -> Self {
+    fn build(id: &str, tool: &str, capabilities: Vec<Capability>, dir: Option<&Path>) -> Self {
         let config = PluginConfig {
             id: id.into(),
             // The stand-in guest needs no component file, so the path is a
@@ -424,7 +418,10 @@ fn no_host_access_unless_config_grants_it() {
 
     // A path that exists on the host is still unreachable: without the grant
     // the guest has no filesystem at all.
-    let target = format!(r#"{{"path":"{}"}}"#, dir.path().join("secret.txt").display());
+    let target = format!(
+        r#"{{"path":"{}"}}"#,
+        dir.path().join("secret.txt").display()
+    );
     let err = spine
         .registry
         .execute(CallId(1), "fs.read", target.as_bytes())

@@ -108,14 +108,22 @@ impl PluginConfig {
 
     /// Whether the `fs` grant (if any) is read-only.
     pub fn fs_read_only(&self) -> bool {
-        self.capabilities
-            .iter()
-            .any(|c| matches!(c, Capability::Fs { read_only: true, .. }))
+        self.capabilities.iter().any(|c| {
+            matches!(
+                c,
+                Capability::Fs {
+                    read_only: true,
+                    ..
+                }
+            )
+        })
     }
 
     /// Whether the `log` capability is granted.
     pub fn can_log(&self) -> bool {
-        self.capabilities.iter().any(|c| matches!(c, Capability::Log))
+        self.capabilities
+            .iter()
+            .any(|c| matches!(c, Capability::Log))
     }
 }
 

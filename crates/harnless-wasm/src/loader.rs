@@ -146,7 +146,6 @@ pub struct WasmPluginManager {
     handles: Mounts,
 }
 
-
 impl Default for WasmPluginManager {
     fn default() -> Self {
         Self::new()
@@ -194,8 +193,8 @@ impl WasmPluginManager {
         Ok((component, descriptor))
     }
 
-    /// Mount one plugin on `ctx` (which must provide the spine's
-    /// [`ToolRegistry`]): new fiber, tools registered inside it.
+    /// Mount one plugin on `ctx`, registering its tools on the spine's
+    /// [`ToolRegistry`] service: new fiber, tools registered inside it.
     ///
     /// Returns the generation. The registrations unwind when the plugin is
     /// [`Self::unmount`]ed.
@@ -203,7 +202,25 @@ impl WasmPluginManager {
         let registry: Arc<ToolRegistry> = ctx
             .get::<ToolRegistry>()
             .ok_or_else(|| format!("plugin {}: no ToolRegistry service on context", config.id))?;
-        self.mount_inner(ctx, &registry, config)
+        self.mount_on(ctx, &registry, config)
+    }
+
+    /// Mount one plugin on `ctx`, registering its tools on `registry` — the
+    /// [`Tools`] seam the caller already holds, rather than one looked up from
+    /// the context by type.
+    ///
+    /// This is the seam a spine that *owns* the registry (the agent harness
+    /// holds `Arc<ToolRegistry>` as a field, not a context service keyed by
+    /// `ToolRegistry`) mounts a plugin through: the guarded pipeline, approval,
+    /// and recording wrap the guest call exactly as for a native tool, because
+    /// it is the same registry the native tools registered on.
+    pub fn mount_on(
+        &self,
+        ctx: &Context,
+        registry: &Arc<ToolRegistry>,
+        config: &PluginConfig,
+    ) -> Result<u64, String> {
+        self.mount_inner(ctx, registry, config)
     }
 
     fn mount_inner(
@@ -218,8 +235,13 @@ impl WasmPluginManager {
         plugin_ctx.set_fiber(fiber.clone());
 
         let live = Arc::new(Mutex::new(
-            LiveInstance::new(&self.engine, component, config, Arc::new(Mutex::new(Vec::new())))
-                .map_err(|e| format!("plugin {}: instantiate failed: {e}", config.id))?,
+            LiveInstance::new(
+                &self.engine,
+                component,
+                config,
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .map_err(|e| format!("plugin {}: instantiate failed: {e}", config.id))?,
         ));
 
         // Register each declared tool through the seam (the same
@@ -343,7 +365,9 @@ impl WasmPluginManager {
         let victim = {
             let mut mounted = self.mounted.lock();
             let pos = match generation {
-                Some(g) => mounted.iter().rposition(|m| m.config.id == id && m.generation == g),
+                Some(g) => mounted
+                    .iter()
+                    .rposition(|m| m.config.id == id && m.generation == g),
                 None => mounted.iter().rposition(|m| m.config.id == id),
             };
             pos.map(|pos| mounted.remove(pos))
@@ -448,5 +472,16 @@ impl WasmPluginManager {
         let live = m.live.as_ref()?;
         let log = live.lock().logged();
         Some(log)
+    }
+
+    /// The fibers of the currently mounted plugins, in mount order. A test or a
+    /// caller observing teardown reads the fiber lifecycle directly: unmounting
+    /// disposes the plugin's own fiber and no other.
+    pub fn mounted_fibers(&self) -> Vec<Arc<Fiber>> {
+        self.mounted
+            .lock()
+            .iter()
+            .map(|m| m.fiber.clone())
+            .collect()
     }
 }
