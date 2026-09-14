@@ -939,6 +939,8 @@ dependencies = [
 name = "harnless-conformance"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
+ "futures-lite",
  "harnless-seams",
  "paste",
  "serde_json",

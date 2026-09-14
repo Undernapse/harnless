@@ -1,68 +1,25 @@
-//! Minimal conformance checks for the seams whose full contract needs
+//! Minimal conformance checks for the seams whose full contract still needs
 //! fixtures owned by consumer branches.
 //!
 //! Each function runs the probes that are self-contained against the trait
 //! surface alone and returns an empty list when nothing observable can be
 //! tested without a scripted scenario. A non-empty list means the provider
 //! broke a cheap invariant; these stubs are floors, not ceilings.
+//!
+//! The model-adapter and execution-world probes that used to live here are
+//! gone: both seams now have real suites ([`crate::adapter_suite`] and
+//! [`crate::executor_suite`]) that drive the contract through the seam, and
+//! keeping a cheap probe alongside the suite that subsumes it means two
+//! checks disagreeing about the same obligation. Settings, storage and
+//! credentials keep their probes because no suite for them exists yet.
 
 use harnless_seams::credentials::{CredentialRef, Credentials};
-use harnless_seams::exec::{PolicyHome, Shell};
-use harnless_seams::llm::ModelAdapter;
 use harnless_seams::settings::{Namespace, Settings};
 use harnless_seams::storage::{BackendName, Storage};
 use serde_json::Value;
 
 use crate::types::Violation;
 
-/// Cheap checks for a [`ModelAdapter`].
-///
-/// The full adapter contract (usage-before-finish, raw-JSON tool arguments,
-/// the two sanctioned failure paths, watchdog bounds) needs a scripted
-/// stream corpus; the cheap probe here is the identity obligation:
-/// `provider()` must name itself with a non-blank identity, since every
-/// request carries it.
-pub fn check_model_adapter(adapter: &dyn ModelAdapter) -> Vec<Violation> {
-    let mut out = Vec::new();
-    let name = adapter.provider();
-    if name.trim().is_empty() {
-        out.push(Violation::new(
-            "adapter_provider_identity",
-            format!(
-                "provider() returned {name:?}; the declared identity header must carry a \
-                 non-blank provider name"
-            ),
-        ));
-    }
-    out
-}
-
-/// Cheap checks for an executor ([`Shell`] implementor).
-///
-/// The full execution-world contract (cancellation semantics, sandbox
-/// enforcement reporting, cwd handling) needs spawn fixtures; the cheap
-/// probes are exit-status routing: a failing command must surface as an
-/// error carrying the exec taxonomy, not as fabricated success text.
-pub fn check_executor(shell: &dyn Shell) -> Vec<Violation> {
-    let mut out = Vec::new();
-    let policy = PolicyHome {
-        workspace_root: ".".to_string(),
-        default_confined: false,
-    };
-    // A command that certainly fails must not be reported as success.
-    // Any typed error is acceptable routing; only fabricated success is a
-    // violation.
-    if let Ok(out_) = shell.exec("exit 3", &policy) {
-        out.push(Violation::new(
-            "executor_failing_command",
-            format!(
-                "`exit 3` returned Ok({out_:?}); a nonzero exit must route as an error, \
-                 not as output"
-            ),
-        ));
-    }
-    out
-}
 /// Cheap checks for a [`Settings`] provider.
 ///
 /// Layered-resolution order needs multi-layer fixtures; the cheap probes
