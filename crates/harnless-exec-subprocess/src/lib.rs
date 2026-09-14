@@ -66,9 +66,11 @@ impl Subprocess for SubprocessLocal {
             .map_err(|err| SeamError::new(ErrorCode::SpawnFailed, err.to_string()))?;
         let stdout = child.stdout.take().map(Pipe::from);
         let stderr = child.stderr.take().map(Pipe::from);
+        let child_pid = child.id() as i32;
         Ok(Box::new(ChildHandle {
             inner: Arc::new(Inner {
                 child: Mutex::new(child),
+                child_pid,
                 stdout: Reader::spawn(stdout, self.max_output_bytes),
                 stderr: Reader::spawn(stderr, self.max_output_bytes),
                 cancelled: AtomicBool::new(false),
@@ -132,6 +134,9 @@ struct ChildHandle {
 
 struct Inner {
     child: Mutex<Child>,
+    /// The child's pid, cached at spawn so `cancel` can signal the process group
+    /// without taking the child lock (which `output` holds across `wait`).
+    child_pid: i32,
     stdout: Reader,
     stderr: Reader,
     cancelled: AtomicBool,
@@ -186,22 +191,32 @@ impl SpawnHandle for ChildHandle {
 
     fn cancel(&self) {
         self.inner.cancelled.store(true, Ordering::SeqCst);
-        let mut child = match self.inner.child.lock() {
-            Ok(child) => child,
-            Err(_) => return,
-        };
         // Prefer the whole process group (the child was placed in its own via
         // setsid); fall back to a direct kill if the group signal fails.
         #[cfg(unix)]
         {
-            let pid = child.id() as i32;
+            // The pid is read *before* taking the lock. `output()` holds the child
+            // across `wait()`, and a caller cancelling a run it is blocked waiting
+            // on — the shape of any "stop this command" caller — would otherwise
+            // deadlock against that wait, or (with a try-lock that gives up) have
+            // its cancellation dropped and be handed the completed run as success.
+            // `Child::id` returns the cached pid, so this needs no lock, and
+            // signalling a since-exited group is harmless: the signal simply does
+            // not land, and `output` reports the real exit.
+            let pid = self.inner.child_pid;
             // kill(-pid) targets the process group led by the child.
             if unsafe { kill(-pid, SIGTERM) } != 0 {
-                let _ = child.kill();
+                // The group is gone or was never led by the child; the direct
+                // kill needs the child, so it is best-effort under a try-lock.
+                if let Ok(mut child) = self.inner.child.try_lock() {
+                    let _ = child.kill();
+                }
             }
         }
         #[cfg(not(unix))]
-        let _ = child.kill();
+        if let Ok(mut child) = self.inner.child.try_lock() {
+            let _ = child.kill();
+        }
     }
 }
 
