@@ -36,6 +36,7 @@ use harnless_seams::tools::{PreDecision, ToolBody, ToolDefinition, Tools as _};
 use harnless_seams::CallId;
 use harnless_wasm::abi::{Capability, Descriptor, PluginConfig, ToolSpec, DEFAULT_FUEL};
 use harnless_wasm::engine::GUEST_SCOPE;
+use harnless_wasm::fixture::{self, Behavior};
 use harnless_wasm::loader::{Registration, WasmPluginManager};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -112,14 +113,17 @@ impl Spine {
         let registry = Arc::new(ToolRegistry::new(EventRegistry::new(), fiber.clone()));
         let ctx = Context::root();
         ctx.set_fiber(fiber.clone());
-        ctx.provide(registry.clone()).expect("provide registry");
+        // The shipped `mount`/`reload`/`reload_all` look the registry up as
+        // `ctx.get::<ToolRegistry>()`, which needs the *shared handle* installed
+        // under the `ToolRegistry` key — `provide_shared`, not `provide`.
+        ctx.provide_shared(&fiber, registry.clone())
+            .expect("provide registry");
         Self {
             ctx,
             registry,
             fiber,
         }
     }
-
     fn names(&self) -> Vec<String> {
         let mut n = self.registry.names();
         n.sort();
@@ -491,4 +495,188 @@ fn fiber_teardown_unwinds_only_its_own_plugins_tools() {
     // but still removes the row.
     assert!(manager.unmount("alpha"));
     assert_eq!(manager.generations(), vec![("beta".into(), 1u64)]);
+}
+
+// ---------------------------------------------------------------------------
+// The shipped reload paths, driven with real components.
+//
+// Everything above drives the loader's *bookkeeping* with a stand-in body.
+// These two tests drive `WasmPluginManager::reload_on` and `reload_all`
+// themselves — the shipped code paths, with the shipped `stage`/`commit`/
+// `retire_older` sequence — against the real fixture components, so the
+// reload guarantee is pinned on the functions config actually calls.
+
+/// A real component mount through the shipped loader.
+fn mount_real(
+    manager: &WasmPluginManager,
+    registry: &Arc<ToolRegistry>,
+    id: &str,
+    behavior: Behavior,
+) -> u64 {
+    let config = PluginConfig::sandboxed(id, fixture::fixture_path(behavior).display().to_string());
+    manager
+        .mount_on(registry, &config)
+        .unwrap_or_else(|e| panic!("{id} mounts: {e}"))
+}
+
+/// Acceptance: the shipped `reload_on` leaves the *new* generation mounted.
+///
+/// A config edit is the only way a plugin changes in production, and `reload`
+/// is what applies it. The guarantee reload must give config is: afterwards
+/// the plugin is mounted, exactly once, with its tools live. A reload that
+/// retired the new generation (the partition-by-position bug) or that left the
+/// old row beside the new one both fail here.
+#[test]
+fn the_shipped_reload_leaves_the_new_generation_mounted() {
+    let manager = WasmPluginManager::new();
+    let spine = Spine::new();
+    let g1 = mount_real(&manager, &spine.registry, "fs", Behavior::FsRead);
+    assert_eq!(g1, 1);
+    assert_eq!(
+        spine.names(),
+        vec!["fs.read"],
+        "the first generation registered its declared tool"
+    );
+    let first_fiber = manager
+        .mounted_fibers()
+        .into_iter()
+        .next()
+        .expect("one mount");
+
+    // Reload the same config row.
+    let config = PluginConfig::sandboxed(
+        "fs",
+        fixture::fixture_path(Behavior::FsRead)
+            .display()
+            .to_string(),
+    );
+    let g2 = manager
+        .reload_on(&spine.registry, &config)
+        .expect("the shipped reload succeeds");
+    assert_eq!(g2, 2, "the reload is the next generation");
+
+    // The tree holds exactly one row for the id, and it is the new one.
+    assert_eq!(
+        manager.generations(),
+        vec![("fs".into(), 2u64)],
+        "exactly one row per id, and it is the reloaded generation"
+    );
+    assert!(
+        manager.is_mounted("fs", 2),
+        "the new generation stands mounted"
+    );
+    assert!(
+        !manager.is_mounted("fs", 1),
+        "the superseded generation is retired"
+    );
+
+    // Its tools are live on the seam, and they actually run.
+    assert_eq!(
+        spine.names(),
+        vec!["fs.read"],
+        "a reload swaps the tool set, it never accumulates or empties it"
+    );
+    let _allow = spine.allow_all();
+    let frozen = spine
+        .registry
+        .execute(CallId(1), "fs.read", b"{}")
+        .expect("the reloaded generation serves calls");
+    assert_eq!(frozen.value, json!({"ok": true}));
+
+    // The old generation's fiber — the thing that owns its registrations — is
+    // the one that tore down; the live mount's stands.
+    assert_eq!(
+        first_fiber.state(),
+        FiberState::Disposed,
+        "reloading retired the old generation's fiber"
+    );
+    let live = manager
+        .mounted_fibers()
+        .into_iter()
+        .next()
+        .expect("still one mount");
+    assert_ne!(
+        Arc::as_ptr(&live),
+        Arc::as_ptr(&first_fiber),
+        "the live row is the new generation's fiber"
+    );
+    assert_eq!(live.state(), FiberState::Active);
+}
+
+/// Acceptance: a successful `reload_all` leaves *every* config mounted, with
+/// its tools present.
+///
+/// The transactional half (`reload_all_is_transactional_...`) proves a bad
+/// config changes nothing. This is the other half, and the one config actually
+/// depends on: when the whole reload succeeds, each row of the new tree is
+/// live — no plugin silently dropped, no generation left unretired.
+#[test]
+fn a_successful_reload_all_leaves_every_config_mounted() {
+    let manager = WasmPluginManager::new();
+    let spine = Spine::new();
+    // Start from a different tree so the swap is observable in both
+    // directions: `spin` is dropped from config, `echo` is new.
+    mount_real(&manager, &spine.registry, "spin", Behavior::Spin);
+    assert_eq!(spine.names(), vec!["spin.spin"]);
+
+    let configs = vec![
+        PluginConfig::sandboxed(
+            "echo",
+            fixture::fixture_path(Behavior::Echo).display().to_string(),
+        ),
+        PluginConfig::sandboxed(
+            "fs",
+            fixture::fixture_path(Behavior::FsRead)
+                .display()
+                .to_string(),
+        ),
+    ];
+    // `echo` imports the host `log`, so its config must grant it — otherwise
+    // this is the transactional-failure test, not this one.
+    let mut configs = configs;
+    configs[0]
+        .capabilities
+        .push(harnless_wasm::abi::Capability::Log);
+
+    // `reload_all` is the context-driven entry point: it looks the registry up
+    // as a context service, so the spine's context must still own it. `Spine`
+    // provides it on the spine's fiber; this is that fiber's context.
+    manager
+        .reload_all(&spine.ctx, &configs)
+        .expect("a good tree reloads");
+
+    // Every config row is mounted, exactly once.
+    let mut gens = manager.generations();
+    gens.sort();
+    assert_eq!(
+        gens,
+        vec![("echo".into(), 1u64), ("fs".into(), 1u64)],
+        "each config of the new tree has exactly one live row"
+    );
+
+    // Every config's tools are present on the seam, and the dropped plugin's
+    // are gone.
+    assert_eq!(
+        spine.names(),
+        vec!["echo.echo", "fs.read"],
+        "the reloaded tree's tools are all registered; the removed plugin's are unwound"
+    );
+
+    // They are not decoration: both mounted generations serve calls.
+    let _allow = spine.allow_all();
+    let fs = spine
+        .registry
+        .execute(CallId(1), "fs.read", b"{}")
+        .expect("the fs row of the reloaded tree runs");
+    assert_eq!(fs.value, json!({"ok": true}));
+    let echo = spine
+        .registry
+        .execute(CallId(2), "echo.echo", br#"{"text":"hi"}"#)
+        .expect("the echo row of the reloaded tree runs");
+    assert_eq!(echo.value, json!({"echo": true}));
+    assert_eq!(
+        manager.plugin_log("echo"),
+        Some(vec![r#"{"text":"hi"}"#.into()]),
+        "the reloaded mount carries its own wired capability"
+    );
 }

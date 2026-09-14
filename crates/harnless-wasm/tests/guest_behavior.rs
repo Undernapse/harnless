@@ -284,6 +284,105 @@ fn the_fs_grant_is_the_only_filesystem_the_guest_can_reach() {
     assert!(inst.get_func(&mut store, "call-read").is_some());
 }
 
+/// Acceptance: an `fs` grant never wires the network.
+///
+/// The scoped linker registers filesystem plus the `wasi:io` plumbing it is
+/// typed against — and nothing else. A guest that reaches for the default
+/// network handle therefore cannot be instantiated *at all*, even when its
+/// config's own grant is valid and mounted-elsewhere-fine. The refusal is
+/// import resolution, before a single guest instruction runs, which is the
+/// strongest form the capability boundary can take: there is no code path in
+/// which the plugin gets a socket and policy has to notice.
+#[test]
+fn a_filesystem_grant_never_wires_the_network() {
+    let engine = harnless_wasm::engine::build_engine().unwrap();
+    let component =
+        wasmtime::component::Component::new(&engine, fixture::component_bytes(Behavior::Sockets))
+            .expect("the sockets fixture compiles");
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut granted = PluginConfig::sandboxed(
+        "sock",
+        fixture::fixture_path(Behavior::Sockets)
+            .display()
+            .to_string(),
+    );
+    // A perfectly ordinary, satisfiable filesystem grant. The plugin's *fs*
+    // half is fine; it is the sockets import that must refuse the mount.
+    granted.capabilities.push(Capability::Fs {
+        dir: dir.path().display().to_string(),
+        read_only: true,
+    });
+
+    let err = LiveInstance::new(
+        &engine,
+        component.clone(),
+        &granted,
+        Arc::new(parking_lot::Mutex::new(Vec::new())),
+    )
+    .err()
+    .expect("a filesystem grant must not satisfy a sockets import");
+    assert!(
+        err.to_string().contains("wasi:sockets/network"),
+        "the refusal names the unimplemented interface: {err}"
+    );
+
+    // It is the *linker* that refuses, not the store or the component: the same
+    // component against the same store with the same grants fails identically
+    // through the raw path, and the very same config mounts a plugin that
+    // imports no sockets.
+    let linker = harnless_wasm::engine::build_linker(&engine, &granted).unwrap();
+    let mut store = harnless_wasm::engine::build_store(
+        &engine,
+        &granted,
+        Arc::new(parking_lot::Mutex::new(Vec::new())),
+    )
+    .unwrap();
+    let raw = linker
+        .instantiate(&mut store, &component)
+        .err()
+        .expect("the scoped linker has no sockets implementation to offer");
+    assert!(
+        raw.to_string()
+            .contains("a matching implementation was not found"),
+        "the failure is import resolution: {raw}"
+    );
+
+    // And through the loader: the mount is refused, so nothing is registered.
+    let manager = WasmPluginManager::new();
+    let h = Harness::new(SessionId(1506));
+    let err = manager
+        .mount_on(&h.tools, &granted)
+        .expect_err("a sockets-importing plugin cannot mount on an fs grant");
+    assert!(
+        err.contains("wasi:sockets/network"),
+        "the loader reports the import failure: {err}"
+    );
+    assert!(
+        h.tools.get("sock.read").is_none(),
+        "a refused mount registers nothing"
+    );
+    assert!(manager.generations().is_empty());
+
+    // Control: the same linker wiring *does* mount a guest with no sockets
+    // import, so the refusal above is the import, not the wiring being broken.
+    let fs_component =
+        wasmtime::component::Component::new(&engine, fixture::component_bytes(Behavior::FsRead))
+            .unwrap();
+    let mut fs_config = PluginConfig::sandboxed("fs", String::from("fs.wasm"));
+    fs_config.capabilities = granted.capabilities.clone();
+    let linker = harnless_wasm::engine::build_linker(&engine, &fs_config).unwrap();
+    let mut store = harnless_wasm::engine::build_store(
+        &engine,
+        &fs_config,
+        Arc::new(parking_lot::Mutex::new(Vec::new())),
+    )
+    .unwrap();
+    linker
+        .instantiate(&mut store, &fs_component)
+        .expect("the filesystem-only guest instantiates against the same wiring");
+}
+
 /// The loader's own fiber bookkeeping stays consistent with a real component
 /// mount: the plugin's fiber is the thing that tears down on unmount.
 #[test]

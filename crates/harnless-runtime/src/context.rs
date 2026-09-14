@@ -40,8 +40,34 @@ impl Context {
         Self::default()
     }
 
-    /// Install a service under a type key, owned by the given fiber.
+    /// Install a **shared** service under its own type key, owned by `fiber`.
     ///
+    /// [`Context::provide`] keys on the type it is handed, so
+    /// `provide(arc.clone())` installs the service under `Arc<T>` and a
+    /// consumer that asks for `ctx.get::<T>()` — the shape a service shared by
+    /// handle (a registry, a store) is looked up under — finds nothing. This
+    /// installs the caller's exact `Arc<T>` under `T`'s key, so
+    /// `ctx.get::<T>()` hands back the same handle the owner holds: registering
+    /// through either view is visible to both, and unwinding is reversible on
+    /// `fiber` like any other registration.
+    pub fn provide_shared<T: Any + Send + Sync>(
+        &self,
+        fiber: &Arc<Fiber>,
+        service: Arc<T>,
+    ) -> Result<Disposer> {
+        let map = self.services.clone();
+        fiber.effect(move || {
+            // Store the caller's Arc itself under T's key: `get::<T>` returns
+            // an `Arc<T>` aliasing the very handle the owner holds.
+            map.provide_arc::<T>(service);
+            let detached = map.clone();
+            Some(Box::new(move || {
+                let _ = detached.remove::<T>();
+            }) as DisposeFn)
+        })
+    }
+
+    /// Install a service under a type key, owned by the given fiber.
     /// The returned disposer removes the service exactly once when the fiber
     /// unloads (or the guard is dropped early) — every registration carries
     /// its own undo (decision 03-Q3). If the service was replaced by a later

@@ -41,6 +41,10 @@
 //! * `fs_plugin.wasm` — descriptor declares one tool `read`; `call_read`
 //!   returns `{"ok":true}`; mounted with an `fs` grant so the scoped WASI
 //!   directory is the only filesystem the guest can reach.
+//! * `sockets_plugin.wasm` — descriptor declares one tool `read`; its world
+//!   imports `wasi:sockets/network` + `instance-network` and `call_read` takes
+//!   the default network handle. No grant ever wires sockets, so this fixture
+//!   cannot mount: the import-resolution failure *is* the capability boundary.
 //!
 //! # Naming
 //!
@@ -79,16 +83,21 @@ pub enum Behavior {
     Boom,
     /// `call`: loop forever (fuel-bounded).
     Spin,
-    /// `call`: return `{"ok":true}`.
+    /// `call`: return `{"ok":true}`; mounted with an `fs` grant.
     FsRead,
+    /// `call`: take the default network handle. Its component imports
+    /// `wasi:sockets/*`, which the shipped scoped linker never registers, so
+    /// the mount fails at import resolution.
+    Sockets,
 }
 
 /// Every behaviour in the corpus.
-pub const ALL: [Behavior; 4] = [
+pub const ALL: [Behavior; 5] = [
     Behavior::Echo,
     Behavior::Boom,
     Behavior::Spin,
     Behavior::FsRead,
+    Behavior::Sockets,
 ];
 
 impl Behavior {
@@ -100,6 +109,15 @@ impl Behavior {
     pub fn imports_host_log(&self) -> bool {
         matches!(self, Behavior::Echo)
     }
+
+    /// Whether this fixture's component imports `wasi:sockets/*`.
+    ///
+    /// The shipped linker registers sockets for no grant whatsoever, so this
+    /// fixture can never mount: the point is that the refusal is
+    /// import-resolution failure at instantiation, not a runtime policy.
+    pub fn imports_sockets(&self) -> bool {
+        matches!(self, Behavior::Sockets)
+    }
 }
 
 /// The fixture file name for a behaviour.
@@ -109,6 +127,7 @@ pub fn fixture_name(behavior: Behavior) -> &'static str {
         Behavior::Boom => "boom_plugin.wasm",
         Behavior::Spin => "spin_plugin.wasm",
         Behavior::FsRead => "fs_plugin.wasm",
+        Behavior::Sockets => "sockets_plugin.wasm",
     }
 }
 
@@ -119,6 +138,7 @@ pub fn tool_name(behavior: Behavior) -> &'static str {
         Behavior::Boom => "boom",
         Behavior::Spin => "spin",
         Behavior::FsRead => "read",
+        Behavior::Sockets => "read",
     }
 }
 
@@ -129,6 +149,7 @@ pub fn plugin_name(behavior: Behavior) -> &'static str {
         Behavior::Boom => "boom",
         Behavior::Spin => "spin",
         Behavior::FsRead => "fs",
+        Behavior::Sockets => "sock",
     }
 }
 
@@ -158,10 +179,18 @@ pub fn world_wit(behavior: Behavior) -> String {
     } else {
         ""
     };
+    // The sockets fixture's world additionally imports the two WASI interfaces
+    // a network-touching guest needs. They are declared in [`SOCKETS_DEP_WIT`],
+    // pushed into the `Resolve` before this package.
+    let wasi = if behavior.imports_sockets() {
+        "  import wasi:sockets/network@0.2.12;\n  import wasi:sockets/instance-network@0.2.12;\n"
+    } else {
+        ""
+    };
     format!(
         r#"package harnless:plugin;
 {host}world plugin {{
-{import}  export descriptor: func() -> string;
+{import}{wasi}  export descriptor: func() -> string;
   export call-{tool}: func(input: string) -> string;
 }}
 "#
@@ -176,6 +205,13 @@ pub fn core_wat(behavior: Behavior) -> String {
     let descriptor = descriptor_json(behavior);
     let log_import = if behavior.imports_host_log() {
         r#"(import "harnless:plugin/host" "log" (func $log (param i32 i32)))"#
+    } else {
+        ""
+    };
+    // The sockets fixture reaches the network through the value-export of the
+    // default network handle, exactly as a `wasi:sockets` guest does.
+    let net_import = if behavior.imports_sockets() {
+        r#"(import "wasi:sockets/instance-network@0.2.12" "instance-network" (func $net (result i32)))"#
     } else {
         ""
     };
@@ -226,12 +262,25 @@ pub fn core_wat(behavior: Behavior) -> String {
             ok_ptr = mem::STRING_AREA + desc_len as u32 + 8,
             ok_len = OK_JSON.len(),
         ),
+        Behavior::Sockets => format!(
+            r#"(func (export "call-{tool}") (param i32) (param i32) (result i32)
+    ;; Taking the handle is the whole point: it is the call the host must
+    ;; never let a filesystem-granted plugin make.
+    (drop (call $net))
+    (i32.store offset={result} (i32.const 0) (i32.const {ok_ptr}))
+    (i32.store offset={result_len} (i32.const 0) (i32.const {ok_len}))
+    (i32.const {result}))"#,
+            result = mem::RESULT_STRUCT,
+            result_len = mem::RESULT_STRUCT + 4,
+            ok_ptr = mem::STRING_AREA + desc_len as u32 + 8,
+            ok_len = OK_JSON.len(),
+        ),
     };
     // The tool-result literal sits just past the descriptor literal in the data
     // segment; each fixture's `call_<tool>` body points its result struct at it.
     let literal = match behavior {
         Behavior::Echo => ECHO_JSON,
-        Behavior::FsRead => OK_JSON,
+        Behavior::FsRead | Behavior::Sockets => OK_JSON,
         _ => "",
     };
     let literal_ptr = mem::STRING_AREA + desc_len as u32 + 8;
@@ -254,6 +303,7 @@ pub fn core_wat(behavior: Behavior) -> String {
     format!(
         r#"(module
   {log_import}
+  {net_import}
   (memory (export "memory") 1)
   (global (export "__data_end") i32 (i32.const 4096))
   (global (export "__heap_base") i32 (i32.const 4096))
@@ -271,6 +321,7 @@ pub fn core_wat(behavior: Behavior) -> String {
 )
 "#,
         log_import = log_import,
+        net_import = net_import,
         data = data,
         result = mem::RESULT_STRUCT,
         result_len = mem::RESULT_STRUCT + 4,
@@ -289,6 +340,25 @@ fn wat_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// The minimal `wasi:sockets` package the sockets fixture's world imports.
+///
+/// Only the two interfaces that world names are declared, and only as much of
+/// them as the fixture touches: the `network` resource and the
+/// `instance-network` value-export. `wit-component` matches the *importing
+/// component's* declared interface against the host's, so a stub is enough to
+/// produce a component whose import name is the real
+/// `wasi:sockets/network@0.2.12` — which is exactly the name the shipped
+/// scoped linker does not implement.
+pub const SOCKETS_DEP_WIT: &str = r#"package wasi:sockets@0.2.12;
+interface network {
+  resource network;
+}
+interface instance-network {
+  use network.{network};
+  instance-network: func() -> network;
+}
+"#;
+
 /// Encode a fixture's core module into the component the loader mounts.
 ///
 /// This is the `cargo-component` build step: embed the world's component
@@ -297,12 +367,29 @@ fn wat_escape(s: &str) -> String {
 pub fn encode_component(behavior: Behavior) -> Vec<u8> {
     let wit = world_wit(behavior);
     let core = core_wat(behavior);
-    encode(&wit, &core).unwrap_or_else(|e| panic!("{behavior:?}: fixture encode failed: {e}"))
+    let deps: &[(&str, &str)] = if behavior.imports_sockets() {
+        &[("sockets.wit", SOCKETS_DEP_WIT)]
+    } else {
+        &[]
+    };
+    encode(deps, &wit, &core).unwrap_or_else(|e| panic!("{behavior:?}: fixture encode failed: {e}"))
 }
 
-fn encode(wit: &str, core_wat: &str) -> Result<Vec<u8>, String> {
+/// Encode one plugin package against its dependency packages.
+///
+/// Every dependency is pushed into the `Resolve` *before* the plugin package:
+/// `push_group` requires a package's dependencies to already be present, so
+/// this is how a fixture's world gets to say `import wasi:sockets/...`.
+fn encode(deps: &[(&str, &str)], wit: &str, core_wat: &str) -> Result<Vec<u8>, String> {
     let core = wat::parse_str(core_wat).map_err(|e| format!("core WAT: {e}"))?;
     let mut resolve = Resolve::default();
+    for (path, dep) in deps {
+        let group =
+            UnresolvedPackageGroup::parse(path, dep).map_err(|e| format!("dep WIT {path}: {e}"))?;
+        resolve
+            .push_group(group)
+            .map_err(|e| format!("dep WIT {path}: {e}"))?;
+    }
     let group =
         UnresolvedPackageGroup::parse("plugin.wit", wit).map_err(|e| format!("world WIT: {e}"))?;
     let pkg = resolve
@@ -358,6 +445,11 @@ mod tests {
     /// The corpus's own contract: every fixture compiles, instantiates under the
     /// config its behaviour needs, and its `descriptor()` reads back exactly the
     /// descriptor the loader will validate.
+    ///
+    /// The sockets fixture is the deliberate exception to the instantiate half:
+    /// it exists *because* no grant wires `wasi:sockets`, so it is only checked
+    /// to compile here (its refusal is pinned by
+    /// `tests/guest_behavior.rs::a_filesystem_grant_never_wires_the_network`).
     #[test]
     fn every_fixture_encodes_and_its_descriptor_reads_back() {
         let engine = crate::engine::build_engine().unwrap();
@@ -365,6 +457,9 @@ mod tests {
             let bytes = component_bytes(behavior);
             let component = wasmtime::component::Component::new(&engine, &bytes)
                 .unwrap_or_else(|e| panic!("{behavior:?} did not compile: {e}"));
+            if behavior.imports_sockets() {
+                continue;
+            }
             let mut config = PluginConfig::sandboxed(
                 plugin_name(behavior),
                 fixture_path(behavior).display().to_string(),
