@@ -75,8 +75,10 @@ impl ToolBody for GuestBody {
 /// mechanical guarantee behind "removing the plugin by editing config
 /// unwinds its registrations".
 pub struct Registration {
-    registry: Arc<ToolRegistry>,
-    names: RegisteredTools,
+    /// The registry the names were registered on.
+    pub registry: Arc<ToolRegistry>,
+    /// The registered names, in registration order.
+    pub names: RegisteredTools,
 }
 
 impl Drop for Registration {
@@ -93,8 +95,9 @@ pub struct MountedPlugin {
     pub fiber: Arc<Fiber>,
     /// The mount generation (starts at 1, +1 per reload).
     pub generation: u64,
-    /// The live guest instance (shared by every tool body of this plugin).
-    pub live: Arc<Mutex<LiveInstance>>,
+    /// The live guest instance (shared by every tool body of this plugin),
+    /// or `None` for a stand-in mount recorded by [`Self::record_mount`].
+    pub live: Option<Arc<Mutex<LiveInstance>>>,
     /// The config this generation mounted with.
     pub config: PluginConfig,
     /// The registered tool names.
@@ -219,25 +222,43 @@ impl WasmPluginManager {
         }
 
         fiber.set_state(FiberState::Active);
-        let generation = {
-            let mut mounted = self.mounted.lock();
-            let g = mounted
-                .iter()
-                .filter(|m| m.config.id == config.id)
-                .map(|m| m.generation)
-                .max()
-                .unwrap_or(0)
-                + 1;
-            mounted.push(MountedPlugin {
-                fiber: fiber.clone(),
-                generation: g,
-                live,
-                config: config.clone(),
-                names,
-            });
-            g
-        };
-        Ok(generation)
+        Ok(self.record_mount(config, &fiber, &names, Some(live)))
+    }
+
+    /// The bookkeeping half of a mount: allocate the generation for `config`
+    /// and record the mounted-tree entry, for a plugin whose tools are
+    /// already registered and whose reversible handle is already provided on
+    /// `fiber`.
+    ///
+    /// [`Self::mount`] is this plus compiling the component and wiring the
+    /// guest calls through [`LiveInstance`]. Splitting the two lets a test
+    /// drive the mount / unmount / reload / generation guarantees against a
+    /// guest body that is not a loadable component — the substitution
+    /// `tests/loader.rs` documents (ISSUE-15). `live` is `None` exactly for
+    /// such a stand-in mount.
+    pub fn record_mount(
+        &self,
+        config: &PluginConfig,
+        fiber: &Arc<Fiber>,
+        names: &RegisteredTools,
+        live: Option<Arc<Mutex<LiveInstance>>>,
+    ) -> u64 {
+        let mut mounted = self.mounted.lock();
+        let g = mounted
+            .iter()
+            .filter(|m| m.config.id == config.id)
+            .map(|m| m.generation)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        mounted.push(MountedPlugin {
+            fiber: fiber.clone(),
+            generation: g,
+            live,
+            config: config.clone(),
+            names: names.clone(),
+        });
+        g
     }
 
     /// Unmount a plugin by id: dispose its fiber, unwinding exactly its
@@ -330,7 +351,8 @@ impl WasmPluginManager {
     pub fn plugin_log(&self, id: &str) -> Option<Vec<String>> {
         let mounted = self.mounted.lock();
         let m = mounted.iter().rev().find(|m| m.config.id == id)?;
-        let log = m.live.lock().logged();
+        let live = m.live.as_ref()?;
+        let log = live.lock().logged();
         Some(log)
     }
 }
