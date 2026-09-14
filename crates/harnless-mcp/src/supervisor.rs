@@ -679,8 +679,18 @@ pub(crate) fn build_generation(
                     return None;
                 }
             };
+            // The server's own description is model-facing text and part of
+            // the allowlist: `tools/list` supplied it, so it rides through to
+            // the registered definition instead of being dropped at the
+            // bridge. A server that omitted it yields an empty string —
+            // never a synthesized one.
             let def = ToolDefinition {
                 name: public,
+                description: tool
+                    .description
+                    .clone()
+                    .map(|d| d.into_owned())
+                    .unwrap_or_default(),
                 schema: serde_json::Value::Object((*tool.input_schema).clone()),
                 serialized: false,
             };

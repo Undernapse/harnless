@@ -24,14 +24,58 @@ use crate::ids::CallId;
 ///
 /// Tool arguments are raw JSON strings end to end; the schema describes how
 /// to validate them at the boundary.
+///
+/// Not every field of a definition is model-facing. Only
+/// [`ToolDefinition::to_schema`] crosses to the provider, and it carries
+/// name, description, and parameters — so the fields an adapter must never
+/// see (`serialized`, and anything added later) are excluded by construction,
+/// not by review.
 #[derive(Clone)]
 pub struct ToolDefinition {
     /// The tool name, namespaced under its provider.
     pub name: String,
+    /// The model-facing text describing what the tool does.
+    ///
+    /// This is part of the allowlist: it is one of the three fields
+    /// [`ToolDefinition::to_schema`] projects onto the wire, and a provider
+    /// decides whether and how to call a tool largely from it. A tool that
+    /// arrives from a source with no description (a legacy plugin
+    /// descriptor, a server that omitted the field) carries an empty string,
+    /// never a fabricated one.
+    pub description: String,
     /// The JSON schema for the tool's arguments.
     pub schema: Value,
     /// Whether the tool carries stateful-call serialization requirements.
+    ///
+    /// Internal scheduling metadata; never model-facing. It has no place in
+    /// [`crate::llm::ToolSchema`] and cannot reach one through
+    /// [`ToolDefinition::to_schema`].
     pub serialized: bool,
+}
+
+impl ToolDefinition {
+    /// Project this definition onto the model-facing
+    /// [`crate::llm::ToolSchema`] — the *one* place a registry definition
+    /// becomes something an adapter may send to a provider.
+    ///
+    /// The allowlist is a code path, not a comment: the body names exactly
+    /// the three fields a provider is permitted to see (name, description,
+    /// parameters) and leaves `strict` at its default. `serialized` — and
+    /// any internal field added to this struct later — is excluded because
+    /// this function never mentions it, so widening [`ToolDefinition`] can
+    /// never silently widen the wire shape. Adapters take
+    /// [`crate::llm::ToolSchema`], never a definition, so there is no other
+    /// route from registry to request.
+    ///
+    /// [`crate::llm::ToolSchema`]: crate::llm::ToolSchema
+    pub fn to_schema(&self) -> crate::llm::ToolSchema {
+        crate::llm::ToolSchema {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            parameters: self.schema.clone(),
+            strict: false,
+        }
+    }
 }
 
 /// The tool body: the actual executable operation.

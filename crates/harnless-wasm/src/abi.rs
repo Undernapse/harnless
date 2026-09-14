@@ -4,8 +4,9 @@
 //!
 //! * `descriptor() -> string` — a JSON descriptor declaring the plugin name
 //!   and its tools. Each tool carries the same contract surface a native
-//!   [`harnless_seams::tools::ToolDefinition`] has: a name, an argument JSON
-//!   schema, an output declaration, and a `serialized` flag.
+//!   [`harnless_seams::tools::ToolDefinition`] has: a name, a model-facing
+//!   description, an argument JSON schema, an output declaration, and a
+//!   `serialized` flag.
 //! * `call_<tool>(input: string) -> string` — one exported execute function
 //!   per declared tool, taking the raw-JSON arguments and returning the
 //!   raw-JSON result. (Wasm functions are synchronous; long-running work is
@@ -36,6 +37,16 @@ pub struct Descriptor {
 pub struct ToolSpec {
     /// The tool name, namespaced under the plugin by the loader.
     pub name: String,
+    /// The model-facing text describing what the tool does — the guest's
+    /// contribution to the [`harnless_seams::llm::ToolSchema`] an adapter
+    /// may send to a provider.
+    ///
+    /// Optional in the descriptor JSON: a plugin written before descriptions
+    /// existed still parses, and its tool simply reaches the model with no
+    /// description. `serde(default)` is what buys that backwards
+    /// compatibility, and it is deliberate — the key is absent, not wrong.
+    #[serde(default)]
+    pub description: String,
     /// The JSON schema for the tool's raw-JSON arguments.
     pub schema: Value,
     /// The output declaration: what shape the raw-JSON result carries.
@@ -137,6 +148,7 @@ mod tests {
             "name": "echo",
             "tools": [{
                 "name": "echo",
+                "description": "Echo the input back.",
                 "schema": {"type": "object"},
                 "output": "json",
                 "serialized": false
@@ -145,8 +157,28 @@ mod tests {
         let d: Descriptor = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(d.name, "echo");
         assert_eq!(d.tools.len(), 1);
+        assert_eq!(d.tools[0].description, "Echo the input back.");
         assert_eq!(d.tools[0].schema, serde_json::json!({"type": "object"}));
         assert_eq!(serde_json::to_value(&d).unwrap(), json);
+    }
+
+    /// A descriptor written before `description` existed must keep parsing —
+    /// that is the whole point of `serde(default)` on the field — and the
+    /// tool it declares reaches the host with no description, not a
+    /// synthesized one.
+    #[test]
+    fn a_descriptor_without_a_description_still_parses() {
+        let json = serde_json::json!({
+            "name": "echo",
+            "tools": [{
+                "name": "echo",
+                "schema": {"type": "object"},
+                "output": "json"
+            }]
+        });
+        let d: Descriptor = serde_json::from_value(json).unwrap();
+        assert_eq!(d.tools[0].description, "");
+        assert!(!d.tools[0].serialized);
     }
 
     #[test]

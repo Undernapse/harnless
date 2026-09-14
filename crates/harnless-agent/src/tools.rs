@@ -614,6 +614,7 @@ mod tests {
     fn echo_def() -> ToolDefinition {
         ToolDefinition {
             name: "echo".into(),
+            description: "Echo the arguments back.".into(),
             schema: serde_json::json!({}),
             serialized: false,
         }
