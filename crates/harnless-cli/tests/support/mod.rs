@@ -212,10 +212,8 @@ pub fn mount_seam_doc(doc: &harnless_cli::profile::ProfileDoc) -> Seam {
         Some(p) => load_script(&p),
         None => Script::one(text_recording("(no script named)")),
     }));
-    let mounted = Mounted {
-        model: Some(model.clone()),
-        ..mounted
-    };
+    let mut mounted = mounted;
+    mounted.model = Some(model.clone());
     Seam { mounted, model }
 }
 

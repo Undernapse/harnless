@@ -121,6 +121,16 @@ impl Mounted {
     }
 }
 
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        // Releasing the last strong handle on the spine disposes the
+        // composition: `SpineMount::Drop` runs the guard's row-resource
+        // disposal and the spine fiber's unwind. A registry-owned spine
+        // (`_spine: None`) has nothing extra to unwind here.
+        self._spine = None;
+    }
+}
+
 /// The per-composition id allocator.
 ///
 /// Positions and times are the log's; *identity* is the caller's — the loop

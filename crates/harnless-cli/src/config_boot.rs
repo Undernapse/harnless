@@ -474,13 +474,18 @@ pub struct SpineMount {
     fiber: Arc<harnless_runtime::Fiber>,
     model: Option<ModelHandle>,
     tools: Option<Arc<harnless_agent::tools::ToolRegistry>>,
+    /// The wiring the spine was mounted with — the plan's tool declarations
+    /// it implements. A warm reuse must agree with the plan on this axis
+    /// (see [`ConfigComposer::mount`]); disagreement is a named failure,
+    /// never a silently tool-less loop for a plan that declared tools.
+    wiring: ToolsWiring,
     /// The composition's id allocator. It rides the *shared* spine, not the
     /// per-`Mounted` copy: every handle of one composition mints off one
     /// counter, so ids stay unique across turns and mounts of the same
     /// session. The log's positions and the loop's ids share no allocator,
     /// so this is the only cross-mount identity source.
     ids: crate::boot::Ids,
-    guard: std::sync::Mutex<harnless_config::MountGuard>,
+    guard: Arc<std::sync::Mutex<harnless_config::MountGuard>>,
 }
 
 impl SpineMount {
@@ -499,6 +504,14 @@ impl Drop for SpineMount {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The spine the most recent test-path `mount` composed or reused —
+    /// a *weak* handle, so the test's own `Mounted` drops remain the last
+    /// strong references and the disposal under test actually runs.
+    pub(crate) static TEST_SPINES: std::sync::Mutex<Option<std::sync::Weak<SpineMount>>> =
+        std::sync::Mutex::new(None);
+}
 /// The config-driven composer: the boot seam implemented over a
 /// [`harnless_config::Composer`].
 ///
@@ -874,10 +887,14 @@ impl ConfigComposer {
     /// Mount a composition and capture its spine as a reusable handle.
     ///
     /// The returned `SpineMount` owns the disposal chain: dropping the last
-    /// handle (or `Mounted::shutdown`) unwinds the row resources and the
-    /// spine's fiber. A `mount` through the seam reuses the handle stored on
-    /// the entry rather than mounting a second spine.
-    pub(crate) fn mount_spine_for(&self, doc: &ConfigDoc) -> Result<SpineMount, CliError> {
+    /// handle unwinds the row resources and the spine's fiber. A `mount`
+    /// through the seam reuses the live handle stored on the entry rather
+    /// than mounting a second spine.
+    pub(crate) fn mount_spine_for(
+        &self,
+        doc: &ConfigDoc,
+        wiring: ToolsWiring,
+    ) -> Result<SpineMount, CliError> {
         let CompositionMount {
             ctx,
             model,
@@ -899,8 +916,9 @@ impl ConfigComposer {
             fiber,
             model,
             tools,
+            wiring,
             ids: crate::boot::Ids::new(),
-            guard: std::sync::Mutex::new(_guard),
+            guard: Arc::new(std::sync::Mutex::new(_guard)),
         })
     }
 }
@@ -975,37 +993,57 @@ impl BootComposer for ConfigComposer {
     }
 
     fn mount(&self, doc: &ProfileDoc) -> Result<Mounted, CliError> {
+        // The plan's wiring is computed from the plan alone — the same
+        // projection `plan()` publishes — before any lock is taken.
+        let wiring = self.tools_wiring(doc)?;
         // The boot half mounts the rows the dump printed *when the stored
         // composition is the one this plan projects* — identity is checked,
-        // not assumed. The whole read-mount-write sequence runs under the
-        // mount lock: two racing cold mounts cannot each mount a spine onto
-        // the shared service map, and the cache's weak spine can never be
-        // observed half-published.
+        // not assumed. The read-mount-write sequence runs under the mount
+        // lock: two racing cold mounts cannot each mount a spine onto the
+        // shared service map, and the cache's weak spine can never be
+        // observed half-published. `parking_lot::Mutex` is not reentrant,
+        // so the cold path composes through the *inner* fold directly —
+        // never through `compose_full`, which takes the same lock.
         let _mount_guard = self.mount_lock.lock();
         let stored = self.last_config.lock().clone();
         let entry = match stored {
             Some(entry) if entry.name == doc.name => entry,
             // A stale or foreign entry re-composes the plan's own name from
             // the stored layers — without the overlays the lost composition
-            // applied. The divergence is loud, never silent: a plan that
-            // declares tools against an unpatched row composition fails the
-            // mount (the F3 guard), and the model check below swaps in the
-            // plan's own adapter whenever the rows' differs. A composition
-            // that fails here fails the mount — a profile that cannot
-            // compose cannot boot either.
+            // applied. The divergence is loud, never silent: the wiring
+            // check below refuses a tool-declaring plan over a tool-less
+            // composition, and the model check swaps in the plan's own
+            // adapter whenever the rows' differs. A composition that fails
+            // here fails the mount — a profile that cannot compose cannot
+            // boot either.
             _ => {
-                let composition = self.compose_full(&doc.name, &[])?;
+                let out = self.composer.compose(&doc.name, &[]).map_err(cli_error)?;
+                *self.last_warnings.lock() = out.warnings.clone();
                 Entry {
-                    name: composition.doc.name.clone(),
-                    doc: composition.doc,
+                    name: out.doc.name.clone(),
+                    doc: out.doc.clone(),
                     spine: None,
                 }
             }
         };
         let spine = match entry.spine.as_ref().and_then(std::sync::Weak::upgrade) {
-            Some(spine) => spine,
+            Some(spine) => {
+                // A warm reuse must implement the plan it is handed. The
+                // spine's wiring is the plan's tool declarations frozen at
+                // mount time; a plan that disagrees with the live spine
+                // would silently boot the wrong loop shape, so it fails
+                // loudly instead.
+                if spine.wiring != wiring {
+                    return Err(CliError::new(
+                        "mount-failed",
+                        "a spine with different tool wiring is already live for this profile; \
+                         drop its last Mounted before mounting the other plan",
+                    ));
+                }
+                spine
+            }
             None => {
-                let spine = Arc::new(self.mount_spine_for(&entry.doc)?);
+                let spine = Arc::new(self.mount_spine_for(&entry.doc, wiring)?);
                 // The composition's spine is now live; the entry keeps it
                 // weakly, so every later `mount` of the same plan reuses it
                 // while it is alive, and the last `Mounted` to drop disposes
@@ -1018,6 +1056,9 @@ impl BootComposer for ConfigComposer {
                 spine
             }
         };
+        #[cfg(test)]
+        crate::config_boot::TEST_SPINES
+            .with(|s| *s.lock().expect("probe lock") = Some(std::sync::Arc::downgrade(&spine)));
         // A plan whose model differs from the rows' model (a field-wise
         // patch swapped it) mounts the plan's model, never the rows'.
         let model = if model_matches(doc, spine.model.as_ref()) {
@@ -1400,7 +1441,21 @@ mod tests {
         let plan = composer.compose("default", None).unwrap();
         let first = composer.mount(&plan).expect("config mount boots");
         let second = composer.mount(&plan).expect("second mount reuses");
-        // Same spine: one log behind both handles, one id allocator.
+        // The probe is a *weak* handle on the spine: it observes the spine's
+        // disposal without preventing it. The raw inner handles — the fiber
+        // Arc and the guard Arc — outlive the spine struct and carry the
+        // observable state the post-drop assertions read.
+        let spine_probe = TEST_SPINES
+            .with(|s| s.lock().expect("probe lock").clone())
+            .expect("mount recorded its spine");
+        let live = spine_probe
+            .upgrade()
+            .expect("spine alive while handles serve");
+        let fiber_probe = Arc::clone(&live.fiber);
+        let guard_probe = Arc::clone(&live.guard);
+        // `live` is a temporary strong handle: release it before the
+        // disposal assertions so `drop(first)` really is the last one.
+        drop(live);
         let log1 = first
             .ctx
             .get::<harnless_agent::session::SessionLog>()
@@ -1408,15 +1463,35 @@ mod tests {
         let id_a = first.ids.message();
         let id_b = second.ids.message();
         assert_ne!(id_a, id_b, "one allocator, monotonic ids");
+        assert_eq!(
+            fiber_probe.state(),
+            harnless_runtime::fiber::FiberState::Active,
+            "the live spine's fiber is Active"
+        );
+        assert!(
+            !guard_probe.lock().expect("guard lock").is_empty(),
+            "the guard holds the composition's row resources"
+        );
         drop(second);
         assert!(
             first.ctx.get::<harnless_agent::AgentLoop>().is_some(),
             "dropping a sibling handle never disposes the live spine"
         );
         assert_eq!(log1.snapshot().records.len(), 0, "untouched log");
+        // The last strong handle dropped: observe disposal directly — the
+        // fiber reached Disposed (the spine's unwind ran) and the guard's
+        // row resources are gone (guard.dispose ran).
         drop(first);
-        // The last handle dropped: the spine's services unwound with its
-        // fiber, so a fresh mount composes a fresh spine.
+        assert_eq!(
+            fiber_probe.state(),
+            harnless_runtime::fiber::FiberState::Disposed,
+            "the last handle's drop ran SpineMount::dispose"
+        );
+        assert!(
+            guard_probe.lock().expect("guard lock").is_empty(),
+            "the guard's row resources were disposed"
+        );
+        // A fresh mount composes a fresh spine.
         let third = composer.mount(&plan).expect("remount after disposal");
         assert!(third.ctx.get::<harnless_agent::AgentLoop>().is_some());
         assert_eq!(
