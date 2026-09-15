@@ -793,6 +793,7 @@ impl ConfigComposer {
         let ctx = Context::root();
         let mut guard = harnless_config::MountGuard::new();
         let mut spine: Option<Arc<Registry>> = None;
+        let mut spine_unwind: Option<SpineUnwind> = None;
         let mut model: Option<ModelHandle> = None;
         let mut spine_tools: Option<Arc<harnless_agent::tools::ToolRegistry>> = None;
         // The wiring is a property of the plan, computed once — the same
@@ -832,11 +833,15 @@ impl ConfigComposer {
                     // The spine's fiber needs an explicit unwind: dropping
                     // the registry does not dispose mounted fibers, so a
                     // later row failure must unmount it or the spine's
-                    // services stay live on a context nobody owns.
-                    guard.push(Box::new(SpineUnwind {
+                    // services stay live on a context nobody owns. The
+                    // unwind handle is held aside and pushed *after* the
+                    // row loop, so the guard's teardown order stays
+                    // reverse-mount: the spine's fiber unwinds last, after
+                    // every row resource it hosts has been disposed.
+                    spine_unwind = Some(SpineUnwind {
                         registry: Arc::clone(&registry),
                         fiber: Arc::clone(&fiber),
-                    }));
+                    });
                     spine = Some(Arc::clone(&registry));
                     spine_tools = tools;
                 }
@@ -859,6 +864,12 @@ impl ConfigComposer {
                     }
                 }
             }
+        }
+        // The spine's unwind handle joins the guard last, so reverse-order
+        // teardown disposes every row resource before the spine's fiber
+        // unwinds (the documented reverse-mount-order rule).
+        if let Some(unwind) = spine_unwind {
+            guard.push(Box::new(unwind));
         }
         let registry = spine.unwrap_or_default();
         // A plan that declared tools and a mount that wired none is a named
@@ -1028,12 +1039,20 @@ impl BootComposer for ConfigComposer {
         };
         let spine = match entry.spine.as_ref().and_then(std::sync::Weak::upgrade) {
             Some(spine) => {
-                // A warm reuse must implement the plan it is handed. The
-                // spine's wiring is the plan's tool declarations frozen at
-                // mount time; a plan that disagrees with the live spine
-                // would silently boot the wrong loop shape, so it fails
-                // loudly instead.
-                if spine.wiring != wiring {
+                // A warm reuse must implement the *shape* of the plan it is
+                // handed: the spine's loop is either tool-less or
+                // registry-backed, and that axis is frozen at mount time.
+                // The registry-backed loop decides allow/deny by name
+                // membership in what it registered, so a plan whose
+                // `declared` list differs only in content or order is still
+                // served by the live spine — only the None/AutoAllow
+                // mismatch boots the wrong loop shape, and it fails loudly.
+                let same_shape = matches!(
+                    (&spine.wiring, &wiring),
+                    (ToolsWiring::None, ToolsWiring::None)
+                        | (ToolsWiring::AutoAllow { .. }, ToolsWiring::AutoAllow { .. })
+                );
+                if !same_shape {
                     return Err(CliError::new(
                         "mount-failed",
                         "a spine with different tool wiring is already live for this profile; \
@@ -1504,5 +1523,35 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    /// A warm spine reuse must implement the plan's loop *shape*: a
+    /// tool-declaring plan over a live tool-less spine fails loudly, and a
+    /// plan that only reorders/extends the tool names is still served by
+    /// the live registry-backed spine (name-membership allow, not a
+    /// frozen list).
+    #[test]
+    fn warm_spine_reuse_rejects_only_the_wiring_shape_mismatch() {
+        use crate::boot::BootComposer as _;
+        let composer = composer();
+        let plain = composer.compose("default", None).unwrap();
+        let tool_plan = composer
+            .compose("default", Some("tools: [echo]"))
+            .expect("tools patch composes");
+        assert_ne!(plain.tools, tool_plan.tools, "the patch declared tools");
+        // A tool-less spine is live for "default".
+        let live = composer.mount(&plain).expect("tool-less mount boots");
+        // The same shape (tool-less) reuses it.
+        let again = composer.mount(&plain).expect("same-shape reuse");
+        drop(again);
+        // A tool-declaring plan over the tool-less spine: wrong loop shape,
+        // named failure — never a silently tool-less loop for a plan that
+        let err = match composer.mount(&tool_plan) {
+            Ok(_) => panic!("shape mismatch must fail the mount"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, "mount-failed");
+        // The live handle is untouched by the refused mount.
+        assert!(live.ctx.get::<harnless_agent::AgentLoop>().is_some());
     }
 }
