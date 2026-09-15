@@ -1604,4 +1604,41 @@ mod tests {
             restated.tools.as_ref().expect("reused registry")
         ));
     }
+
+    /// `model_matches`' golden clause: a plan that keeps the provider but
+    /// swaps `model.script` must NOT match the rows' mounted adapter —
+    /// the mount swaps in the plan's own golden, never silently keeps the
+    /// rows'. A plan naming no script matches the built-in demo corpus
+    /// (script_id ""), and a different provider never matches.
+    #[test]
+    fn model_matches_compares_provider_and_golden() {
+        let rows = build_adapter(&ProfileDoc::default_profile())
+            .unwrap()
+            .expect("default composes an adapter");
+        // Same provider, no script named: matches the demo corpus.
+        assert!(model_matches(&ProfileDoc::default_profile(), Some(&rows)));
+        // Same provider, a golden swapped in: must not match.
+        let mut swapped = ProfileDoc::default_profile();
+        swapped.model = ModelSpec::Replay {
+            provider: "openai".into(),
+            script: Some("/golden/other.json".into()),
+        };
+        assert!(
+            !model_matches(&swapped, Some(&rows)),
+            "a script-swapped plan never matches the rows' adapter"
+        );
+        // A different provider never matches, script or not.
+        let mut other_provider = ProfileDoc::default_profile();
+        other_provider.model = ModelSpec::Replay {
+            provider: "otherprov".into(),
+            script: None,
+        };
+        assert!(!model_matches(&other_provider, Some(&rows)));
+        // No plan model and no mounted adapter match; a plan model over no
+        // adapter never does.
+        let mut none = ProfileDoc::default_profile();
+        none.model = ModelSpec::None;
+        assert!(model_matches(&none, None));
+        assert!(!model_matches(&ProfileDoc::default_profile(), None));
+    }
 }
