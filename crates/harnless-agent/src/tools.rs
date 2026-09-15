@@ -609,7 +609,11 @@ impl harnless_seams::Tools for ToolRegistry {
     }
 
     fn names(&self) -> Vec<String> {
-        self.tools.read().keys().cloned().collect()
+        // Sorted: the projection is part of what a provider sees (schemas
+        // ride the adapter request), so it must not depend on HashMap order.
+        let mut names: Vec<String> = self.tools.read().keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// The model-facing schemas of every registered tool.
@@ -618,13 +622,18 @@ impl harnless_seams::Tools for ToolRegistry {
     /// implementation; this override exists so the projection is a single
     /// locked pass over the tool map rather than one lock acquisition per
     /// name. The allowlist is `to_schema`'s, unchanged — this route cannot
-    /// widen what reaches an adapter.
+    /// widen what reaches an adapter. Order is by name, matching the sorted
+    /// `names`: the schema vector rides the adapter request and any golden
+    /// or conformance key derived from it, so it must be deterministic.
     fn schemas(&self) -> Vec<harnless_seams::ToolSchema> {
-        self.tools
+        let mut schemas: Vec<(String, harnless_seams::ToolSchema)> = self
+            .tools
             .read()
             .values()
-            .map(|(def, _)| def.to_schema())
-            .collect()
+            .map(|(def, _)| (def.name.clone(), def.to_schema()))
+            .collect();
+        schemas.sort_by(|a, b| a.0.cmp(&b.0));
+        schemas.into_iter().map(|(_, s)| s).collect()
     }
 }
 

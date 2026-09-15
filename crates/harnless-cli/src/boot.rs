@@ -223,6 +223,18 @@ pub(crate) fn mount_spine(
     ),
     CliError,
 > {
+    // `Registry::mount` runs the plugin body on a *fresh* fiber of the
+    // registry's own. If the caller's context already carries a fiber, this
+    // is a re-entrant mount from inside another plugin's body, and the
+    // wiring's effects would be booked onto that outer fiber — unwinding
+    // with it while this composition stayed live. That is a silent effect
+    // loss, so refuse it loudly at boot.
+    if ctx.fiber().is_some() {
+        return Err(CliError::new(
+            "mount-failed",
+            "mount_spine called on a context already under a fiber",
+        ));
+    }
     let fiber = registry
         .mount(
             ctx,
@@ -260,6 +272,11 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
     }
 
     fn apply(&self, ctx: &Context) -> harnless_runtime::Result<()> {
+        // `Registry::mount` sets the fresh fiber on the plugin context
+        // before calling `apply`, so the fiber here is *this mount's* fiber.
+        let fiber = ctx
+            .fiber()
+            .ok_or_else(|| harnless_runtime::RuntimeError::new("MOUNT", "no owning fiber"))?;
         Spine::new(SessionId(1)).apply(ctx)?;
         let ToolsWiring::AutoAllow { declared } = &self.wiring else {
             return Ok(());
@@ -279,7 +296,6 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
                 harnless_seams::PreDecision,
             >| harnless_seams::PreDecision::Allow,
         )?;
-        let fiber = ctx.fiber().expect("spine must be mounted within a fiber");
         let loop_ = harnless_agent::loop_::AgentLoop::with_tools(
             ctx.get::<harnless_agent::session::SessionLog>()
                 .expect("spine provides the log"),

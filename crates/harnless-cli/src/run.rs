@@ -95,10 +95,11 @@ pub fn drive_turn(mounted: &Mounted, prompt: &str) -> Result<String, CliError> {
         model: None,
     }));
 
-    // One turn, possibly many adapter calls: the loop owns the log, so the
-    // driver re-reads the logged surface before every step and the loop
-    // commits each assistant message and tool round-trip itself. The CLI
-    // never re-implements the loop's commitment logic.
+    // One adapter call per turn: the loop owns the log, so the driver reads
+    // the logged surface (which carries every prior turn) and the loop
+    // commits the assistant message — or the tool round-trip, which ends
+    // the turn — itself. The CLI never re-implements the loop's commitment
+    // logic.
     let turn = loop_.run_turn(make_driver(
         model,
         Arc::clone(&log),
@@ -181,10 +182,9 @@ fn make_driver(
     ids: crate::boot::Ids,
     schemas: Vec<harnless_seams::ToolSchema>,
 ) -> Driver {
-    Box::new(move || loop {
-        // The model-visible list is re-read per step: the loop commits each
-        // assistant message and tool round-trip to the log as the turn
-        // proceeds, so the next adapter call sees the whole surface.
+    Box::new(move || {
+        // The model-visible list is the logged surface: every prior turn's
+        // messages, plus the prompt this turn just appended.
         let messages = model_messages(&log);
         let mut stream: harnless_seams::BoxStream =
             match model.stream(ids.call(), &messages, &schemas, None) {
@@ -220,7 +220,15 @@ fn make_driver(
                 BlockKind::Reasoning => blocks.push(ContentBlock::Reasoning { text: b.text }),
                 BlockKind::ToolCall => {
                     // The assembled tool-call block carries the provider's
-                    // raw-JSON envelope; the loop executes the call.
+                    // raw-JSON envelope; the loop executes the call. The
+                    // envelope is validated strictly — a malformed or
+                    // partial one is a named failure, never an invented id.
+                    if tool_call.is_some() {
+                        return stop_error(
+                            ErrorCode::StreamTerminated,
+                            "more than one tool call in one step",
+                        );
+                    }
                     let value: serde_json::Value = match serde_json::from_str(&b.text) {
                         Ok(v) => v,
                         Err(e) => {
@@ -230,21 +238,29 @@ fn make_driver(
                             )
                         }
                     };
-                    let name = value
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let arguments = value
-                        .get("arguments")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let call_id = value
-                        .get("id")
-                        .and_then(|v| v.as_u64())
-                        .map(CallId)
-                        .unwrap_or_else(|| ids.call());
+                    let field = |key: &str| -> Option<String> {
+                        value.get(key).map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                    };
+                    let (Some(name), Some(arguments)) = (field("name"), field("arguments")) else {
+                        return stop_error(
+                            ErrorCode::StreamTerminated,
+                            "tool-call block is missing name or arguments",
+                        );
+                    };
+                    // The call id must be numeric: the log's correlation key
+                    // is a u64 newtype, and a provider whose ids are strings
+                    // must fail loudly rather than have an id invented — an
+                    // invented id breaks the "cited retirement is
+                    // unambiguous" property the log's ids carry.
+                    let Some(call_id) = value.get("id").and_then(|v| v.as_u64()).map(CallId) else {
+                        return stop_error(
+                            ErrorCode::StreamTerminated,
+                            "tool-call block carries no numeric call id",
+                        );
+                    };
                     tool_call = Some((call_id, name, arguments));
                 }
                 _ => blocks.push(ContentBlock::Text { text: b.text }),
@@ -257,12 +273,12 @@ fn make_driver(
                 arguments,
             });
         }
-        return DriverOutcome::Message(MessageRecord {
+        DriverOutcome::Message(MessageRecord {
             id: ids.message(),
             blocks,
             provider: Some(model.provider().to_string()),
             model: Some("replay".into()),
-        });
+        })
     })
 }
 
