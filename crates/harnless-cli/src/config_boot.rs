@@ -437,40 +437,56 @@ impl harnless_config::compose::BundleStore for LayeredStore {
 }
 
 /// A composed configuration with the profile name it was composed for and
-/// the spine mount it produced, if any.
+/// a *weak* handle to the spine mount it produced, if any.
 ///
 /// `mount` checks the name against the plan it was handed before trusting
 /// the stored document, so a `mount` can never silently mount a *different
-/// profile's* rows. The spine rides along because mounting it is not
-/// idempotent: a second `mount_config` over the same plan would re-mount a
-/// mounted one reuses that composition instead of mounting another.
+/// profile's* rows. The spine rides along weakly because mounting is not
+/// idempotent: a live composition is reused, never re-mounted — but the
+/// cache must not own it, or disposal could never happen. A cold upgrade
+/// re-mounts under the composer's mount lock, so two racing cold mounts
+/// cannot each leave a spine mounted on the shared service map.
 #[derive(Clone)]
 struct Entry {
     name: String,
     doc: ConfigDoc,
-    spine: Option<Arc<SpineMount>>,
+    spine: Option<std::sync::Weak<SpineMount>>,
 }
 
 /// A live spine composition: the mounted context, its registry, the model
 /// and tool registry the rows composed, and the fiber that owns the spine's
 /// registrations.
 ///
-/// Disposal is explicit and idempotent: dropping the last handle (or
-/// `Mounted::shutdown`) disposes the guard chain — row resources and the
-/// spine's fiber unwind — in reverse mount order. Until then the
-/// composition stays live for whoever holds it.
+/// Disposal is explicit and idempotent: dropping the last handle disposes
+/// the guard chain — row resources and the spine's fiber unwind — in
+/// reverse mount order. The composition cache holds only a *weak* reference
+/// (see [`ConfigComposer::mount`]), so the last live `Mounted` is the last
+/// owner and teardown actually happens.
+///
+/// The state is **shared** across every `Mounted` of one composition: the
+/// log, event registry, tool pipeline, loop, and id allocator are one per
+/// composition — which is what a multi-turn session is. A caller that needs
+/// ids unique across *compositions* must hold one `Mounted`, not mount
+/// repeatedly.
 pub struct SpineMount {
     ctx: Context,
     registry: Arc<Registry>,
     fiber: Arc<harnless_runtime::Fiber>,
     model: Option<ModelHandle>,
     tools: Option<Arc<harnless_agent::tools::ToolRegistry>>,
+    /// The composition's id allocator. It rides the *shared* spine, not the
+    /// per-`Mounted` copy: every handle of one composition mints off one
+    /// counter, so ids stay unique across turns and mounts of the same
+    /// session. The log's positions and the loop's ids share no allocator,
+    /// so this is the only cross-mount identity source.
+    ids: crate::boot::Ids,
     guard: std::sync::Mutex<harnless_config::MountGuard>,
 }
 
 impl SpineMount {
-    /// Tear the composition down: dispose every row resource and unwind the
-    /// spine's fiber. Idempotent.
+    /// Tear the composition down: dispose every row resource, then unwind
+    /// the spine's fiber. Idempotent — the guard's latch and the fiber's
+    /// state both make a second call a no-op.
     fn dispose(&self) {
         self.guard.lock().expect("guard lock").dispose();
         self.registry.unmount(&self.fiber);
@@ -496,12 +512,16 @@ pub struct ConfigComposer {
     /// Warnings from the most recent composition, so the binary reports them
     /// once instead of threading them through every call.
     last_warnings: parking_lot::Mutex<Vec<Warning>>,
-    /// The most recent composition's full document and the profile name it
-    /// was composed for, so `mount` — the boot half of the seam — mounts the
-    /// *rows* the dump printed rather than a spine-only re-composition of
-    /// the plan, and refuses to mount a document composed for a different
-    /// profile. `compose` writes it; `mount` reads it and checks the name.
+    /// The most recent composition's full document, the profile name it was
+    /// composed for, and a weak handle to its live spine, so `mount` — the
+    /// boot half of the seam — mounts the *rows* the dump printed, reuses a
+    /// live composition instead of re-mounting one, and never owns a spine
+    /// the caller has already dropped. `compose` writes it; `mount` reads
+    /// and upgrades it under `mount_lock`.
     last_config: parking_lot::Mutex<Option<Entry>>,
+    /// Serializes the cold-mount read-upgrade-mount-write sequence so two
+    /// racing `mount` calls cannot both mount a spine onto one service map.
+    mount_lock: parking_lot::Mutex<()>,
 }
 
 impl ConfigComposer {
@@ -553,6 +573,7 @@ impl ConfigComposer {
             specs: PluginSpecs::built_in(),
             last_warnings: parking_lot::Mutex::new(last_warnings),
             last_config: parking_lot::Mutex::new(None),
+            mount_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -611,12 +632,15 @@ impl ConfigComposer {
 
     /// Compose the full configuration document, with warnings and trace.
     pub fn compose_full(&self, name: &str, overlays: &[Layer]) -> Result<Composition, CliError> {
+        // Under the mount lock: replacing the entry must never interleave
+        // with a cold mount, or a spine mounted for the old document gets
+        // published into the new one's entry.
+        let _mount_guard = self.mount_lock.lock();
         let out = self.composer.compose(name, overlays).map_err(cli_error)?;
         *self.last_warnings.lock() = out.warnings.clone();
-        // A new composition replaces the old entry. If the old entry's spine
-        // was handed to a live `Mounted`, that handle owns its disposal; the
-        // entry drops its own reference, and a later `mount` composes a
-        // fresh spine for the new document.
+        // A new composition replaces the old entry. The old entry's weak
+        // spine dies with the last live `Mounted` that holds it; a later
+        // `mount` of the new document composes a fresh spine.
         *self.last_config.lock() = Some(Entry {
             name: out.doc.name.clone(),
             doc: out.doc.clone(),
@@ -861,8 +885,10 @@ impl ConfigComposer {
             _registry,
             _guard,
         } = self.mount_config(doc)?;
-        // The spine's fiber is the registry's mount; a composition without
-        // one mounted no spine row, which the seam cannot boot.
+        // The spine is the only plugin this composition mounts through this
+        // registry — model/tool rows mount through their own guards, never
+        // here — so the registry's last fiber *is* the spine's. No spine
+        // fiber means no spine row mounted, which the seam cannot boot.
         let fiber =
             _registry.fibers().into_iter().last().ok_or_else(|| {
                 CliError::new("mount-failed", "composition mounted no spine fiber")
@@ -873,6 +899,7 @@ impl ConfigComposer {
             fiber,
             model,
             tools,
+            ids: crate::boot::Ids::new(),
             guard: std::sync::Mutex::new(_guard),
         })
     }
@@ -950,40 +977,43 @@ impl BootComposer for ConfigComposer {
     fn mount(&self, doc: &ProfileDoc) -> Result<Mounted, CliError> {
         // The boot half mounts the rows the dump printed *when the stored
         // composition is the one this plan projects* — identity is checked,
-        // not assumed. A stale or foreign `last_config` re-composes the
-        // plan's own name; a composition that fails is a named failure,
-        // never a silent reference fallback. The stored composition's spine
-        // is *reused*, not re-mounted: mounting is not idempotent, and the
-        // composition `compose` produced is the one the dump describes.
+        // not assumed. The whole read-mount-write sequence runs under the
+        // mount lock: two racing cold mounts cannot each mount a spine onto
+        // the shared service map, and the cache's weak spine can never be
+        // observed half-published.
+        let _mount_guard = self.mount_lock.lock();
         let stored = self.last_config.lock().clone();
         let entry = match stored {
-            Some(entry) if entry.name == doc.name => Some(entry),
-            // The overlays `compose` applied are not recoverable from the
-            // plan alone, so a foreign entry re-composes the named profile
-            // from the stored layers. A composition that fails here fails
-            // the mount — dump-equals-mount's error clause says a profile
-            // that cannot compose cannot boot either.
+            Some(entry) if entry.name == doc.name => entry,
+            // A stale or foreign entry re-composes the plan's own name from
+            // the stored layers — without the overlays the lost composition
+            // applied. The divergence is loud, never silent: a plan that
+            // declares tools against an unpatched row composition fails the
+            // mount (the F3 guard), and the model check below swaps in the
+            // plan's own adapter whenever the rows' differs. A composition
+            // that fails here fails the mount — a profile that cannot
+            // compose cannot boot either.
             _ => {
                 let composition = self.compose_full(&doc.name, &[])?;
-                Some(Entry {
+                Entry {
                     name: composition.doc.name.clone(),
                     doc: composition.doc,
                     spine: None,
-                })
+                }
             }
         };
-        let entry = entry.expect("compose_full returns or errors");
-        let spine = match entry.spine {
+        let spine = match entry.spine.as_ref().and_then(std::sync::Weak::upgrade) {
             Some(spine) => spine,
             None => {
                 let spine = Arc::new(self.mount_spine_for(&entry.doc)?);
-                // The composition's spine is now live; the entry hands it to
-                // every later `mount` of the same plan instead of mounting a
-                // second spine onto the service map.
+                // The composition's spine is now live; the entry keeps it
+                // weakly, so every later `mount` of the same plan reuses it
+                // while it is alive, and the last `Mounted` to drop disposes
+                // it for real.
                 *self.last_config.lock() = Some(Entry {
                     name: entry.name.clone(),
                     doc: entry.doc.clone(),
-                    spine: Some(Arc::clone(&spine)),
+                    spine: Some(Arc::downgrade(&spine)),
                 });
                 spine
             }
@@ -995,13 +1025,14 @@ impl BootComposer for ConfigComposer {
         } else {
             build_adapter(doc)?
         };
+        let ids = spine.ids.clone();
         Ok(Mounted {
             ctx: spine.ctx.clone(),
             _registry: Arc::clone(&spine.registry),
             tools: spine.tools.clone(),
             _spine: Some(spine as Arc<dyn std::any::Any + Send + Sync>),
             model,
-            ids: crate::boot::Ids::new(),
+            ids,
         })
     }
 }
@@ -1355,5 +1386,48 @@ mod tests {
             .err()
             .expect("an unknown doc: row fails mount too");
         assert_eq!(mount_err.code, "unknown-plugin");
+    }
+
+    /// The seam's boot half over the *config* composer (the binary's
+    /// composition root, not the reference mount the seam tests drive):
+    /// mounting a composed plan reuses the composition's spine — one log,
+    /// one id allocator across handles — and disposal happens when the
+    /// last handle goes, not never.
+    #[test]
+    fn mounting_a_plan_reuses_the_composition_spine_and_disposes_last_handle() {
+        use crate::boot::BootComposer as _;
+        let composer = composer();
+        let plan = composer.compose("default", None).unwrap();
+        let first = composer.mount(&plan).expect("config mount boots");
+        let second = composer.mount(&plan).expect("second mount reuses");
+        // Same spine: one log behind both handles, one id allocator.
+        let log1 = first
+            .ctx
+            .get::<harnless_agent::session::SessionLog>()
+            .expect("spine provides the log");
+        let id_a = first.ids.message();
+        let id_b = second.ids.message();
+        assert_ne!(id_a, id_b, "one allocator, monotonic ids");
+        drop(second);
+        assert!(
+            first.ctx.get::<harnless_agent::AgentLoop>().is_some(),
+            "dropping a sibling handle never disposes the live spine"
+        );
+        assert_eq!(log1.snapshot().records.len(), 0, "untouched log");
+        drop(first);
+        // The last handle dropped: the spine's services unwound with its
+        // fiber, so a fresh mount composes a fresh spine.
+        let third = composer.mount(&plan).expect("remount after disposal");
+        assert!(third.ctx.get::<harnless_agent::AgentLoop>().is_some());
+        assert_eq!(
+            third
+                .ctx
+                .get::<harnless_agent::session::SessionLog>()
+                .expect("fresh log")
+                .snapshot()
+                .records
+                .len(),
+            0
+        );
     }
 }

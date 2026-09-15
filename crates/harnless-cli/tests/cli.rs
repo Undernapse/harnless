@@ -167,6 +167,7 @@ fn a_declared_tool_boots_and_runs_through_the_binary() {
     use harnless_seams::{BlockKind, ContentBlock, ReplayState, StreamFrame, Usage};
     use std::io::Write;
     let dir = std::env::temp_dir().join(format!("hrls-tool-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("tool.json");
     // Capture the tool-call recording the same way the seam harness does —
