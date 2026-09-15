@@ -867,7 +867,10 @@ impl ConfigComposer {
         }
         // The spine's unwind handle joins the guard last, so reverse-order
         // teardown disposes every row resource before the spine's fiber
-        // unwinds (the documented reverse-mount-order rule).
+        // unwinds (the documented reverse-mount-order rule). The push is
+        // deliberately post-loop: the in-loop error paths already `dispose`
+        // the guard, so `MountGuard::push`'s disposed-guard branch stays
+        // belt-and-braces here rather than a live path.
         if let Some(unwind) = spine_unwind {
             guard.push(Box::new(unwind));
         }
@@ -917,10 +920,22 @@ impl ConfigComposer {
         // registry — model/tool rows mount through their own guards, never
         // here — so the registry's last fiber *is* the spine's. No spine
         // fiber means no spine row mounted, which the seam cannot boot.
-        let fiber =
-            _registry.fibers().into_iter().last().ok_or_else(|| {
-                CliError::new("mount-failed", "composition mounted no spine fiber")
-            })?;
+        let fiber = match _registry.fibers().into_iter().last() {
+            Some(fiber) => fiber,
+            None => {
+                // The composition failed after its rows mounted: the guard
+                // is a bound local here, and dropping it without `dispose`
+                // would leave the mounted rows' resources — and an Active
+                // spine fiber on an orphan context — alive forever. A failed
+                // boot unwinds, never leaks.
+                let mut guard = _guard;
+                guard.dispose();
+                return Err(CliError::new(
+                    "mount-failed",
+                    "composition mounted no spine fiber",
+                ));
+            }
+        };
         Ok(SpineMount {
             ctx,
             registry: _registry,
@@ -1553,5 +1568,40 @@ mod tests {
         assert_eq!(err.code, "mount-failed");
         // The live handle is untouched by the refused mount.
         assert!(live.ctx.get::<harnless_agent::AgentLoop>().is_some());
+    }
+
+    /// The positive half of the shape rule: over a live registry-backed
+    /// spine, a plan whose declared tool list differs only in content or
+    /// order is still served (name-membership allow), so the mount reuses
+    /// the spine instead of failing.
+    #[test]
+    fn warm_spine_reuse_accepts_a_differing_tool_list() {
+        use crate::boot::BootComposer as _;
+        let composer = composer();
+        let echo_plan = composer
+            .compose("default", Some("tools: [echo]"))
+            .expect("tools patch composes");
+        // Same *set*, different declared *list*: the built-in registry only
+        // has `echo`, so the second plan re-states the name in a shape the
+        // frozen-list comparison would have rejected.
+        let reordered_plan = composer
+            .compose("default", Some("tools: [echo, echo]"))
+            .expect("reordered tools patch composes");
+        assert_ne!(
+            echo_plan.tools, reordered_plan.tools,
+            "the plans' declared lists differ"
+        );
+        // A registry-backed spine is live for "default" with `echo`.
+        let live = composer.mount(&echo_plan).expect("tool mount boots");
+        assert!(live.tools.is_some(), "the spine wired a tool registry");
+        // The re-stated plan over the same-shape spine: served by name
+        // membership, so the mount reuses the live spine.
+        let restated = composer
+            .mount(&reordered_plan)
+            .expect("same-shape reuse serves a differing tool list");
+        assert!(Arc::ptr_eq(
+            live.tools.as_ref().expect("live registry"),
+            restated.tools.as_ref().expect("reused registry")
+        ));
     }
 }
