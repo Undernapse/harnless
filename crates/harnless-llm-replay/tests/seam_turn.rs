@@ -297,3 +297,34 @@ fn corpus_is_a_stable_golden_document() {
         again.frames.last()
     );
 }
+
+/// The corpus-file API round-trips: a script written with
+/// `write_corpus_json` loads back through `from_json_file` with the same
+/// recordings in call order, and the single-object golden shape still
+/// loads as a one-recording script.
+#[test]
+fn corpus_files_round_trip_through_the_script_api() {
+    let dir = std::env::temp_dir().join(format!("hrls-corpus-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let recording = Recording::capture(&recorded_stream(), &recorded_replay());
+    let script = Script::new(vec![recording.clone(), recording.clone()]);
+
+    let path = dir.join("corpus.json");
+    script.write_corpus_json(&path).expect("write corpus");
+    let loaded = Script::from_json_file(&path).expect("load corpus");
+    assert_eq!(loaded.len(), 2, "both recordings survive");
+    assert_eq!(
+        loaded.recording_at(0).to_json().unwrap(),
+        recording.to_json().unwrap(),
+        "the corpus preserves each recording verbatim"
+    );
+
+    // The single-object golden shape loads as a one-recording script.
+    let single = dir.join("golden.json");
+    std::fs::write(&single, recording.to_json().unwrap()).unwrap();
+    let loaded = Script::from_json_file(&single).expect("load single golden");
+    assert_eq!(loaded.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -30,7 +30,6 @@
 
 use std::sync::Arc;
 
-use harnless_agent::spine::Spine;
 use harnless_config::compose::{Composer, Composition, ProfileStore, Warning};
 use harnless_config::doc::{BundleDoc, ConfigDoc, Layer, ProfileSpec, Row};
 use harnless_config::error::ConfigError;
@@ -38,9 +37,8 @@ use harnless_config::subst::Subst;
 use harnless_config::{MountedResource, PluginRegistry};
 use harnless_runtime::context::Context;
 use harnless_runtime::plugin::Registry;
-use harnless_seams::SessionId;
 
-use crate::boot::{BootComposer, Mounted};
+use crate::boot::{BootComposer, Mounted, ToolsWiring};
 use crate::model::{build_adapter, ModelHandle};
 use crate::profile::{ModelSpec, ProfileDoc};
 use crate::CliError;
@@ -145,6 +143,8 @@ pub struct CompositionMount {
     pub ctx: Context,
     /// The model composed by the model row, if any.
     pub model: Option<ModelHandle>,
+    /// The mounted tool registry, when the profile's plan declared tools.
+    pub tools: Option<Arc<harnless_agent::tools::ToolRegistry>>,
     /// The spine's registry — kept alive so its services stay mounted.
     _registry: Arc<Registry>,
     /// The mount guard that disposes every row resource.
@@ -160,7 +160,8 @@ pub struct CompositionMount {
 pub fn default_plugins() -> PluginRegistry {
     let mut registry = PluginRegistry::new();
     registry.register_fn(REPLAY_PLUGIN, |id: &str, config| {
-        let model = build_adapter(&model_plan(id, config)?).map_err(|e| e.message)?;
+        let plan = model_plan(id, config)?;
+        let model = build_adapter(&plan).map_err(|e| e.message)?;
         Ok(ModelResource {
             id: id.to_string(),
             model,
@@ -172,7 +173,35 @@ pub fn default_plugins() -> PluginRegistry {
             model: None,
         })
     });
+    // A `tool` row is plan content the spine's wiring acts on, not a service
+    // this registry builds — but the row must still *mount*, so the name
+    // resolves to an inert resource. The tool bodies themselves are
+    // registered by `crate::boot::register_builtins` on the spine's
+    // pipeline; a declared name with no built-in body is a named mount
+    // failure there, never a silently unregistered tool.
+    registry.register_fn(TOOL_PLUGIN, |id: &str, _config| {
+        Ok(InertResource { id: id.to_string() })
+    });
     registry
+}
+
+/// A mounted row that contributes no service: the placeholder a `tool` row
+/// resolves to, so the row validates and mounts while the spine's wiring
+/// owns the actual tool registration.
+struct InertResource {
+    id: String,
+}
+
+impl MountedResource for InertResource {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn dispose(&mut self) {}
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// A mount plan carrying only a model composition.
@@ -388,8 +417,8 @@ impl ProfileStore for LayeredStore {
 impl harnless_config::compose::BundleStore for LayeredStore {
     fn load(&self, name: &str) -> harnless_config::error::Result<Option<BundleDoc>> {
         if let Some(disk) = self.disk() {
-            if let Some(bundle) = harnless_config::compose::BundleStore::load(&disk, name)? {
-                return Ok(Some(bundle));
+            if let Some(doc) = harnless_config::compose::BundleStore::load(&disk, name)? {
+                return Ok(Some(doc));
             }
         }
         harnless_config::compose::BundleStore::load(&self.built_in, name)
@@ -407,6 +436,82 @@ impl harnless_config::compose::BundleStore for LayeredStore {
     }
 }
 
+/// A composed configuration with the profile name it was composed for and
+/// a *weak* handle to the spine mount it produced, if any.
+///
+/// `mount` checks the name against the plan it was handed before trusting
+/// the stored document, so a `mount` can never silently mount a *different
+/// profile's* rows. The spine rides along weakly because mounting is not
+/// idempotent: a live composition is reused, never re-mounted — but the
+/// cache must not own it, or disposal could never happen. A cold upgrade
+/// re-mounts under the composer's mount lock, so two racing cold mounts
+/// cannot each leave a spine mounted on the shared service map.
+#[derive(Clone)]
+struct Entry {
+    name: String,
+    doc: ConfigDoc,
+    spine: Option<std::sync::Weak<SpineMount>>,
+}
+
+/// A live spine composition: the mounted context, its registry, the model
+/// and tool registry the rows composed, and the fiber that owns the spine's
+/// registrations.
+///
+/// Disposal is explicit and idempotent: dropping the last handle disposes
+/// the guard chain — row resources and the spine's fiber unwind — in
+/// reverse mount order. The composition cache holds only a *weak* reference
+/// (see [`ConfigComposer::mount`]), so the last live `Mounted` is the last
+/// owner and teardown actually happens.
+///
+/// The state is **shared** across every `Mounted` of one composition: the
+/// log, event registry, tool pipeline, loop, and id allocator are one per
+/// composition — which is what a multi-turn session is. A caller that needs
+/// ids unique across *compositions* must hold one `Mounted`, not mount
+/// repeatedly.
+pub struct SpineMount {
+    ctx: Context,
+    registry: Arc<Registry>,
+    fiber: Arc<harnless_runtime::Fiber>,
+    model: Option<ModelHandle>,
+    tools: Option<Arc<harnless_agent::tools::ToolRegistry>>,
+    /// The wiring the spine was mounted with — the plan's tool declarations
+    /// it implements. A warm reuse must agree with the plan on this axis
+    /// (see [`ConfigComposer::mount`]); disagreement is a named failure,
+    /// never a silently tool-less loop for a plan that declared tools.
+    wiring: ToolsWiring,
+    /// The composition's id allocator. It rides the *shared* spine, not the
+    /// per-`Mounted` copy: every handle of one composition mints off one
+    /// counter, so ids stay unique across turns and mounts of the same
+    /// session. The log's positions and the loop's ids share no allocator,
+    /// so this is the only cross-mount identity source.
+    ids: crate::boot::Ids,
+    guard: Arc<std::sync::Mutex<harnless_config::MountGuard>>,
+}
+
+impl SpineMount {
+    /// Tear the composition down: dispose every row resource, then unwind
+    /// the spine's fiber. Idempotent — the guard's latch and the fiber's
+    /// state both make a second call a no-op.
+    fn dispose(&self) {
+        self.guard.lock().expect("guard lock").dispose();
+        self.registry.unmount(&self.fiber);
+    }
+}
+
+impl Drop for SpineMount {
+    fn drop(&mut self) {
+        self.dispose();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The spine the most recent test-path `mount` composed or reused —
+    /// a *weak* handle, so the test's own `Mounted` drops remain the last
+    /// strong references and the disposal under test actually runs.
+    pub(crate) static TEST_SPINES: std::sync::Mutex<Option<std::sync::Weak<SpineMount>>> =
+        std::sync::Mutex::new(None);
+}
 /// The config-driven composer: the boot seam implemented over a
 /// [`harnless_config::Composer`].
 ///
@@ -420,6 +525,16 @@ pub struct ConfigComposer {
     /// Warnings from the most recent composition, so the binary reports them
     /// once instead of threading them through every call.
     last_warnings: parking_lot::Mutex<Vec<Warning>>,
+    /// The most recent composition's full document, the profile name it was
+    /// composed for, and a weak handle to its live spine, so `mount` — the
+    /// boot half of the seam — mounts the *rows* the dump printed, reuses a
+    /// live composition instead of re-mounting one, and never owns a spine
+    /// the caller has already dropped. `compose` writes it; `mount` reads
+    /// and upgrades it under `mount_lock`.
+    last_config: parking_lot::Mutex<Option<Entry>>,
+    /// Serializes the cold-mount read-upgrade-mount-write sequence so two
+    /// racing `mount` calls cannot both mount a spine onto one service map.
+    mount_lock: parking_lot::Mutex<()>,
 }
 
 impl ConfigComposer {
@@ -470,6 +585,8 @@ impl ConfigComposer {
             plugins: default_plugins(),
             specs: PluginSpecs::built_in(),
             last_warnings: parking_lot::Mutex::new(last_warnings),
+            last_config: parking_lot::Mutex::new(None),
+            mount_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -528,8 +645,20 @@ impl ConfigComposer {
 
     /// Compose the full configuration document, with warnings and trace.
     pub fn compose_full(&self, name: &str, overlays: &[Layer]) -> Result<Composition, CliError> {
+        // Under the mount lock: replacing the entry must never interleave
+        // with a cold mount, or a spine mounted for the old document gets
+        // published into the new one's entry.
+        let _mount_guard = self.mount_lock.lock();
         let out = self.composer.compose(name, overlays).map_err(cli_error)?;
         *self.last_warnings.lock() = out.warnings.clone();
+        // A new composition replaces the old entry. The old entry's weak
+        // spine dies with the last live `Mounted` that holds it; a later
+        // `mount` of the new document composes a fresh spine.
+        *self.last_config.lock() = Some(Entry {
+            name: out.doc.name.clone(),
+            doc: out.doc.clone(),
+            spine: None,
+        });
         Ok(out)
     }
 
@@ -664,7 +793,13 @@ impl ConfigComposer {
         let ctx = Context::root();
         let mut guard = harnless_config::MountGuard::new();
         let mut spine: Option<Arc<Registry>> = None;
+        let mut spine_unwind: Option<SpineUnwind> = None;
         let mut model: Option<ModelHandle> = None;
+        let mut spine_tools: Option<Arc<harnless_agent::tools::ToolRegistry>> = None;
+        // The wiring is a property of the plan, computed once — the same
+        // projection `plan()` publishes, so the mounted loop and the dumped
+        // plan cannot disagree about whether tools were declared.
+        let wiring = self.tools_wiring(&self.plan(doc)?)?;
         for row in &doc.rows {
             // A field-wise patch's document rows are plan content, not
             // services — but they are validated here exactly as `plan`
@@ -682,26 +817,33 @@ impl ConfigComposer {
             }
             match self.specs.seam(&row.plugin) {
                 Seam::Spine => {
+                    // The CLI's boot owns the loop composition: the spine
+                    // mounts wired per the plan's tool declarations, so a
+                    // profile that declared tools gets the registry-backed
+                    // loop as its `AgentLoop` service.
                     let registry = Arc::new(Registry::new());
-                    let fiber = match registry.mount(&ctx, Arc::new(Spine::new(SessionId(1)))) {
-                        Ok(fiber) => fiber,
-                        Err(e) => {
-                            guard.dispose();
-                            return Err(CliError::new(
-                                "mount-failed",
-                                format!("{}: {}", e.code, e.message),
-                            ));
-                        }
-                    };
+                    let (tools, fiber) =
+                        match crate::boot::mount_spine(&ctx, &registry, wiring.clone()) {
+                            Ok(mounted) => mounted,
+                            Err(err) => {
+                                guard.dispose();
+                                return Err(err);
+                            }
+                        };
                     // The spine's fiber needs an explicit unwind: dropping
                     // the registry does not dispose mounted fibers, so a
                     // later row failure must unmount it or the spine's
-                    // services stay live on a context nobody owns.
-                    guard.push(Box::new(SpineUnwind {
+                    // services stay live on a context nobody owns. The
+                    // unwind handle is held aside and pushed *after* the
+                    // row loop, so the guard's teardown order stays
+                    // reverse-mount: the spine's fiber unwinds last, after
+                    // every row resource it hosts has been disposed.
+                    spine_unwind = Some(SpineUnwind {
                         registry: Arc::clone(&registry),
                         fiber: Arc::clone(&fiber),
-                    }));
+                    });
                     spine = Some(Arc::clone(&registry));
+                    spine_tools = tools;
                 }
                 Seam::Model | Seam::Tool | Seam::Unknown => {
                     match harnless_config::mount(&one_row(doc, row), &self.plugins) {
@@ -723,12 +865,86 @@ impl ConfigComposer {
                 }
             }
         }
+        // The spine's unwind handle joins the guard last, so reverse-order
+        // teardown disposes every row resource before the spine's fiber
+        // unwinds (the documented reverse-mount-order rule). The push is
+        // deliberately post-loop: the in-loop error paths already `dispose`
+        // the guard, so `MountGuard::push`'s disposed-guard branch stays
+        // belt-and-braces here rather than a live path.
+        if let Some(unwind) = spine_unwind {
+            guard.push(Box::new(unwind));
+        }
         let registry = spine.unwrap_or_default();
+        // A plan that declared tools and a mount that wired none is a named
+        // failure, never an absent Option: `Mounted.tools == None` is the
+        // runner's signal to project no schemas, which must mean "no tools
+        // declared", not "the spine row was missing".
+        if !matches!(wiring, crate::boot::ToolsWiring::None) && spine_tools.is_none() {
+            guard.dispose();
+            return Err(CliError::new(
+                "mount-failed",
+                "the plan declared tools but no spine row mounted a tool pipeline",
+            ));
+        }
         Ok(CompositionMount {
             ctx,
             model,
+            tools: spine_tools,
             _registry: registry,
+            // The caller owns the guard: dropping it (or `dispose`) unwinds
+            // the row resources. A composition that never hands the guard
+            // to a live owner disposes here, not never.
             _guard: guard,
+        })
+    }
+
+    /// Mount a composition and capture its spine as a reusable handle.
+    ///
+    /// The returned `SpineMount` owns the disposal chain: dropping the last
+    /// handle unwinds the row resources and the spine's fiber. A `mount`
+    /// through the seam reuses the live handle stored on the entry rather
+    /// than mounting a second spine.
+    pub(crate) fn mount_spine_for(
+        &self,
+        doc: &ConfigDoc,
+        wiring: ToolsWiring,
+    ) -> Result<SpineMount, CliError> {
+        let CompositionMount {
+            ctx,
+            model,
+            tools,
+            _registry,
+            _guard,
+        } = self.mount_config(doc)?;
+        // The spine is the only plugin this composition mounts through this
+        // registry — model/tool rows mount through their own guards, never
+        // here — so the registry's last fiber *is* the spine's. No spine
+        // fiber means no spine row mounted, which the seam cannot boot.
+        let fiber = match _registry.fibers().into_iter().last() {
+            Some(fiber) => fiber,
+            None => {
+                // The composition failed after its rows mounted: the guard
+                // is a bound local here, and dropping it without `dispose`
+                // would leave the mounted rows' resources — and an Active
+                // spine fiber on an orphan context — alive forever. A failed
+                // boot unwinds, never leaks.
+                let mut guard = _guard;
+                guard.dispose();
+                return Err(CliError::new(
+                    "mount-failed",
+                    "composition mounted no spine fiber",
+                ));
+            }
+        };
+        Ok(SpineMount {
+            ctx,
+            registry: _registry,
+            fiber,
+            model,
+            tools,
+            wiring,
+            ids: crate::boot::Ids::new(),
+            guard: Arc::new(std::sync::Mutex::new(_guard)),
         })
     }
 }
@@ -792,32 +1008,128 @@ impl BootComposer for ConfigComposer {
         doc.dump()
     }
 
+    fn tools_wiring(&self, doc: &ProfileDoc) -> Result<ToolsWiring, CliError> {
+        if doc.tools.is_empty() {
+            Ok(ToolsWiring::None)
+        } else {
+            Ok(ToolsWiring::AutoAllow {
+                declared: doc.tools.clone(),
+            })
+        }
+    }
+
     fn mount(&self, doc: &ProfileDoc) -> Result<Mounted, CliError> {
-        // The mount plan is the projection of a composed configuration, so
-        // this is mounting what the dump printed. The spine mounts in its own
-        // fiber, and the composed model handle rides along. A failure after
-        // the spine mounted must unwind the fiber — a failed boot leaves no
-        // half-mounted service holding a context.
-        let ctx = Context::root();
-        let registry = Registry::new();
-        let spine_fiber = registry
-            .mount(&ctx, Arc::new(Spine::new(SessionId(1))))
-            .map_err(|e| CliError::new("mount-failed", format!("{}: {}", e.code, e.message)))?;
-        let model = match build_adapter(doc) {
-            Ok(model) => model,
-            Err(err) => {
-                registry.unmount(&spine_fiber);
-                return Err(err);
+        // The plan's wiring is computed from the plan alone — the same
+        // projection `plan()` publishes — before any lock is taken.
+        let wiring = self.tools_wiring(doc)?;
+        // The boot half mounts the rows the dump printed *when the stored
+        // composition is the one this plan projects* — identity is checked,
+        // not assumed. The read-mount-write sequence runs under the mount
+        // lock: two racing cold mounts cannot each mount a spine onto the
+        // shared service map, and the cache's weak spine can never be
+        // observed half-published. `parking_lot::Mutex` is not reentrant,
+        // so the cold path composes through the *inner* fold directly —
+        // never through `compose_full`, which takes the same lock.
+        let _mount_guard = self.mount_lock.lock();
+        let stored = self.last_config.lock().clone();
+        let entry = match stored {
+            Some(entry) if entry.name == doc.name => entry,
+            // A stale or foreign entry re-composes the plan's own name from
+            // the stored layers — without the overlays the lost composition
+            // applied. The divergence is loud, never silent: the wiring
+            // check below refuses a tool-declaring plan over a tool-less
+            // composition, and the model check swaps in the plan's own
+            // adapter whenever the rows' differs. A composition that fails
+            // here fails the mount — a profile that cannot compose cannot
+            // boot either.
+            _ => {
+                let out = self.composer.compose(&doc.name, &[]).map_err(cli_error)?;
+                *self.last_warnings.lock() = out.warnings.clone();
+                Entry {
+                    name: out.doc.name.clone(),
+                    doc: out.doc.clone(),
+                    spine: None,
+                }
             }
         };
+        let spine = match entry.spine.as_ref().and_then(std::sync::Weak::upgrade) {
+            Some(spine) => {
+                // A warm reuse must implement the *shape* of the plan it is
+                // handed: the spine's loop is either tool-less or
+                // registry-backed, and that axis is frozen at mount time.
+                // The registry-backed loop decides allow/deny by name
+                // membership in what it registered, so a plan whose
+                // `declared` list differs only in content or order is still
+                // served by the live spine — only the None/AutoAllow
+                // mismatch boots the wrong loop shape, and it fails loudly.
+                let same_shape = matches!(
+                    (&spine.wiring, &wiring),
+                    (ToolsWiring::None, ToolsWiring::None)
+                        | (ToolsWiring::AutoAllow { .. }, ToolsWiring::AutoAllow { .. })
+                );
+                if !same_shape {
+                    return Err(CliError::new(
+                        "mount-failed",
+                        "a spine with different tool wiring is already live for this profile; \
+                         drop its last Mounted before mounting the other plan",
+                    ));
+                }
+                spine
+            }
+            None => {
+                let spine = Arc::new(self.mount_spine_for(&entry.doc, wiring)?);
+                // The composition's spine is now live; the entry keeps it
+                // weakly, so every later `mount` of the same plan reuses it
+                // while it is alive, and the last `Mounted` to drop disposes
+                // it for real.
+                *self.last_config.lock() = Some(Entry {
+                    name: entry.name.clone(),
+                    doc: entry.doc.clone(),
+                    spine: Some(Arc::downgrade(&spine)),
+                });
+                spine
+            }
+        };
+        #[cfg(test)]
+        crate::config_boot::TEST_SPINES
+            .with(|s| *s.lock().expect("probe lock") = Some(std::sync::Arc::downgrade(&spine)));
+        // A plan whose model differs from the rows' model (a field-wise
+        // patch swapped it) mounts the plan's model, never the rows'.
+        let model = if model_matches(doc, spine.model.as_ref()) {
+            spine.model.clone()
+        } else {
+            build_adapter(doc)?
+        };
+        let ids = spine.ids.clone();
         Ok(Mounted {
-            ctx,
-            _registry: registry,
+            ctx: spine.ctx.clone(),
+            _registry: Arc::clone(&spine.registry),
+            tools: spine.tools.clone(),
+            _spine: Some(spine as Arc<dyn std::any::Any + Send + Sync>),
             model,
+            ids,
         })
     }
 }
 
+/// Whether a composed model handle is the one a plan names.
+///
+/// The identity that matters at this boundary is the plan's `ModelSpec` in
+/// full: a plan that names no provider must not mount a row-composed
+/// adapter; a plan whose replay provider *or golden script* differs from the
+/// rows' must mount its own. A patch that swaps only `model.script` swaps
+/// the mounted adapter, never silently keeps the rows' golden.
+fn model_matches(doc: &ProfileDoc, mounted: Option<&ModelHandle>) -> bool {
+    match (&doc.model, mounted) {
+        (ModelSpec::None, None) => true,
+        // A plan with no `script:` names the built-in demo corpus, which an
+        // adapter built without a golden path reports as `""`.
+        (ModelSpec::Replay { provider, script }, Some(handle)) => {
+            handle.provider() == provider && handle.script_id() == script.as_deref().unwrap_or("")
+        }
+        _ => false,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,12 +1417,11 @@ mod tests {
     #[test]
     fn a_field_wise_overlay_projects_onto_the_plan() {
         let composer = composer();
-        let overlays =
-            parse_overlays(Some("system_prompt: be terse\ntools:\n- bash\n- read\n")).unwrap();
+        let overlays = parse_overlays(Some("system_prompt: be terse\ntools:\n- echo\n")).unwrap();
         let doc = composer.compose_config("default", &overlays).unwrap();
         let plan = composer.plan(&doc).expect("plan projects doc rows");
         assert_eq!(plan.system_prompt, "be terse");
-        assert_eq!(plan.tools, vec!["bash", "read"]);
+        assert_eq!(plan.tools, vec!["echo"]);
         // The doc rows never appear as seams and never mount.
         assert_eq!(plan.seams, SPINE_SEAMS);
         let mounted = composer
@@ -1150,5 +1461,184 @@ mod tests {
             .err()
             .expect("an unknown doc: row fails mount too");
         assert_eq!(mount_err.code, "unknown-plugin");
+    }
+
+    /// The seam's boot half over the *config* composer (the binary's
+    /// composition root, not the reference mount the seam tests drive):
+    /// mounting a composed plan reuses the composition's spine — one log,
+    /// one id allocator across handles — and disposal happens when the
+    /// last handle goes, not never.
+    #[test]
+    fn mounting_a_plan_reuses_the_composition_spine_and_disposes_last_handle() {
+        use crate::boot::BootComposer as _;
+        let composer = composer();
+        let plan = composer.compose("default", None).unwrap();
+        let first = composer.mount(&plan).expect("config mount boots");
+        let second = composer.mount(&plan).expect("second mount reuses");
+        // The probe is a *weak* handle on the spine: it observes the spine's
+        // disposal without preventing it. The raw inner handles — the fiber
+        // Arc and the guard Arc — outlive the spine struct and carry the
+        // observable state the post-drop assertions read.
+        let spine_probe = TEST_SPINES
+            .with(|s| s.lock().expect("probe lock").clone())
+            .expect("mount recorded its spine");
+        let live = spine_probe
+            .upgrade()
+            .expect("spine alive while handles serve");
+        let fiber_probe = Arc::clone(&live.fiber);
+        let guard_probe = Arc::clone(&live.guard);
+        // `live` is a temporary strong handle: release it before the
+        // disposal assertions so `drop(first)` really is the last one.
+        drop(live);
+        let log1 = first
+            .ctx
+            .get::<harnless_agent::session::SessionLog>()
+            .expect("spine provides the log");
+        let id_a = first.ids.message();
+        let id_b = second.ids.message();
+        assert_ne!(id_a, id_b, "one allocator, monotonic ids");
+        assert_eq!(
+            fiber_probe.state(),
+            harnless_runtime::fiber::FiberState::Active,
+            "the live spine's fiber is Active"
+        );
+        assert!(
+            !guard_probe.lock().expect("guard lock").is_empty(),
+            "the guard holds the composition's row resources"
+        );
+        drop(second);
+        assert!(
+            first.ctx.get::<harnless_agent::AgentLoop>().is_some(),
+            "dropping a sibling handle never disposes the live spine"
+        );
+        assert_eq!(log1.snapshot().records.len(), 0, "untouched log");
+        // The last strong handle dropped: observe disposal directly — the
+        // fiber reached Disposed (the spine's unwind ran) and the guard's
+        // row resources are gone (guard.dispose ran).
+        drop(first);
+        assert_eq!(
+            fiber_probe.state(),
+            harnless_runtime::fiber::FiberState::Disposed,
+            "the last handle's drop ran SpineMount::dispose"
+        );
+        assert!(
+            guard_probe.lock().expect("guard lock").is_empty(),
+            "the guard's row resources were disposed"
+        );
+        // A fresh mount composes a fresh spine.
+        let third = composer.mount(&plan).expect("remount after disposal");
+        assert!(third.ctx.get::<harnless_agent::AgentLoop>().is_some());
+        assert_eq!(
+            third
+                .ctx
+                .get::<harnless_agent::session::SessionLog>()
+                .expect("fresh log")
+                .snapshot()
+                .records
+                .len(),
+            0
+        );
+    }
+
+    /// A warm spine reuse must implement the plan's loop *shape*: a
+    /// tool-declaring plan over a live tool-less spine fails loudly, and a
+    /// plan that only reorders/extends the tool names is still served by
+    /// the live registry-backed spine (name-membership allow, not a
+    /// frozen list).
+    #[test]
+    fn warm_spine_reuse_rejects_only_the_wiring_shape_mismatch() {
+        use crate::boot::BootComposer as _;
+        let composer = composer();
+        let plain = composer.compose("default", None).unwrap();
+        let tool_plan = composer
+            .compose("default", Some("tools: [echo]"))
+            .expect("tools patch composes");
+        assert_ne!(plain.tools, tool_plan.tools, "the patch declared tools");
+        // A tool-less spine is live for "default".
+        let live = composer.mount(&plain).expect("tool-less mount boots");
+        // The same shape (tool-less) reuses it.
+        let again = composer.mount(&plain).expect("same-shape reuse");
+        drop(again);
+        // A tool-declaring plan over the tool-less spine: wrong loop shape,
+        // named failure — never a silently tool-less loop for a plan that
+        let err = match composer.mount(&tool_plan) {
+            Ok(_) => panic!("shape mismatch must fail the mount"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, "mount-failed");
+        // The live handle is untouched by the refused mount.
+        assert!(live.ctx.get::<harnless_agent::AgentLoop>().is_some());
+    }
+
+    /// The positive half of the shape rule: over a live registry-backed
+    /// spine, a plan whose declared tool list differs only in content or
+    /// order is still served (name-membership allow), so the mount reuses
+    /// the spine instead of failing.
+    #[test]
+    fn warm_spine_reuse_accepts_a_differing_tool_list() {
+        use crate::boot::BootComposer as _;
+        let composer = composer();
+        let echo_plan = composer
+            .compose("default", Some("tools: [echo]"))
+            .expect("tools patch composes");
+        // Same *set*, different declared *list*: the built-in registry only
+        // has `echo`, so the second plan re-states the name in a shape the
+        // frozen-list comparison would have rejected.
+        let reordered_plan = composer
+            .compose("default", Some("tools: [echo, echo]"))
+            .expect("reordered tools patch composes");
+        assert_ne!(
+            echo_plan.tools, reordered_plan.tools,
+            "the plans' declared lists differ"
+        );
+        // A registry-backed spine is live for "default" with `echo`.
+        let live = composer.mount(&echo_plan).expect("tool mount boots");
+        assert!(live.tools.is_some(), "the spine wired a tool registry");
+        // The re-stated plan over the same-shape spine: served by name
+        // membership, so the mount reuses the live spine.
+        let restated = composer
+            .mount(&reordered_plan)
+            .expect("same-shape reuse serves a differing tool list");
+        assert!(Arc::ptr_eq(
+            live.tools.as_ref().expect("live registry"),
+            restated.tools.as_ref().expect("reused registry")
+        ));
+    }
+
+    /// `model_matches`' golden clause: a plan that keeps the provider but
+    /// swaps `model.script` must NOT match the rows' mounted adapter —
+    /// the mount swaps in the plan's own golden, never silently keeps the
+    /// rows'. A plan naming no script matches the built-in demo corpus
+    /// (script_id ""), and a different provider never matches.
+    #[test]
+    fn model_matches_compares_provider_and_golden() {
+        let rows = build_adapter(&ProfileDoc::default_profile())
+            .unwrap()
+            .expect("default composes an adapter");
+        // Same provider, no script named: matches the demo corpus.
+        assert!(model_matches(&ProfileDoc::default_profile(), Some(&rows)));
+        // Same provider, a golden swapped in: must not match.
+        let mut swapped = ProfileDoc::default_profile();
+        swapped.model = ModelSpec::Replay {
+            provider: "openai".into(),
+            script: Some("/golden/other.json".into()),
+        };
+        assert!(
+            !model_matches(&swapped, Some(&rows)),
+            "a script-swapped plan never matches the rows' adapter"
+        );
+        // A different provider never matches, script or not.
+        let mut other_provider = ProfileDoc::default_profile();
+        other_provider.model = ModelSpec::Replay {
+            provider: "otherprov".into(),
+            script: None,
+        };
+        assert!(!model_matches(&other_provider, Some(&rows)));
+        // No plan model and no mounted adapter match; a plan model over no
+        // adapter never does.
+        let mut none = ProfileDoc::default_profile();
+        none.model = ModelSpec::None;
+        assert!(model_matches(&none, None));
+        assert!(!model_matches(&ProfileDoc::default_profile(), None));
     }
 }

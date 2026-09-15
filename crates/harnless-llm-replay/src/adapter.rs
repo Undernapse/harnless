@@ -41,16 +41,30 @@ const REPLAY_OWNER_KEY: &str = "__harnless_provider";
 pub struct ReplayAdapter {
     provider: String,
     script: Script,
+    /// The golden-file path this script was loaded from, `""` for a
+    /// built-in/inline script. Reported through `ModelAdapter::script_id` so
+    /// the CLI's boot can check the mounted adapter against the plan.
+    script_id: String,
     calls: AtomicUsize,
 }
 
 impl ReplayAdapter {
     /// Build an adapter replaying `script` under provider identity
-    /// `provider`.
+    /// `provider`, with no golden-file identity.
     pub fn new(provider: impl Into<String>, script: Script) -> Self {
+        Self::with_script_id(provider, script, "")
+    }
+
+    /// Build an adapter whose script came from the file `script_id` names.
+    pub fn with_script_id(
+        provider: impl Into<String>,
+        script: Script,
+        script_id: impl Into<String>,
+    ) -> Self {
         Self {
             provider: provider.into(),
             script,
+            script_id: script_id.into(),
             calls: AtomicUsize::new(0),
         }
     }
@@ -141,6 +155,10 @@ fn has_content(frames: &[StreamFrame]) -> bool {
 impl ModelAdapter for ReplayAdapter {
     fn provider(&self) -> &str {
         &self.provider
+    }
+
+    fn script_id(&self) -> &str {
+        &self.script_id
     }
 
     fn owns(&self, replay_state: &ReplayState) -> bool {
