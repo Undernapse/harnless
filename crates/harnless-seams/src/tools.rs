@@ -146,6 +146,25 @@ pub trait Tools: Send + Sync + 'static {
 
     /// Enumerate tools by name.
     fn names(&self) -> Vec<String>;
+
+    /// The model-facing schemas of every registered tool, via the sanctioned
+    /// [`ToolDefinition::to_schema`] projection.
+    ///
+    /// This is the default projection of [`Self::names`] + [`Self::get`]:
+    /// names → definitions → [`ToolDefinition::to_schema`]. The allowlist in
+    /// `to_schema` is the guarantee that internal metadata (`serialized`,
+    /// anything added later) cannot reach the wire through this route — a
+    /// caller that needs what the provider sees calls this, never a hand-rolled
+    /// projection over `get`.
+    ///
+    /// [`ToolDefinition::to_schema`]: ToolDefinition::to_schema
+    fn schemas(&self) -> Vec<crate::llm::ToolSchema> {
+        self.names()
+            .iter()
+            .filter_map(|name| self.get(name))
+            .map(|def| def.to_schema())
+            .collect()
+    }
 }
 
 /// The policy home for the guarded pipeline: default confinement mode and

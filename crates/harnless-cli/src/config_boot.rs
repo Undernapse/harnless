@@ -30,7 +30,6 @@
 
 use std::sync::Arc;
 
-use harnless_agent::spine::Spine;
 use harnless_config::compose::{Composer, Composition, ProfileStore, Warning};
 use harnless_config::doc::{BundleDoc, ConfigDoc, Layer, ProfileSpec, Row};
 use harnless_config::error::ConfigError;
@@ -38,9 +37,8 @@ use harnless_config::subst::Subst;
 use harnless_config::{MountedResource, PluginRegistry};
 use harnless_runtime::context::Context;
 use harnless_runtime::plugin::Registry;
-use harnless_seams::SessionId;
 
-use crate::boot::{BootComposer, Mounted};
+use crate::boot::{BootComposer, Mounted, ToolsWiring};
 use crate::model::{build_adapter, ModelHandle};
 use crate::profile::{ModelSpec, ProfileDoc};
 use crate::CliError;
@@ -145,6 +143,8 @@ pub struct CompositionMount {
     pub ctx: Context,
     /// The model composed by the model row, if any.
     pub model: Option<ModelHandle>,
+    /// The mounted tool registry, when the profile's plan declared tools.
+    pub tools: Option<Arc<harnless_agent::tools::ToolRegistry>>,
     /// The spine's registry — kept alive so its services stay mounted.
     _registry: Arc<Registry>,
     /// The mount guard that disposes every row resource.
@@ -420,6 +420,12 @@ pub struct ConfigComposer {
     /// Warnings from the most recent composition, so the binary reports them
     /// once instead of threading them through every call.
     last_warnings: parking_lot::Mutex<Vec<Warning>>,
+    /// The most recent composition's full document, so `mount` — the boot
+    /// half of the seam — mounts the *rows* the dump printed rather than a
+    /// spine-only re-composition of the plan. `compose` writes it; `mount`
+    /// reads it; a `mount` without a preceding `compose` composes the named
+    /// profile first, so the two halves can never disagree.
+    last_config: parking_lot::Mutex<Option<ConfigDoc>>,
 }
 
 impl ConfigComposer {
@@ -470,6 +476,7 @@ impl ConfigComposer {
             plugins: default_plugins(),
             specs: PluginSpecs::built_in(),
             last_warnings: parking_lot::Mutex::new(last_warnings),
+            last_config: parking_lot::Mutex::new(None),
         }
     }
 
@@ -530,6 +537,7 @@ impl ConfigComposer {
     pub fn compose_full(&self, name: &str, overlays: &[Layer]) -> Result<Composition, CliError> {
         let out = self.composer.compose(name, overlays).map_err(cli_error)?;
         *self.last_warnings.lock() = out.warnings.clone();
+        *self.last_config.lock() = Some(out.doc.clone());
         Ok(out)
     }
 
@@ -641,14 +649,16 @@ impl ConfigComposer {
         &self.plugins
     }
 
-    /// The seam table this composer projects with.
-    pub fn specs(&self) -> &PluginSpecs {
-        &self.specs
-    }
-
-    /// The underlying config composer, for embedders that want the raw fold.
-    pub fn config(&self) -> &Composer {
-        &self.composer
+    /// Override the plugin registry with a prepared one.
+    ///
+    /// The seam-test harness uses this to inject a scripted model plugin —
+    /// a plugin name whose factory serves a caller-supplied replay script —
+    /// so a test drives multi-turn corpora through the real composition
+    /// without a file path or network. The factory closure is the test's own
+    /// `Arc`; the registry only stores it.
+    pub fn with_registry(mut self, plugins: PluginRegistry) -> Self {
+        self.plugins = plugins;
+        self
     }
 
     /// Mount a composed configuration: every row through the plugin registry,
@@ -665,6 +675,7 @@ impl ConfigComposer {
         let mut guard = harnless_config::MountGuard::new();
         let mut spine: Option<Arc<Registry>> = None;
         let mut model: Option<ModelHandle> = None;
+        let mut spine_tools: Option<Arc<harnless_agent::tools::ToolRegistry>> = None;
         for row in &doc.rows {
             // A field-wise patch's document rows are plan content, not
             // services — but they are validated here exactly as `plan`
@@ -682,15 +693,23 @@ impl ConfigComposer {
             }
             match self.specs.seam(&row.plugin) {
                 Seam::Spine => {
+                    // The CLI's boot owns the loop composition: the spine
+                    // mounts wired per the plan's tool declarations, so a
+                    // profile that declared tools gets the registry-backed
+                    // loop as its `AgentLoop` service.
                     let registry = Arc::new(Registry::new());
-                    let fiber = match registry.mount(&ctx, Arc::new(Spine::new(SessionId(1)))) {
-                        Ok(fiber) => fiber,
-                        Err(e) => {
+                    let wiring = match self.plan(doc).and_then(|plan| self.tools_wiring(&plan)) {
+                        Ok(wiring) => wiring,
+                        Err(err) => {
                             guard.dispose();
-                            return Err(CliError::new(
-                                "mount-failed",
-                                format!("{}: {}", e.code, e.message),
-                            ));
+                            return Err(err);
+                        }
+                    };
+                    let (tools, fiber) = match crate::boot::mount_spine(&ctx, &registry, wiring) {
+                        Ok(mounted) => mounted,
+                        Err(err) => {
+                            guard.dispose();
+                            return Err(err);
                         }
                     };
                     // The spine's fiber needs an explicit unwind: dropping
@@ -702,6 +721,7 @@ impl ConfigComposer {
                         fiber: Arc::clone(&fiber),
                     }));
                     spine = Some(Arc::clone(&registry));
+                    spine_tools = tools;
                 }
                 Seam::Model | Seam::Tool | Seam::Unknown => {
                     match harnless_config::mount(&one_row(doc, row), &self.plugins) {
@@ -727,6 +747,7 @@ impl ConfigComposer {
         Ok(CompositionMount {
             ctx,
             model,
+            tools: spine_tools,
             _registry: registry,
             _guard: guard,
         })
@@ -792,29 +813,86 @@ impl BootComposer for ConfigComposer {
         doc.dump()
     }
 
+    fn tools_wiring(&self, doc: &ProfileDoc) -> Result<ToolsWiring, CliError> {
+        if doc.tools.is_empty() {
+            Ok(ToolsWiring::None)
+        } else {
+            Ok(ToolsWiring::AutoAllow {
+                declared: doc.tools.clone(),
+            })
+        }
+    }
+
     fn mount(&self, doc: &ProfileDoc) -> Result<Mounted, CliError> {
-        // The mount plan is the projection of a composed configuration, so
-        // this is mounting what the dump printed. The spine mounts in its own
-        // fiber, and the composed model handle rides along. A failure after
-        // the spine mounted must unwind the fiber — a failed boot leaves no
-        // half-mounted service holding a context.
+        // The boot half mounts the *rows* the dump printed — the same
+        // `mount_config` the composed-configuration path uses — so a profile
+        // that declared tools gets the registry-backed loop, and a patch that
+        // swapped the model row swaps the mounted adapter. The plan document
+        // alone cannot express rows, so `mount` resolves the full document
+        // from the most recent composition (or composes the named profile
+        // when called standalone) and falls back to the minimal reference
+        // mount when no rows can be composed.
+        let config_doc = self
+            .last_config
+            .lock()
+            .clone()
+            .or_else(|| self.compose_config(&doc.name, &[]).ok());
+        if let Some(config_doc) = config_doc {
+            let CompositionMount {
+                ctx,
+                model,
+                tools,
+                _registry,
+                _guard,
+            } = self.mount_config(&config_doc)?;
+            // A plan whose model differs from the rows' model (a field-wise
+            // patch swapped it) mounts the plan's model, never the rows'.
+            let model = if model_matches(doc, model.as_ref()) {
+                model
+            } else {
+                build_adapter(doc)?
+            };
+            // The seam's `Mounted` owns the registry as an `Arc`; the config
+            // mount's disposal chain (row resources + the spine's fiber
+            // unwind) must stay alive exactly as long as the composition —
+            // dropping it would dispose live row resources out from under the
+            // mounted context. `ManuallyDrop` is the honest owner: it never
+            // runs `Drop`, and the chain unwinds with the process, matching
+            // the reference mount's leak-tolerant shape.
+            let chain = std::mem::ManuallyDrop::new((_guard, _registry));
+            return Ok(Mounted {
+                ctx,
+                _registry: Arc::clone(&chain.1),
+                model,
+                ids: crate::boot::Ids::new(),
+                tools,
+            });
+        }
         let ctx = Context::root();
-        let registry = Registry::new();
-        let spine_fiber = registry
-            .mount(&ctx, Arc::new(Spine::new(SessionId(1))))
-            .map_err(|e| CliError::new("mount-failed", format!("{}: {}", e.code, e.message)))?;
-        let model = match build_adapter(doc) {
-            Ok(model) => model,
-            Err(err) => {
-                registry.unmount(&spine_fiber);
-                return Err(err);
-            }
-        };
+        let registry = Arc::new(Registry::new());
+        let wiring = self.tools_wiring(doc)?;
+        let (tools, _fiber) = crate::boot::mount_spine(&ctx, &registry, wiring)?;
+        let model = build_adapter(doc)?;
         Ok(Mounted {
             ctx,
             _registry: registry,
             model,
+            ids: crate::boot::Ids::new(),
+            tools,
         })
+    }
+}
+
+/// Whether a composed model handle is the one a plan names.
+///
+/// The identity that matters at this boundary is the plan's `ModelSpec`: a
+/// plan that names no provider must not mount a row-composed adapter, and a
+/// plan whose replay provider differs from the rows' must mount its own.
+fn model_matches(doc: &ProfileDoc, mounted: Option<&ModelHandle>) -> bool {
+    match (&doc.model, mounted) {
+        (ModelSpec::None, None) => true,
+        (ModelSpec::Replay { provider, .. }, Some(handle)) => handle.provider() == provider,
+        _ => false,
     }
 }
 

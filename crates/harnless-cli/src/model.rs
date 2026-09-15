@@ -30,13 +30,23 @@ pub fn build_adapter(doc: &ProfileDoc) -> Result<Option<ModelHandle>, CliError> 
                     let text = std::fs::read_to_string(path).map_err(|e| {
                         CliError::new("bad-script", format!("cannot read script {path}: {e}"))
                     })?;
-                    Script::from_json_str(&text).map_err(|e| CliError::new("bad-script", e))?
+                    load_script_text(&text)?
                 }
                 None => Script::one(demo_recording()),
             };
             Ok(Some(Arc::new(ReplayAdapter::new(provider.clone(), script))))
         }
     }
+}
+
+/// Load script text: a single recording document, or a corpus array of
+/// them in call order.
+///
+/// A golden file for one turn is a recording object; a multi-turn script is
+/// the JSON array of those objects. Both shapes load here, so a profile's
+/// `script:` path names either.
+fn load_script_text(text: &str) -> Result<Script, CliError> {
+    Script::from_json_file_text(text).map_err(|e| CliError::new("bad-script", e))
 }
 
 /// A minimal built-in recording: one text block answering the prompt.

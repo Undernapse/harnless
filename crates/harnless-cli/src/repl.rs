@@ -4,7 +4,8 @@
 //! stdin line by line, driving one agent turn per line against the same
 //! live composition — so the session log accumulates across turns exactly
 //! as the headless runner builds it for a single turn. EOF or `exit` ends
-//! the session.
+//! the session cleanly: neither opens a turn, and the log ends at the last
+//! completed turn's close. Blank lines are skipped without a turn.
 //!
 //! The loop is deliberately dumb: no line editing, no history. The value it
 //! pins is the composition shape — mount once, drive many turns through the

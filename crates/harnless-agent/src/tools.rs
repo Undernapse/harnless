@@ -611,6 +611,21 @@ impl harnless_seams::Tools for ToolRegistry {
     fn names(&self) -> Vec<String> {
         self.tools.read().keys().cloned().collect()
     }
+
+    /// The model-facing schemas of every registered tool.
+    ///
+    /// The seam trait's default (`names` → `get` → `to_schema`) is the whole
+    /// implementation; this override exists so the projection is a single
+    /// locked pass over the tool map rather than one lock acquisition per
+    /// name. The allowlist is `to_schema`'s, unchanged — this route cannot
+    /// widen what reaches an adapter.
+    fn schemas(&self) -> Vec<harnless_seams::ToolSchema> {
+        self.tools
+            .read()
+            .values()
+            .map(|(def, _)| def.to_schema())
+            .collect()
+    }
 }
 
 #[cfg(test)]

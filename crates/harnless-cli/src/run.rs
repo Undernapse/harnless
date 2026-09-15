@@ -4,15 +4,26 @@
 //! prompt to the session log, drive one [`AgentLoop`] turn through the
 //! composed model, and print the assistant message. A profile with no model
 //! provider is a named `no-model-provider` failure, never a silent empty
-//! turn.
+//! turn. A turn that ends in a provider failure is a named `turn-failed`
+//! error carrying the structured cause — the session log keeps the failed
+//! turn's bracket and prompt, and a later turn on the same composition
+//! still runs.
+//!
+//! A model-requested tool call executes through the mounted pipeline and
+//! its frozen result lands in the log; the CLI renders tool blocks as
+//! plain text (`render_block`), never as structured output — the tool
+//! round-trip is a log fact, not a terminal one.
+
+use std::sync::Arc;
 
 use futures::stream::Stream as _;
-use harnless_agent::events::{ContentBlock, MessageRecord, SessionEvent, TurnEndReason};
+use harnless_agent::events::{
+    ContentBlock, MessageRecord, SessionEvent, ToolCallRecord, TurnEndReason,
+};
 use harnless_agent::loop_::{AgentLoop, Driver, DriverOutcome};
 use harnless_agent::session::SessionLog;
 use harnless_seams::{
-    BlockAssembler, BlockKind, CallId, ErrorCode, Message, MessageId, ProviderFailure, Role,
-    StreamEvent,
+    BlockAssembler, BlockKind, CallId, ErrorCode, Message, ProviderFailure, Role, StreamEvent,
 };
 
 use crate::boot::{BootComposer, DefaultComposer, Mounted};
@@ -39,6 +50,19 @@ pub fn run_default(profile: &str, patch: Option<&str>, prompt: &str) -> Result<S
     run_once(&DefaultComposer, profile, patch, prompt)
 }
 
+/// The model-facing tool schemas for an adapter request.
+///
+/// The registry's schemas ride on every request the CLI drives — that is the
+/// route by which a declared tool reaches the adapter. A composition without
+/// tools requests with no schemas, which is today's wire shape.
+fn request_schemas(mounted: &Mounted) -> Vec<harnless_seams::ToolSchema> {
+    mounted
+        .tools
+        .as_ref()
+        .map(|tools| harnless_seams::Tools::schemas(tools.as_ref()))
+        .unwrap_or_default()
+}
+
 /// Drive one turn on a live composition and return the assistant text.
 ///
 /// The user prompt is logged first (it is model-visible), then the loop runs
@@ -63,7 +87,7 @@ pub fn drive_turn(mounted: &Mounted, prompt: &str) -> Result<String, CliError> {
         .get::<SessionLog>()
         .expect("spine provides the log");
     log.append(SessionEvent::UserMessage(MessageRecord {
-        id: MessageId(1),
+        id: mounted.ids.message(),
         blocks: vec![ContentBlock::Text {
             text: prompt.to_string(),
         }],
@@ -71,10 +95,16 @@ pub fn drive_turn(mounted: &Mounted, prompt: &str) -> Result<String, CliError> {
         model: None,
     }));
 
-    // The model-visible message list for this step: the logged surface.
-    let messages = model_messages(&log);
-
-    let turn = loop_.run_turn(make_driver(model, messages));
+    // One turn, possibly many adapter calls: the loop owns the log, so the
+    // driver re-reads the logged surface before every step and the loop
+    // commits each assistant message and tool round-trip itself. The CLI
+    // never re-implements the loop's commitment logic.
+    let turn = loop_.run_turn(make_driver(
+        model,
+        Arc::clone(&log),
+        mounted.ids.clone(),
+        request_schemas(mounted),
+    ));
     let text = final_assistant_text(&log);
     match turn.reason {
         TurnEndReason::Completed => Ok(text),
@@ -145,10 +175,19 @@ fn quote(s: &str) -> String {
 
 /// Build the loop driver: one adapter call whose stream folds into the
 /// assistant message the loop commits.
-fn make_driver(model: ModelHandle, messages: Vec<Message>) -> Driver {
-    Box::new(move || {
+fn make_driver(
+    model: ModelHandle,
+    log: Arc<SessionLog>,
+    ids: crate::boot::Ids,
+    schemas: Vec<harnless_seams::ToolSchema>,
+) -> Driver {
+    Box::new(move || loop {
+        // The model-visible list is re-read per step: the loop commits each
+        // assistant message and tool round-trip to the log as the turn
+        // proceeds, so the next adapter call sees the whole surface.
+        let messages = model_messages(&log);
         let mut stream: harnless_seams::BoxStream =
-            match model.stream(CallId(1), &messages, &[], None) {
+            match model.stream(ids.call(), &messages, &schemas, None) {
                 Ok(stream) => stream,
                 Err(err) => return stop_error(err.code, &err.message),
             };
@@ -174,20 +213,56 @@ fn make_driver(model: ModelHandle, messages: Vec<Message>) -> Driver {
         if let Some(f) = failure {
             return stop_error(f.code, &f.message);
         }
-        let blocks = assembler
-            .blocks()
-            .into_iter()
-            .map(|b| match b.kind {
-                BlockKind::Reasoning => ContentBlock::Reasoning { text: b.text },
-                _ => ContentBlock::Text { text: b.text },
-            })
-            .collect();
-        DriverOutcome::Message(MessageRecord {
-            id: MessageId(2),
+        let mut tool_call: Option<(CallId, String, String)> = None;
+        let mut blocks = Vec::new();
+        for b in assembler.blocks() {
+            match b.kind {
+                BlockKind::Reasoning => blocks.push(ContentBlock::Reasoning { text: b.text }),
+                BlockKind::ToolCall => {
+                    // The assembled tool-call block carries the provider's
+                    // raw-JSON envelope; the loop executes the call.
+                    let value: serde_json::Value = match serde_json::from_str(&b.text) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return stop_error(
+                                ErrorCode::StreamTerminated,
+                                &format!("malformed tool-call block: {e}"),
+                            )
+                        }
+                    };
+                    let name = value
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let arguments = value
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let call_id = value
+                        .get("id")
+                        .and_then(|v| v.as_u64())
+                        .map(CallId)
+                        .unwrap_or_else(|| ids.call());
+                    tool_call = Some((call_id, name, arguments));
+                }
+                _ => blocks.push(ContentBlock::Text { text: b.text }),
+            }
+        }
+        if let Some((call_id, tool, arguments)) = tool_call {
+            return DriverOutcome::ToolCall(ToolCallRecord {
+                call_id,
+                tool,
+                arguments,
+            });
+        }
+        return DriverOutcome::Message(MessageRecord {
+            id: ids.message(),
             blocks,
             provider: Some(model.provider().to_string()),
             model: Some("replay".into()),
-        })
+        });
     })
 }
 
