@@ -93,6 +93,11 @@ pub struct Mounted {
     pub ctx: Context,
     /// Keeps the plugin registry (and thus mounted fibers) alive.
     pub _registry: Arc<Registry>,
+    /// The composition's disposal owner. A config-boot mount hands the live
+    /// spine here, so dropping (or `shutdown`) the `Mounted` unwinds the row
+    /// resources and the spine's fiber; the reference mount's spine is owned
+    /// by its registry and needs no separate handle.
+    pub _spine: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// The composed model provider, if the profile names one.
     pub model: Option<ModelHandle>,
     /// The composition's id allocator: every `MessageId` and adapter-request
@@ -104,6 +109,16 @@ pub struct Mounted {
     /// projects its schemas onto every adapter request and its presence gates
     /// the tool-call driver shape.
     pub tools: Option<Arc<harnless_agent::tools::ToolRegistry>>,
+}
+
+impl Mounted {
+    /// Tear the composition down before this handle is dropped: dispose the
+    /// disposal owner (row resources and the spine's fiber unwind, in
+    /// reverse mount order). Idempotent; a composition whose spine is owned
+    /// by the plain registry has nothing extra to unwind here.
+    pub fn shutdown(&mut self) {
+        self._spine = None;
+    }
 }
 
 /// The per-composition id allocator.
@@ -196,6 +211,7 @@ impl BootComposer for DefaultComposer {
         Ok(Mounted {
             ctx,
             _registry: registry,
+            _spine: None,
             model,
             ids: Ids::new(),
             tools,
@@ -223,6 +239,15 @@ pub(crate) fn mount_spine(
     ),
     CliError,
 > {
+    // A spine owns the `AgentLoop` service key. Mounting a second spine over
+    // one context would leave two fibers' disposers racing over that key —
+    // unsupported, and loud rather than racy.
+    if ctx.has::<harnless_agent::loop_::AgentLoop>() {
+        return Err(CliError::new(
+            "mount-failed",
+            "a spine is already mounted on this context",
+        ));
+    }
     // `Registry::mount` runs the plugin body on a *fresh* fiber of the
     // registry's own. If the caller's context already carries a fiber, this
     // is a re-entrant mount from inside another plugin's body, and the
@@ -284,17 +309,37 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
         let tools = ctx
             .get::<harnless_agent::tools::ToolRegistry>()
             .ok_or_else(|| harnless_runtime::RuntimeError::new("MOUNT", "tool pipeline missing"))?;
-        register_builtins(&tools, declared)?;
-        // Auto-allow: the pipeline is fail-closed, and the CLI composes only
-        // its own registered tools. Approval UX and policy modes stay out of
-        // scope (#61); the denial path stays the agent crate's tested interior.
+        use harnless_seams::Tools as _;
+        let registered: Vec<String> = {
+            let all = register_builtins(&tools, declared)?;
+            tools
+                .names()
+                .into_iter()
+                .filter(|n| all.contains(n))
+                .collect()
+        };
+        // Auto-allow, scoped: the pipeline is fail-closed, and the CLI grants
+        // allowance only to the tools it actually registered from the plan's
+        // declarations. A later row that registers a body under some other
+        // name still hits the fail-closed default, not a blanket grant.
+        // Approval UX and policy modes stay out of scope (#61); the denial
+        // path stays the agent crate's tested interior.
+        let allowed = registered;
         tools.on_pre_execute(
-            |_: &mut harnless_agent::tools::PreExecute,
-             _next: &mut harnless_runtime::events::Next<
+            move |e: &mut harnless_agent::tools::PreExecute,
+                  _next: &mut harnless_runtime::events::Next<
                 '_,
                 harnless_agent::tools::PreExecute,
                 harnless_seams::PreDecision,
-            >| harnless_seams::PreDecision::Allow,
+            >| {
+                if allowed.iter().any(|name| *name == e.0) {
+                    harnless_seams::PreDecision::Allow
+                } else {
+                    harnless_seams::PreDecision::Deny(
+                        "tool is not registered by the CLI boot".to_string(),
+                    )
+                }
+            },
         )?;
         let loop_ = harnless_agent::loop_::AgentLoop::with_tools(
             ctx.get::<harnless_agent::session::SessionLog>()
@@ -309,6 +354,13 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
         // Re-provide the loop under its service key so `ctx.get::<AgentLoop>()`
         // hands back the wired loop. The spine's tool-less provide is owned by
         // this same fiber and unwinds LIFO with it.
+        //
+        // The remove-then-provide is deliberate, not a stale-disposer race:
+        // both registrations live on one fiber, so at teardown the wired
+        // loop's disposer runs first (LIFO) and the spine's older disposer
+        // then runs its unconditional remove on an already-absent key — a
+        // no-op. A *second* spine mount over one context is unsupported:
+        // two fibers would race over the one `AgentLoop` key.
         ctx.remove::<harnless_agent::loop_::AgentLoop>();
         ctx.provide_shared(&fiber, Arc::new(loop_))?;
         Ok(())
@@ -342,30 +394,47 @@ impl harnless_seams::ToolBody for EchoTool {
 /// Register the CLI's built-in tools on a freshly wired registry.
 ///
 /// The registry starts empty at boot; the profile's declared tool names pick
-/// which built-ins ride. Today the only built-in is [`EchoTool`]; a declared
-/// name with no built-in body mounts as no-op (the name still reaches the
-/// plan and the dump), which is the honest shape until exec-world tools land.
+/// which built-ins ride. Today the only built-in is [`EchoTool`]. A declared
+/// name with no built-in body is a named mount failure — the plan advertised
+/// a tool the composition cannot run, and a silently unregistered tool (no
+/// schema on the wire, no guard) is exactly the quiet divergence this seam
+/// exists to prevent. Returns the names actually registered.
 pub(crate) fn register_builtins(
     tools: &harnless_agent::tools::ToolRegistry,
     declared: &[String],
-) -> harnless_runtime::Result<()> {
+) -> harnless_runtime::Result<Vec<String>> {
     use harnless_seams::Tools as _;
-    if declared.iter().any(|name| name == "echo") {
-        tools
-            .register(
-                harnless_seams::ToolDefinition {
-                    name: "echo".to_string(),
-                    description: "Echo the arguments back as the tool result.".to_string(),
-                    schema: serde_json::json!({"type": "object"}),
-                    serialized: false,
-                },
-                Arc::new(EchoTool),
-            )
-            .map_err(|_| {
-                harnless_runtime::RuntimeError::new("MOUNT", "echo registration failed")
-            })?;
+    let mut registered = Vec::new();
+    for name in declared {
+        match name.as_str() {
+            "echo" => {
+                tools
+                    .register(
+                        harnless_seams::ToolDefinition {
+                            name: "echo".to_string(),
+                            description: "Echo the arguments back as the tool result.".to_string(),
+                            schema: serde_json::json!({"type": "object"}),
+                            serialized: false,
+                        },
+                        Arc::new(EchoTool),
+                    )
+                    .map_err(|_| {
+                        harnless_runtime::RuntimeError::new("MOUNT", "echo registration failed")
+                    })?;
+                registered.push("echo".to_string());
+            }
+            other => {
+                // `RuntimeError` carries a static message; the declared name
+                // is in the mount-failed text the CLI maps onto its error.
+                let _ = other;
+                return Err(harnless_runtime::RuntimeError::new(
+                    "MOUNT",
+                    "profile declares a tool this build has no body for (built-ins: echo)",
+                ));
+            }
+        }
     }
-    Ok(())
+    Ok(registered)
 }
 
 /// Merge a YAML patch document over a composed profile.

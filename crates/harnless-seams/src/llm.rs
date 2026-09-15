@@ -347,6 +347,15 @@ pub trait ModelAdapter: Send + Sync + 'static {
     /// The provider identity declared in every request header.
     fn provider(&self) -> &str;
 
+    /// The identity of the scripted corpus this adapter replays, if it is a
+    /// scripted adapter. The CLI's boot compares it against the plan's
+    /// `model.script` so a patch that swaps the golden swaps the adapter —
+    /// a dump that names one file never boots another. Non-scripted
+    /// adapters report `""`, which matches no plan.
+    fn script_id(&self) -> &str {
+        ""
+    }
+
     /// Whether this adapter owns `replay_state` — replay state is returned
     /// only to the same adapter instance that registered both the historical
     /// and the target provider.

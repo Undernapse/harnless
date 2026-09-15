@@ -130,6 +130,15 @@ impl Registry {
             .map(|m| m.plugin.name().to_owned())
             .collect()
     }
+
+    /// The fibers of mounted plugins, in mount order.
+    pub fn fibers(&self) -> Vec<Arc<Fiber>> {
+        self.plugins
+            .lock()
+            .iter()
+            .map(|m| m.fiber.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]

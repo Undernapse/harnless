@@ -25,16 +25,20 @@ pub fn build_adapter(doc: &ProfileDoc) -> Result<Option<ModelHandle>, CliError> 
     match &doc.model {
         ModelSpec::None => Ok(None),
         ModelSpec::Replay { provider, script } => {
-            let script = match script.as_deref() {
+            let loaded = match script.as_deref() {
                 Some(path) => {
                     let text = std::fs::read_to_string(path).map_err(|e| {
                         CliError::new("bad-script", format!("cannot read script {path}: {e}"))
                     })?;
-                    load_script_text(&text)?
+                    (load_script_text(&text)?, path.to_string())
                 }
-                None => Script::one(demo_recording()),
+                None => (Script::one(demo_recording()), String::new()),
             };
-            Ok(Some(Arc::new(ReplayAdapter::new(provider.clone(), script))))
+            Ok(Some(Arc::new(ReplayAdapter::with_script_id(
+                provider.clone(),
+                loaded.0,
+                loaded.1,
+            ))))
         }
     }
 }

@@ -277,7 +277,9 @@ fn make_driver(
             id: ids.message(),
             blocks,
             provider: Some(model.provider().to_string()),
-            model: Some("replay".into()),
+            // The adapter's own identity, never a hardcoded "replay": the
+            // log's provenance must name what actually answered.
+            model: Some(model.script_id().to_string()),
         })
     })
 }

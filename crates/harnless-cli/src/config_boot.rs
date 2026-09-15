@@ -160,7 +160,8 @@ pub struct CompositionMount {
 pub fn default_plugins() -> PluginRegistry {
     let mut registry = PluginRegistry::new();
     registry.register_fn(REPLAY_PLUGIN, |id: &str, config| {
-        let model = build_adapter(&model_plan(id, config)?).map_err(|e| e.message)?;
+        let plan = model_plan(id, config)?;
+        let model = build_adapter(&plan).map_err(|e| e.message)?;
         Ok(ModelResource {
             id: id.to_string(),
             model,
@@ -172,7 +173,35 @@ pub fn default_plugins() -> PluginRegistry {
             model: None,
         })
     });
+    // A `tool` row is plan content the spine's wiring acts on, not a service
+    // this registry builds — but the row must still *mount*, so the name
+    // resolves to an inert resource. The tool bodies themselves are
+    // registered by `crate::boot::register_builtins` on the spine's
+    // pipeline; a declared name with no built-in body is a named mount
+    // failure there, never a silently unregistered tool.
+    registry.register_fn(TOOL_PLUGIN, |id: &str, _config| {
+        Ok(InertResource { id: id.to_string() })
+    });
     registry
+}
+
+/// A mounted row that contributes no service: the placeholder a `tool` row
+/// resolves to, so the row validates and mounts while the spine's wiring
+/// owns the actual tool registration.
+struct InertResource {
+    id: String,
+}
+
+impl MountedResource for InertResource {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn dispose(&mut self) {}
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// A mount plan carrying only a model composition.
@@ -388,8 +417,8 @@ impl ProfileStore for LayeredStore {
 impl harnless_config::compose::BundleStore for LayeredStore {
     fn load(&self, name: &str) -> harnless_config::error::Result<Option<BundleDoc>> {
         if let Some(disk) = self.disk() {
-            if let Some(bundle) = harnless_config::compose::BundleStore::load(&disk, name)? {
-                return Ok(Some(bundle));
+            if let Some(doc) = harnless_config::compose::BundleStore::load(&disk, name)? {
+                return Ok(Some(doc));
             }
         }
         harnless_config::compose::BundleStore::load(&self.built_in, name)
@@ -407,15 +436,51 @@ impl harnless_config::compose::BundleStore for LayeredStore {
     }
 }
 
-/// A composed configuration with the profile name it was composed for.
+/// A composed configuration with the profile name it was composed for and
+/// the spine mount it produced, if any.
 ///
 /// `mount` checks the name against the plan it was handed before trusting
 /// the stored document, so a `mount` can never silently mount a *different
-/// profile's* rows.
-#[derive(Debug, Clone)]
+/// profile's* rows. The spine rides along because mounting it is not
+/// idempotent: a second `mount_config` over the same plan would re-mount a
+/// mounted one reuses that composition instead of mounting another.
+#[derive(Clone)]
 struct Entry {
     name: String,
     doc: ConfigDoc,
+    spine: Option<Arc<SpineMount>>,
+}
+
+/// A live spine composition: the mounted context, its registry, the model
+/// and tool registry the rows composed, and the fiber that owns the spine's
+/// registrations.
+///
+/// Disposal is explicit and idempotent: dropping the last handle (or
+/// `Mounted::shutdown`) disposes the guard chain — row resources and the
+/// spine's fiber unwind — in reverse mount order. Until then the
+/// composition stays live for whoever holds it.
+pub struct SpineMount {
+    ctx: Context,
+    registry: Arc<Registry>,
+    fiber: Arc<harnless_runtime::Fiber>,
+    model: Option<ModelHandle>,
+    tools: Option<Arc<harnless_agent::tools::ToolRegistry>>,
+    guard: std::sync::Mutex<harnless_config::MountGuard>,
+}
+
+impl SpineMount {
+    /// Tear the composition down: dispose every row resource and unwind the
+    /// spine's fiber. Idempotent.
+    fn dispose(&self) {
+        self.guard.lock().expect("guard lock").dispose();
+        self.registry.unmount(&self.fiber);
+    }
+}
+
+impl Drop for SpineMount {
+    fn drop(&mut self) {
+        self.dispose();
+    }
 }
 
 /// The config-driven composer: the boot seam implemented over a
@@ -548,9 +613,14 @@ impl ConfigComposer {
     pub fn compose_full(&self, name: &str, overlays: &[Layer]) -> Result<Composition, CliError> {
         let out = self.composer.compose(name, overlays).map_err(cli_error)?;
         *self.last_warnings.lock() = out.warnings.clone();
+        // A new composition replaces the old entry. If the old entry's spine
+        // was handed to a live `Mounted`, that handle owns its disposal; the
+        // entry drops its own reference, and a later `mount` composes a
+        // fresh spine for the new document.
         *self.last_config.lock() = Some(Entry {
             name: out.doc.name.clone(),
             doc: out.doc.clone(),
+            spine: None,
         });
         Ok(out)
     }
@@ -770,7 +840,40 @@ impl ConfigComposer {
             model,
             tools: spine_tools,
             _registry: registry,
+            // The caller owns the guard: dropping it (or `dispose`) unwinds
+            // the row resources. A composition that never hands the guard
+            // to a live owner disposes here, not never.
             _guard: guard,
+        })
+    }
+
+    /// Mount a composition and capture its spine as a reusable handle.
+    ///
+    /// The returned `SpineMount` owns the disposal chain: dropping the last
+    /// handle (or `Mounted::shutdown`) unwinds the row resources and the
+    /// spine's fiber. A `mount` through the seam reuses the handle stored on
+    /// the entry rather than mounting a second spine.
+    pub(crate) fn mount_spine_for(&self, doc: &ConfigDoc) -> Result<SpineMount, CliError> {
+        let CompositionMount {
+            ctx,
+            model,
+            tools,
+            _registry,
+            _guard,
+        } = self.mount_config(doc)?;
+        // The spine's fiber is the registry's mount; a composition without
+        // one mounted no spine row, which the seam cannot boot.
+        let fiber =
+            _registry.fibers().into_iter().last().ok_or_else(|| {
+                CliError::new("mount-failed", "composition mounted no spine fiber")
+            })?;
+        Ok(SpineMount {
+            ctx,
+            registry: _registry,
+            fiber,
+            model,
+            tools,
+            guard: std::sync::Mutex::new(_guard),
         })
     }
 }
@@ -848,74 +951,79 @@ impl BootComposer for ConfigComposer {
         // The boot half mounts the rows the dump printed *when the stored
         // composition is the one this plan projects* — identity is checked,
         // not assumed. A stale or foreign `last_config` re-composes the
-        // plan's own name (without the lost overlays, which the plan itself
-        // still carries for the model), and a document that cannot be
-        // composed falls back to the reference mount.
+        // plan's own name; a composition that fails is a named failure,
+        // never a silent reference fallback. The stored composition's spine
+        // is *reused*, not re-mounted: mounting is not idempotent, and the
+        // composition `compose` produced is the one the dump describes.
         let stored = self.last_config.lock().clone();
-        let config_doc = match stored {
-            Some(entry) if entry.name == doc.name => Some(entry.doc),
-            Some(_) => self.compose_config(&doc.name, &[]).ok(),
-            None => self.compose_config(&doc.name, &[]).ok(),
+        let entry = match stored {
+            Some(entry) if entry.name == doc.name => Some(entry),
+            // The overlays `compose` applied are not recoverable from the
+            // plan alone, so a foreign entry re-composes the named profile
+            // from the stored layers. A composition that fails here fails
+            // the mount — dump-equals-mount's error clause says a profile
+            // that cannot compose cannot boot either.
+            _ => {
+                let composition = self.compose_full(&doc.name, &[])?;
+                Some(Entry {
+                    name: composition.doc.name.clone(),
+                    doc: composition.doc,
+                    spine: None,
+                })
+            }
         };
-        if let Some(config_doc) = config_doc {
-            let CompositionMount {
-                ctx,
-                model,
-                tools,
-                _registry,
-                _guard,
-            } = self.mount_config(&config_doc)?;
-            // A plan whose model differs from the rows' model (a field-wise
-            // patch swapped it) mounts the plan's model, never the rows'.
-            let model = if model_matches(doc, model.as_ref()) {
-                model
-            } else {
-                build_adapter(doc)?
-            };
-            // The seam's `Mounted` owns the registry as an `Arc`; the config
-            // mount's disposal chain (row resources + the spine's fiber
-            // unwind) must stay alive exactly as long as the composition —
-            // dropping it would dispose live row resources out from under the
-            // mounted context. `ManuallyDrop` is the honest owner: it never
-            // runs `Drop`, and the chain unwinds with the process, matching
-            // the reference mount's leak-tolerant shape.
-            let chain = std::mem::ManuallyDrop::new((_guard, _registry));
-            return Ok(Mounted {
-                ctx,
-                _registry: Arc::clone(&chain.1),
-                model,
-                ids: crate::boot::Ids::new(),
-                tools,
-            });
-        }
-        let ctx = Context::root();
-        let registry = Arc::new(Registry::new());
-        let wiring = self.tools_wiring(doc)?;
-        let (tools, _fiber) = crate::boot::mount_spine(&ctx, &registry, wiring)?;
-        let model = build_adapter(doc)?;
+        let entry = entry.expect("compose_full returns or errors");
+        let spine = match entry.spine {
+            Some(spine) => spine,
+            None => {
+                let spine = Arc::new(self.mount_spine_for(&entry.doc)?);
+                // The composition's spine is now live; the entry hands it to
+                // every later `mount` of the same plan instead of mounting a
+                // second spine onto the service map.
+                *self.last_config.lock() = Some(Entry {
+                    name: entry.name.clone(),
+                    doc: entry.doc.clone(),
+                    spine: Some(Arc::clone(&spine)),
+                });
+                spine
+            }
+        };
+        // A plan whose model differs from the rows' model (a field-wise
+        // patch swapped it) mounts the plan's model, never the rows'.
+        let model = if model_matches(doc, spine.model.as_ref()) {
+            spine.model.clone()
+        } else {
+            build_adapter(doc)?
+        };
         Ok(Mounted {
-            ctx,
-            _registry: registry,
+            ctx: spine.ctx.clone(),
+            _registry: Arc::clone(&spine.registry),
+            tools: spine.tools.clone(),
+            _spine: Some(spine as Arc<dyn std::any::Any + Send + Sync>),
             model,
             ids: crate::boot::Ids::new(),
-            tools,
         })
     }
 }
 
 /// Whether a composed model handle is the one a plan names.
 ///
-/// The identity that matters at this boundary is the plan's `ModelSpec`: a
-/// plan that names no provider must not mount a row-composed adapter, and a
-/// plan whose replay provider differs from the rows' must mount its own.
+/// The identity that matters at this boundary is the plan's `ModelSpec` in
+/// full: a plan that names no provider must not mount a row-composed
+/// adapter; a plan whose replay provider *or golden script* differs from the
+/// rows' must mount its own. A patch that swaps only `model.script` swaps
+/// the mounted adapter, never silently keeps the rows' golden.
 fn model_matches(doc: &ProfileDoc, mounted: Option<&ModelHandle>) -> bool {
     match (&doc.model, mounted) {
         (ModelSpec::None, None) => true,
-        (ModelSpec::Replay { provider, .. }, Some(handle)) => handle.provider() == provider,
+        // A plan with no `script:` names the built-in demo corpus, which an
+        // adapter built without a golden path reports as `""`.
+        (ModelSpec::Replay { provider, script }, Some(handle)) => {
+            handle.provider() == provider && handle.script_id() == script.as_deref().unwrap_or("")
+        }
         _ => false,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1203,12 +1311,11 @@ mod tests {
     #[test]
     fn a_field_wise_overlay_projects_onto_the_plan() {
         let composer = composer();
-        let overlays =
-            parse_overlays(Some("system_prompt: be terse\ntools:\n- bash\n- read\n")).unwrap();
+        let overlays = parse_overlays(Some("system_prompt: be terse\ntools:\n- echo\n")).unwrap();
         let doc = composer.compose_config("default", &overlays).unwrap();
         let plan = composer.plan(&doc).expect("plan projects doc rows");
         assert_eq!(plan.system_prompt, "be terse");
-        assert_eq!(plan.tools, vec!["bash", "read"]);
+        assert_eq!(plan.tools, vec!["echo"]);
         // The doc rows never appear as seams and never mount.
         assert_eq!(plan.seams, SPINE_SEAMS);
         let mounted = composer

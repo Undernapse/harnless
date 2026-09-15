@@ -155,3 +155,57 @@ fn interactive_reads_prompts_from_stdin() {
         "one answer per prompt:\n{text}"
     );
 }
+
+/// The shipped binary's tool path: `hrls run --patch 'tools: [echo]'` must
+/// boot the registry-backed loop end to end. This is the composition the
+/// config layer produces for a declared tool — the seam tests pin the same
+/// round-trip at the log surface through the reference mount; this pins that
+/// the *binary's* composition root (ConfigComposer) reaches the same result.
+#[test]
+fn a_declared_tool_boots_and_runs_through_the_binary() {
+    use harnless_llm_replay::Recording;
+    use harnless_seams::{BlockKind, ContentBlock, ReplayState, StreamFrame, Usage};
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("hrls-tool-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("tool.json");
+    // Capture the tool-call recording the same way the seam harness does —
+    // real frames, validated — so the binary replays a corpus the replay
+    // crate itself certifies, not a hand-written envelope.
+    let json = r#"{"id":1,"name":"echo","arguments":"{\"msg\":\"ping\"}"}"#.to_string();
+    let frames = vec![
+        StreamFrame::BlockStart {
+            index: 0,
+            kind: BlockKind::ToolCall,
+        },
+        StreamFrame::ToolCallDelta {
+            index: 0,
+            call_id: harnless_seams::CallId(1),
+            json: json.clone(),
+        },
+        StreamFrame::BlockEnd {
+            index: 0,
+            assembled: ContentBlock {
+                kind: BlockKind::ToolCall,
+                text: json,
+            },
+        },
+        StreamFrame::Usage(Usage::default()),
+        StreamFrame::Finish,
+    ];
+    let rec = Recording::capture(&frames, &ReplayState::default());
+    rec.validate().expect("fixture recording validates");
+    std::fs::write(&script, rec.to_json().expect("recording serializes")).unwrap();
+    let patch = dir.join("tools.yaml");
+    let mut f = std::fs::File::create(&patch).unwrap();
+    write!(
+        f,
+        "tools:\n- echo\nmodel:\n  kind: replay\n  provider: openai\n  script: {}\n",
+        script.display()
+    )
+    .unwrap();
+    drop(f);
+    let out = hrls(&["run", "--patch", patch.to_str().unwrap(), "--", "call echo"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+}
