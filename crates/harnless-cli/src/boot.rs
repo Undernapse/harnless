@@ -279,7 +279,20 @@ impl BootComposer for DefaultComposer {
         let wiring = self.tools_wiring(doc)?;
         let id_seed = seed.id_seed;
         let (tools, fiber, mirror) = mount_spine(&ctx, &registry, wiring, seed)?;
-        let model = build_adapter(doc)?;
+        let model = match build_adapter(doc) {
+            Ok(model) => model,
+            Err(err) => {
+                // The spine mounted and took the session lock; the
+                // composition never exists to close it. Unwind the mount
+                // and release the writer — a failed boot unwinds, never
+                // leaks.
+                drop(fiber);
+                if let Some(mirror) = mirror {
+                    mirror.close();
+                }
+                return Err(err);
+            }
+        };
         Ok(Mounted {
             ctx,
             _registry: registry,
@@ -400,9 +413,17 @@ pub(crate) fn mount_spine(
         mounted_mirror: std::sync::Mutex::new(None),
     });
     let plugin: Arc<dyn harnless_runtime::plugin::Plugin> = spine.clone();
-    let fiber = registry
-        .mount(ctx, plugin)
-        .map_err(|e| CliError::new("mount-failed", format!("{}: {}", e.code, e.message)))?;
+    let fiber = registry.mount(ctx, plugin).map_err(|e| {
+        // A failed `apply` rolls back its own registrations, but a
+        // mirror it already installed holds the session lock — the
+        // composition never exists to close it, so close it here.
+        // A failed boot unwinds, never leaks.
+        let slot = spine.mounted_mirror.lock().expect("mirror out lock");
+        if let Some(mirror) = slot.as_ref() {
+            mirror.close();
+        }
+        CliError::new("mount-failed", format!("{}: {}", e.code, e.message))
+    })?;
     let tools = match wiring {
         // The registry-backed loop is live: the handle rides on `Mounted` so
         // the runner projects its schemas onto every adapter request.

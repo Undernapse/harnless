@@ -987,6 +987,12 @@ impl ConfigComposer {
                             Ok(config) => config,
                             Err(err) => {
                                 guard.dispose();
+                                if let Some(mirror) = spine_mirror.take() {
+                                    // The spine mounted and took the session lock; no
+                                    // composition ever owns it. A failed boot unwinds,
+                                    // never leaks.
+                                    mirror.close();
+                                }
                                 return Err(cli_error(err));
                             }
                         };
@@ -998,6 +1004,12 @@ impl ConfigComposer {
                         }
                         Err(e) => {
                             guard.dispose();
+                            if let Some(mirror) = spine_mirror.take() {
+                                // The spine mounted and took the session lock; no
+                                // composition ever owns it. A failed boot unwinds,
+                                // never leaks.
+                                mirror.close();
+                            }
                             return Err(CliError::new(
                                 "plugin-build-failed",
                                 format!("store row {:?}: {e}", row.id),
@@ -1019,6 +1031,12 @@ impl ConfigComposer {
                         }
                         Err(err) => {
                             guard.dispose();
+                            if let Some(mirror) = spine_mirror.take() {
+                                // The spine mounted and took the session lock; no
+                                // composition ever owns it. A failed boot unwinds,
+                                // never leaks.
+                                mirror.close();
+                            }
                             return Err(cli_error(err));
                         }
                     }
@@ -1040,6 +1058,12 @@ impl ConfigComposer {
         // declared", not "the spine row was missing".
         if !matches!(wiring, crate::boot::ToolsWiring::None) && spine_tools.is_none() {
             guard.dispose();
+            if let Some(mirror) = spine_mirror.take() {
+                // The spine mounted and took the session lock; no
+                // composition ever owns it. A failed boot unwinds,
+                // never leaks.
+                mirror.close();
+            }
             return Err(CliError::new(
                 "mount-failed",
                 "the plan declared tools but no spine row mounted a tool pipeline",
@@ -1092,7 +1116,7 @@ impl ConfigComposer {
             model,
             tools,
             store,
-            mirror,
+            mut mirror,
             _registry,
             _guard,
         } = self.mount_config_with_seed(doc, seed)?;
@@ -1110,6 +1134,12 @@ impl ConfigComposer {
                 // boot unwinds, never leaks.
                 let mut guard = _guard;
                 guard.dispose();
+                if let Some(mirror) = mirror.take() {
+                    // The spine mounted and took the session lock; no
+                    // composition ever owns it. A failed boot unwinds,
+                    // never leaks.
+                    mirror.close();
+                }
                 return Err(CliError::new(
                     "mount-failed",
                     "composition mounted no spine fiber",
@@ -1319,6 +1349,19 @@ impl BootComposer for ConfigComposer {
                             "mount-failed",
                             "a spine with different tool wiring is already live for this profile; \
                              drop its last Mounted before mounting the other plan",
+                        ));
+                    }
+                    // The invariant that keeps `Mounted::drop`'s mirror-close
+                    // safe under warm reuse: a cached spine is always built
+                    // from the default seed, so it never owns a mirroring
+                    // writer. If a future change ever cached a store-mounted
+                    // spine, the first `Mounted` to drop would close a writer
+                    // a live sibling still needs — refuse it at boot instead.
+                    if spine.mirror.is_some() {
+                        return Err(CliError::new(
+                            "mount-failed",
+                            "a store-mounted spine is never warm-reusable; \
+                             this is a bug in the spine cache",
                         ));
                     }
                     spine

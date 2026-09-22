@@ -48,14 +48,6 @@ fn hrls_at(home: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> Outpu
         .expect("hrls binary runs")
 }
 
-/// One-shot variant of [`hrls_at`] with a fresh temp `HOME` per call.
-fn hrls_env(args: &[&str], env: &[(&str, &str)]) -> Output {
-    let home = temp_home();
-    let out = hrls_at(&home, args, env);
-    let _ = std::fs::remove_dir_all(&home);
-    out
-}
-
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }

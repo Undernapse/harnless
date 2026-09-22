@@ -693,3 +693,37 @@ fn mount_seeded_writer_frees_when_the_mount_ends() {
     drop(log);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn failed_seeded_mount_releases_the_lock() {
+    // A mount that fails *after* the spine took the session lock must
+    // unwind the writer with it — "a failed boot unwinds, never leaks".
+    // The injection is the plan itself: a replay script that cannot be
+    // read makes `build_adapter` fail right after `mount_spine` succeeded,
+    // which is the post-apply window where the writer would otherwise
+    // outlive every owner (no `Mounted` ever exists to close it).
+    let dir = temp_store("failmount");
+    let store = SessionStore::new(&dir);
+    let id = 606u64;
+    std::fs::write(store.session_path(id), file_fixture_lines()).unwrap();
+
+    let doc = support::seam_profile_store(
+        "failmount",
+        Some(std::path::Path::new("/nonexistent/missing-script.json")),
+        &[],
+        Some(&dir),
+    );
+    let opened = open_session(&DefaultComposer, &doc, Some(id), None, None);
+    let err = match opened {
+        Ok(_) => panic!("a missing script must refuse the mount"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code, "bad-script", "the mount fails loudly, named");
+    // The session is not wedged: the lock went with the failed boot.
+    drop(
+        store
+            .open_existing(id)
+            .expect("a failed mount must leave the lock free"),
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
