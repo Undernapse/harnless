@@ -62,16 +62,34 @@ struct Cli {
 enum Command {
     /// Run one headless agent turn and print the answer.
     Run {
+        /// Resume an existing session by id instead of minting a new one.
+        #[arg(long, value_parser = parse_session_id, conflicts_with = "fork")]
+        resume: Option<u64>,
+        /// Fork an existing session: copy its log into a new session id.
+        #[arg(long, value_parser = parse_session_id)]
+        fork: Option<u64>,
         /// The prompt (everything after `--`).
         #[arg(last = true, required = true)]
         prompt: Vec<String>,
     },
     /// Start an interactive REPL session.
-    Interactive,
+    Interactive {
+        /// Resume an existing session by id instead of minting a new one.
+        #[arg(long, value_parser = parse_session_id, conflicts_with = "fork")]
+        resume: Option<u64>,
+        /// Fork an existing session: copy its log into a new session id.
+        #[arg(long, value_parser = parse_session_id)]
+        fork: Option<u64>,
+    },
     /// Profile management.
     Profile {
         #[command(subcommand)]
         action: ProfileAction,
+    },
+    /// Session management.
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsAction,
     },
 }
 
@@ -79,6 +97,19 @@ enum Command {
 enum ProfileAction {
     /// List available profiles.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionsAction {
+    /// List sessions in the composed plan's store dir (#71 §3).
+    List,
+}
+
+/// Session ids are decimal `u64` (#71 §2) — the raw minted number, not
+/// `SessionId`'s branded display.
+fn parse_session_id(s: &str) -> Result<u64, String> {
+    s.parse::<u64>()
+        .map_err(|_| format!("session ids are decimal numbers, not {s:?}"))
 }
 
 fn main() -> ExitCode {
@@ -123,19 +154,54 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                 Ok(())
             }
         },
-        Some(Command::Run { prompt }) => {
-            let text = run::run_once(&composer, &cli.profile, patch.as_deref(), &prompt.join(" "))?;
+        Some(Command::Run {
+            resume,
+            fork,
+            prompt,
+        }) => {
+            let doc = composer.compose(&cli.profile, patch)?;
             report(&composer);
+            // The session route (#71 §2): mint/resume/fork, then the turn.
+            // The mint line rides stderr *after* mount, *before* the turn —
+            // stdout's contract is "the answer text, then nothing else".
+            // A plan with no model cannot run a turn at all: refuse it
+            // before minting, so the named error is the only stderr line and
+            // no session file is created for a turn that never happened.
+            if !doc.has_model() {
+                return Err(CliError::new(
+                    "no-model-provider",
+                    "this profile composes no model provider; run `hrls profile list` \
+                     for available profiles or patch in a model",
+                ));
+            }
+            let session =
+                harnless_cli::session::open_session(&composer, &doc, *resume, *fork, None)?;
+            if doc.store.is_some() {
+                eprintln!("session: {}", session.id);
+            }
+            let text = run::drive_turn(&session.mounted, &prompt.join(" "))?;
             println!("{text}");
             Ok(())
         }
-        Some(Command::Interactive) => {
-            let doc = composer.compose(&cli.profile, None)?;
+        Some(Command::Interactive { resume, fork }) => {
+            let doc = composer.compose(&cli.profile, patch)?;
             report(&composer);
-            let mounted = composer.mount(&doc)?;
+            let session =
+                harnless_cli::session::open_session(&composer, &doc, *resume, *fork, None)?;
             let stdin = std::io::stdin();
-            repl::repl(&mounted, stdin.lock(), std::io::stdout())
+            repl::repl_named(&session.mounted, session.id, doc.store.is_some(), stdin.lock(), std::io::stdout())
         }
+        Some(Command::Sessions { action }) => match action {
+            // `sessions list` reads the composed plan's store dir — so
+            // `--profile`/`--patch` affect it (#71 §3). It never mounts.
+            SessionsAction::List => {
+                let doc = composer.compose(&cli.profile, patch)?;
+                report(&composer);
+                let store = harnless_cli::session::store_handle(&doc, None)?;
+                print!("{}", harnless_cli::session::render_list(&store.list()));
+                Ok(())
+            }
+        },
         None => {
             if cli.dump_config || cli.dump_full_config {
                 let dumped = if cli.dump_full_config {

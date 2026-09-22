@@ -56,6 +56,23 @@ pub struct ProfileDoc {
     pub tools: Vec<String>,
     /// The base system-prompt directive for assembled prompts.
     pub system_prompt: String,
+    /// The session store the composition mounts, as the plan's tail key.
+    ///
+    /// `None` is sessionless mode (#69 §4): resume/fork/list fail
+    /// `storage-not-mounted`. Appended **last** so every existing dump
+    /// golden keeps its byte order; `#[serde(default)]` keeps a dump from an
+    /// older build loadable (absent = sessionless).
+    #[serde(default)]
+    pub store: Option<StoreSpec>,
+}
+
+/// The plan's projection of a storage row (#69 §1): where the session logs
+/// live.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreSpec {
+    /// The state directory holding `<id>.jsonl` session files.
+    pub dir: String,
 }
 
 impl ProfileDoc {
@@ -77,6 +94,11 @@ impl ProfileDoc {
             },
             tools: Vec::new(),
             system_prompt: "You are harnless, a helpful agent.".to_string(),
+            // The reference plan stays sessionless on purpose (#69 §2): the
+            // `DefaultComposer` is the seam-test fixture and must never
+            // touch `$HOME`. Only the config-boot built-in bundle ships the
+            // store row.
+            store: None,
         }
     }
 

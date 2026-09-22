@@ -918,6 +918,7 @@ dependencies = [
  "harnless-llm-replay",
  "harnless-runtime",
  "harnless-seams",
+ "harnless-storage-jsonl",
  "parking_lot",
  "serde",
  "serde_json",
@@ -1084,8 +1085,10 @@ name = "harnless-storage-jsonl"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "harnless-agent",
  "harnless-conformance",
  "harnless-seams",
+ "libc",
  "parking_lot",
  "serde",
  "serde_json",

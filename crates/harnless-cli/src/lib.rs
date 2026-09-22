@@ -17,6 +17,7 @@ pub mod model;
 pub mod profile;
 pub mod repl;
 pub mod run;
+pub mod session;
 
 use std::fmt;
 

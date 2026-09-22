@@ -9,12 +9,32 @@
 use std::process::{Command, Output};
 
 /// Run the binary with `args`, never inheriting the test harness's stdin.
+///
+/// `HOME` is redirected to a per-test temp dir: the shipped default profile
+/// is durable (#69 §2), and a bare `hrls run` must never write to the
+/// developer's real `~/.harnless` from the test suite.
 fn hrls(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_hrls"))
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .expect("hrls binary runs")
+    hrls_env(args, &[])
+}
+
+/// Run the binary with `args` plus extra environment, in an isolated
+/// `HOME`: the shipped default profile is durable (#69 §2), and the test
+/// suite must never write to the developer's real `~/.harnless`.
+fn hrls_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let home = std::env::temp_dir().join(format!(
+        "hrls-home-{}-{}",
+        std::process::id(),
+        std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hrls"));
+    cmd.args(args).env("HOME", &home);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.stdin(std::process::Stdio::null()).output().expect("hrls binary runs");
+    let _ = std::fs::remove_dir_all(&home);
+    out
 }
 
 fn stdout(out: &Output) -> String {
@@ -45,7 +65,7 @@ fn profile_list_shows_the_built_in_profile() {
 
 #[test]
 fn dump_config_prints_yaml_that_reloads() {
-    let out = hrls(&["--dump-config"]);
+    let out = hrls_env(&["--dump-config"], &[("HOME", "/tmp/hrls-fixed-home")]);
     assert!(out.status.success());
     let text = stdout(&out);
     // Valid YAML…
@@ -53,12 +73,18 @@ fn dump_config_prints_yaml_that_reloads() {
     // …whose profile fields match what boot composes (dump-equals-mount shape)…
     assert_eq!(doc["name"].as_str(), Some("default"));
     assert_eq!(doc["model"]["kind"].as_str(), Some("replay"));
+    // The shipped default is durable (#69 §2): the dump carries the store
+    // row, with `${home}` expanded to this process's HOME.
+    let expected_dir = "/tmp/hrls-fixed-home/.harnless/sessions";
+    assert_eq!(doc["store"]["dir"].as_str(), Some(expected_dir));
     // …and reparses through the profile loader to an equal document.
     let reparsed = harnless_cli::profile::ProfileDoc::load(&text).expect("dump reloads");
-    assert_eq!(
-        reparsed,
-        harnless_cli::profile::ProfileDoc::default_profile()
-    );
+    let mut expected = harnless_cli::profile::ProfileDoc::default_profile();
+    expected.seams.push("store".to_string());
+    expected.store = Some(harnless_cli::profile::StoreSpec {
+        dir: expected_dir.to_string(),
+    });
+    assert_eq!(reparsed, expected);
     // Re-dumping the reloaded document is byte-identical: fixed point.
     assert_eq!(reparsed.dump(), text);
 }

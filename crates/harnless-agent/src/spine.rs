@@ -36,16 +36,22 @@ impl Spine {
     pub fn new(session_id: SessionId) -> Self {
         Self { session_id }
     }
-}
 
-impl Plugin for Spine {
-    fn name(&self) -> &str {
-        "spine"
-    }
-
-    fn apply(&self, ctx: &Context) -> Result<()> {
-        // The session log is the single source of truth.
-        let log = SessionLog::new(self.session_id);
+    /// Provide the spine's services on `ctx` with a caller-built log.
+    ///
+    /// The stock [`Spine::apply`] builds a fresh [`SessionLog`]; the CLI
+    /// boot's seeded mount (#67 §5) needs to provide a log reconstructed
+    /// from stored records — or one wrapped in a persistence mirror — under
+    /// the same service key instead. This is the spine's own registration
+    /// chain with the log supplied: event registry, tool pipeline, and the
+    /// tool-less loop all register exactly as `apply` does, on the mount's
+    /// fiber, unwinding in the same LIFO order. `apply` is this with its own
+    /// fresh log.
+    pub fn apply_with_log(
+        &self,
+        ctx: &Context,
+        log: SessionLog,
+    ) -> Result<()> {
         ctx.provide(log)?;
 
         // The tool registry hosts the guarded pipeline's extension points.
@@ -64,6 +70,17 @@ impl Plugin for Spine {
         ctx.provide(loop_)?;
 
         Ok(())
+    }
+}
+
+impl Plugin for Spine {
+    fn name(&self) -> &str {
+        "spine"
+    }
+
+    fn apply(&self, ctx: &Context) -> Result<()> {
+        // The session log is the single source of truth.
+        self.apply_with_log(ctx, SessionLog::new(self.session_id))
     }
 }
 

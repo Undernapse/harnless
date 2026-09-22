@@ -32,3 +32,7 @@ Used by `/wayfinder`. The **map** is a file with one **child** file per ticket.
 ## Efforts
 
 - [`rust-dsh`](../.scratch/rust-dsh/map.md): Rust reimplementation of the DeepSeek Harness (`dsh`) preserving its plugability architecture.
+
+## Wayfinder on GitHub
+
+Wayfinder maps use **GitHub Issues**, not `.scratch/`: the map is a map-labeled issue, children are native sub-issues with `wayfinder:<type>` labels. Claim = assignee + `Status: claimed` line; resolve = `## Answer` comment + `Status: resolved` line + close, with a context pointer (gist + link) appended to the map's *Decisions so far*. Blocking is the `Blocked by:` body convention (the token cannot use GraphQL `addBlockedBy`).

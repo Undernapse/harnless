@@ -26,13 +26,27 @@ use crate::CliError;
 pub fn repl(
     mounted: &Mounted,
     input: impl BufRead,
+    output: impl Write,
+) -> Result<(), CliError> {
+    repl_named(mounted, 0, false, input, output)
+}
+
+/// As [`repl`], with the session banner (#71 §2): a store-mounted session
+/// names its id in the banner slot; a sessionless composition keeps the
+/// generic line.
+pub fn repl_named(
+    mounted: &Mounted,
+    id: u64,
+    named: bool,
+    input: impl BufRead,
     mut output: impl Write,
 ) -> Result<(), CliError> {
-    writeln!(
-        output,
-        "hrls interactive session — type `exit` or Ctrl-D to end"
-    )
-    .map_err(|e| CliError::new("io-error", e.to_string()))?;
+    let banner = if named {
+        format!("harnless — session {id} (exit or Ctrl-D to end)")
+    } else {
+        "hrls interactive session — type `exit` or Ctrl-D to end".to_string()
+    };
+    writeln!(output, "{banner}").map_err(|e| CliError::new("io-error", e.to_string()))?;
     for line in input.lines() {
         let line = line.map_err(|e| CliError::new("io-error", e.to_string()))?;
         let line = line.trim();

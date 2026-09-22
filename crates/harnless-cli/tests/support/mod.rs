@@ -150,11 +150,24 @@ impl harnless_seams::ModelAdapter for ScriptedModel {
 }
 
 /// A profile document for the seam tests: spine seams, scripted model,
-/// declared tools.
+/// declared tools, sessionless (`store: None` — the #69 §2 rule: the seam
+/// fixture never touches `$HOME`).
 pub fn seam_profile(
     name: &str,
     script: Option<&std::path::Path>,
     tools: &[&str],
+) -> harnless_cli::profile::ProfileDoc {
+    seam_profile_store(name, script, tools, None)
+}
+
+/// As [`seam_profile`], store-mounted: `store_dir` becomes the plan's
+/// `store.dir` so the durability seam (#72 File A) drives the real mirror
+/// into a temp dir — no new injection API, `Mounted.store` is the seam.
+pub fn seam_profile_store(
+    name: &str,
+    script: Option<&std::path::Path>,
+    tools: &[&str],
+    store_dir: Option<&std::path::Path>,
 ) -> harnless_cli::profile::ProfileDoc {
     harnless_cli::profile::ProfileDoc {
         name: name.to_string(),
@@ -170,6 +183,9 @@ pub fn seam_profile(
         },
         tools: tools.iter().map(|t| t.to_string()).collect(),
         system_prompt: "seam test".to_string(),
+        store: store_dir.map(|dir| harnless_cli::profile::StoreSpec {
+            dir: dir.display().to_string(),
+        }),
     }
 }
 

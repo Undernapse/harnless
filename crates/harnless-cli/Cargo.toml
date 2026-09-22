@@ -12,6 +12,7 @@ harnless-seams = { path = "../harnless-seams" }
 harnless-agent = { path = "../harnless-agent" }
 harnless-config = { path = "../harnless-config" }
 harnless-llm-replay = { path = "../harnless-llm-replay" }
+harnless-storage-jsonl = { path = "../harnless-storage-jsonl" }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
