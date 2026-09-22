@@ -1,12 +1,22 @@
 //! `hrls` — the harnless CLI binary.
 //!
 //! Verbs:
-//! * `hrls run --profile <name> [--patch <file>] -- <prompt>` — headless
-//!   one-shot agent turn;
-//! * `hrls interactive --profile <name>` — REPL entry;
+//! * `hrls run --profile <name> [--patch <file>] [--resume <id> | --fork <id>] -- <prompt>`
+//!   — headless one-shot agent turn; on a store-mounted plan the minted or
+//!   resumed session id prints to stderr as `session: <id>` before the turn
+//!   (stdout stays "the answer text, then nothing else");
+//! * `hrls interactive --profile <name> [--resume <id> | --fork <id>]` —
+//!   REPL entry, same session route and banner;
+//! * `hrls sessions list` — the store's session table for the composed
+//!   plan's store dir;
 //! * `hrls --profile <name> --dump-config` — print the composed profile
-//!   document through the boot serializer;
+//!   document through the boot serializer (a pure offline operation: no
+//!   store dir is created, no lock is taken);
 //! * `hrls profile list` — show available profiles.
+//!
+//! Session failures carry stable codes: `session-not-found`,
+//! `session-locked`, `session-corrupt`, `storage-not-mounted`,
+//! `session-mint-failed` — every one a boot-time refusal, never mid-session.
 //!
 //! Composition is the layered model in `harnless-config`: the profile's
 //! bundles, its own patch, the home-level patch, and any `--patch` overlays

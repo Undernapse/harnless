@@ -213,13 +213,18 @@ impl FileLock {
     }
 }
 
-fn read_holder(lock_path: &Path) -> Option<u32> {
+pub fn read_holder(lock_path: &Path) -> Option<u32> {
     let mut buf = String::new();
     match File::open(lock_path).and_then(|mut f| f.read_to_string(&mut buf)) {
         Ok(_) => {}
         Err(_) => return None,
     }
-    buf.trim().parse().ok()
+    // The reader is unlocked (the lock is held by the *other* process), so it
+    // can land in the truncate-to-write window and see empty content. Take
+    // the last non-empty line: the current holder's pid, whatever the window.
+    buf.lines()
+        .rev()
+        .find_map(|line| line.trim().parse::<u32>().ok())
 }
 
 /// The session store: pure path state over a directory, created lazily at

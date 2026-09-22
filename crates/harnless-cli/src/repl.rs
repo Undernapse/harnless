@@ -1,11 +1,13 @@
 //! The interactive REPL entry.
 //!
-//! The REPL composes and mounts a profile once, then reads prompts from
-//! stdin line by line, driving one agent turn per line against the same
-//! live composition — so the session log accumulates across turns exactly
-//! as the headless runner builds it for a single turn. EOF or `exit` ends
-//! the session cleanly: neither opens a turn, and the log ends at the last
-//! completed turn's close. Blank lines are skipped without a turn.
+//! The REPL composes and mounts a profile once (through the session route:
+//! mint, `--resume`, or `--fork`, with the session id named in the banner),
+//! then reads prompts from stdin line by line, driving one agent turn per
+//! line against the same live composition — so the session log accumulates
+//! across turns and mirrors to the session file exactly as the headless
+//! runner builds it for a single turn. EOF or `exit` ends the session
+//! cleanly: neither opens a turn, and the log ends at the last completed
+//! turn's close. Blank lines are skipped without a turn.
 //!
 //! The loop is deliberately dumb: no line editing, no history. The value it
 //! pins is the composition shape — mount once, drive many turns through the

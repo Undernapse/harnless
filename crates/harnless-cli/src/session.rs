@@ -222,17 +222,18 @@ pub fn store_handle(
 
 /// Expand `${home}` in a store dir. The config-boot route expands at compose
 /// time; a raw plan (the seam harness) can still carry the token. The token
-/// without a `HOME` is a named failure, never a literal `${home}` directory
-/// — the wrong-dir mount class #69 §3 exists to refuse.
+/// without a home is a named failure, never a literal `${home}` directory
+/// — the wrong-dir mount class #69 §3 exists to refuse. The home resolves
+/// `HOME` then `USERPROFILE`, the same order the substitution pass uses.
 fn expand_home(dir: &str) -> Result<String, CliError> {
     if !dir.contains("${home}") {
         return Ok(dir.to_string());
     }
-    match std::env::var("HOME") {
-        Ok(home) => Ok(dir.replace("${home}", &home)),
-        Err(_) => Err(CliError::new(
+    match crate::config_boot::default_home() {
+        Some(home) => Ok(dir.replace("${home}", &home)),
+        None => Err(CliError::new(
             "storage-not-mounted",
-            format!("store dir {dir:?} names ${{home}} but HOME is unset"),
+            format!("store dir {dir:?} names ${{home}} but no home is set"),
         )),
     }
 }

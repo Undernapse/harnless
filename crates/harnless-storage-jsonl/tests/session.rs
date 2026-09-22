@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::os::unix::io::AsRawFd;
 
 use harnless_agent::events::{CommittedRecord, SessionEvent, TurnEndReason};
-use harnless_storage_jsonl::SessionStore;
+use harnless_storage_jsonl::{read_holder, FileLock, SessionStore};
 
 fn fixture(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -337,5 +337,34 @@ fn list_orders_by_mtime_desc_and_marks_corrupt_files() {
     let torn_meta = metas.iter().find(|m| m.id == 3).unwrap();
     assert!(!torn_meta.corrupt);
     assert_eq!(torn_meta.event_count, Some(2));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn list_marks_corrupt_files_and_lock_holder_pid_is_recorded() {
+    // T5's store half: the corrupt-file flag in `list`, and the lock file
+    // carrying the holder's pid (the diagnostic #70 §5 names).
+    let dir = fixture("list2");
+    let store = SessionStore::new(&dir);
+    write_lines(&dir, 1, &record_lines(&bracket(0)));
+    let live = 9u64;
+    write_lines(&dir, live, &record_lines(&bracket(0)));
+    let _holder = FileLock::hold(&dir, live).unwrap();
+    let rows = store.list();
+    assert_eq!(
+        rows.iter().find(|r| r.id == 1).unwrap().corrupt,
+        false,
+        "a clean file is not flagged"
+    );
+    std::fs::write(dir.join("7.jsonl"), b"{ not json\n").unwrap();
+    let rows = store.list();
+    let row = rows.iter().find(|r| r.id == 7).unwrap();
+    assert!(row.corrupt, "a corrupt file is flagged");
+    assert_eq!(row.event_count, None, "a corrupt file has no count");
+    assert_eq!(
+        read_holder(&dir.join(format!("{live}.jsonl.lock"))),
+        Some(std::process::id()),
+        "the lock file names its holder's pid"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

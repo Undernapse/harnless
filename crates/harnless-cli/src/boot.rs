@@ -253,7 +253,7 @@ impl BootComposer for DefaultComposer {
         // sessionless, unseeded shape (#69 §2): the reference plan carries no
         // store, so nothing here touches the filesystem unless a caller
         // hands a seed (the durability seam's store-mounted harness does).
-        let fresh = seed.records.is_none() && seed.id_seed == 0 && seed.is_empty();
+        let fresh = seed.is_empty();
         let ctx = Context::root();
         let registry = Arc::new(Registry::new());
         let wiring = self.tools_wiring(doc)?;

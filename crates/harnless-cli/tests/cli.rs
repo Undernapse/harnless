@@ -22,14 +22,19 @@ fn hrls(args: &[&str]) -> Output {
 
 /// A fresh isolated `HOME` for a session-route test that spans several
 /// invocations (mint → list → resume → fork share one store dir).
+///
+/// `mktemp -d` is the collision authority: pid+clock alone can repeat across
+/// parallel test threads on coarse-clock platforms, and a shared dir would
+/// make two tests' session stores interfere.
 fn temp_home() -> std::path::PathBuf {
-    let home = std::env::temp_dir().join(format!(
-        "hrls-home-{}-{}",
-        std::process::id(),
-        std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos()
-    ));
-    std::fs::create_dir_all(&home).unwrap();
-    home
+    let out = Command::new("mktemp")
+        .args(["-d"])
+        .output()
+        .expect("mktemp -d runs");
+    assert!(out.status.success(), "mktemp -d failed");
+    let dir = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 /// Run the binary against a fixed `HOME`, with extra environment.
@@ -386,5 +391,50 @@ fn empty_store_lists_header_only_and_exits_zero() {
     let out = hrls_at(&home, &["sessions", "list"], &[]);
     assert!(out.status.success());
     assert_eq!(stdout(&out), "id\tmodified\tevents\tfirst prompt\n");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+
+#[test]
+fn dump_config_touches_nothing() {
+    // T3's purity half: `--dump-config` is a pure offline operation — no
+    // mkdir, no lock, no open of the store the plan names.
+    let home = temp_home();
+    let out = hrls_at(&home, &["--dump-config"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        !home.join(".harnless").exists(),
+        "the dump must not create the store dir"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn resume_and_fork_cannot_combine() {
+    // T1's flag half: clap rejects the pair before any composition runs.
+    let out = hrls(&["run", "--resume", "1", "--fork", "2", "--", "hi"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("cannot be used with"), "{}", stderr(&out));
+}
+
+#[test]
+fn sessions_list_never_mutates_the_store() {
+    // T6's read-only half: listing reads metadata; the session file's bytes
+    // and mtime ride untouched (a writer's append would move the mtime).
+    let home = temp_home();
+    let id = mint(&home, "hello");
+    let file = home.join(".harnless/sessions").join(format!("{id}.jsonl"));
+    let before = (
+        std::fs::read(&file).unwrap(),
+        file.metadata().unwrap().modified().unwrap(),
+    );
+    let out = hrls_at(&home, &["sessions", "list"], &[]);
+    assert!(out.status.success());
+    let after = (
+        std::fs::read(&file).unwrap(),
+        file.metadata().unwrap().modified().unwrap(),
+    );
+    assert_eq!(before.0, after.0, "list never rewrites bytes");
+    assert_eq!(before.1, after.1, "list never touches the mtime");
     let _ = std::fs::remove_dir_all(&home);
 }

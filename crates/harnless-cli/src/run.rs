@@ -2,12 +2,13 @@
 //!
 //! The runner is the headless entry: mount the profile, append the user
 //! prompt to the session log, drive one [`AgentLoop`] turn through the
-//! composed model, and print the assistant message. A profile with no model
-//! provider is a named `no-model-provider` failure, never a silent empty
-//! turn. A turn that ends in a provider failure is a named `turn-failed`
-//! error carrying the structured cause — the session log keeps the failed
-//! turn's bracket and prompt, and a later turn on the same composition
-//! still runs.
+//! composed model, and print the assistant message. A plan that composes no
+//! model provider is refused by the CLI *before* minting — a
+//! `no-model-provider` failure never leaves a session file behind. A turn
+//! that ends in a provider failure is a named `turn-failed` error carrying
+//! the structured cause — the session log keeps the failed turn's bracket
+//! and prompt, and a later resume replays it and starts the loop clean, so
+//! the next turn appends past the boundary.
 //!
 //! A model-requested tool call executes through the mounted pipeline and
 //! its frozen result lands in the log; the CLI renders tool blocks as

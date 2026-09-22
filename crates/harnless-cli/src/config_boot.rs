@@ -264,7 +264,7 @@ pub fn storage_spec_from_config(config: &serde_yaml::Value) -> Result<StoreSpec,
 }
 
 /// The home directory `${home}` expands to.
-fn default_home() -> Option<String> {
+pub(crate) fn default_home() -> Option<String> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| h.to_string_lossy().into_owned())
