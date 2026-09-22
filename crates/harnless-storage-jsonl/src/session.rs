@@ -312,9 +312,16 @@ impl SessionStore {
     /// unlink the file and its lock sibling. The caller holds no writer (a
     /// mount that took the writer and then failed closed it — the file is
     /// still this boot's orphan), so this is the by-id shape of
-    /// [`SessionWriter::abandon`]. Best-effort: a missing file is success.
+    /// [`SessionWriter::abandon`].
+    ///
+    /// The flock is taken (non-blocking) *before* the unlink: the writer's
+    /// close released it, so a concurrent open may already own the file —
+    /// a held lock refuses the abandon (`session-locked`) rather than
+    /// unlinking under a live writer. A missing file or sibling is success.
     pub fn abandon(&self, id: u64) -> Result<(), SessionError> {
         let path = self.path(id);
+        // Lock-first: if another process holds the session, refuse.
+        let _lock = FileLock::acquire(&path, id, true)?;
         let lock_path = {
             let mut p = path.as_os_str().to_os_string();
             p.push(".lock");
@@ -799,9 +806,24 @@ impl SessionWriter {
             p.push(".lock");
             PathBuf::from(p)
         };
-        std::fs::remove_file(&path)
-            .and_then(|()| std::fs::remove_file(&lock_path))
-            .map_err(|e| SessionError::new("io-error", format!("abandoning session {id}: {e}")))
+        // Same tolerance as [`SessionStore::abandon`]: a missing lock
+        // sibling is success. The lock file is shared state — a failed
+        // `create_new` (lock acquisition after the O_EXCL create) can
+        // leave the session file with no sibling, and the abandon that
+        // cleans the phantom must not abort on its absence.
+        for p in [&path, &lock_path] {
+            match std::fs::remove_file(p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(SessionError::new(
+                        "io-error",
+                        format!("abandoning session {id}: {e}"),
+                    ))
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Append one committed record: a single `write_all(line + "\n")`,

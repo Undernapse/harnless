@@ -797,23 +797,3 @@ fn failed_fresh_mount_abandons_the_mint() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
-
-#[test]
-fn tmp_debug_orphan() {
-    let dir = temp_store("dbg");
-    let doc = support::seam_profile_store(
-        "dbg",
-        Some(std::path::Path::new("/nonexistent/missing-script.json")),
-        &[],
-        Some(&dir),
-    );
-    let opened = open_session(&DefaultComposer, &doc, None, None, None);
-    eprintln!("opened err: {:?}", opened.as_ref().err().map(|e| &e.code));
-    let leftovers: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    eprintln!("leftovers: {leftovers:?}");
-    std::fs::remove_dir_all(&dir).unwrap();
-}

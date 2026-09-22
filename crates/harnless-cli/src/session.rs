@@ -121,6 +121,11 @@ pub fn open_session(
                             let _ = writer.abandon();
                         }
                         None => {
+                            // The writer is gone (a post-mirror failure
+                            // arm closed it), so the flock is free and a
+                            // concurrent open could already own the file.
+                            // `abandon` re-takes the lock first and
+                            // refuses rather than unlink under a writer.
                             let _ = store.abandon(id);
                         }
                     }
@@ -208,6 +213,7 @@ pub fn open_session(
                             let _ = writer.abandon();
                         }
                         None => {
+                            // Lock-first abandon; see the fresh arm.
                             let _ = store.abandon(target);
                         }
                     }
