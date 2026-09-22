@@ -14,25 +14,40 @@ use std::process::{Command, Output};
 /// is durable (#69 §2), and a bare `hrls run` must never write to the
 /// developer's real `~/.harnless` from the test suite.
 fn hrls(args: &[&str]) -> Output {
-    hrls_env(args, &[])
+    let home = temp_home();
+    let out = hrls_at(&home, args, &[]);
+    let _ = std::fs::remove_dir_all(&home);
+    out
 }
 
-/// Run the binary with `args` plus extra environment, in an isolated
-/// `HOME`: the shipped default profile is durable (#69 §2), and the test
-/// suite must never write to the developer's real `~/.harnless`.
-fn hrls_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+/// A fresh isolated `HOME` for a session-route test that spans several
+/// invocations (mint → list → resume → fork share one store dir).
+fn temp_home() -> std::path::PathBuf {
     let home = std::env::temp_dir().join(format!(
         "hrls-home-{}-{}",
         std::process::id(),
         std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&home).unwrap();
+    home
+}
+
+/// Run the binary against a fixed `HOME`, with extra environment.
+fn hrls_at(home: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hrls"));
-    cmd.args(args).env("HOME", &home);
+    cmd.args(args).env("HOME", home);
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let out = cmd.stdin(std::process::Stdio::null()).output().expect("hrls binary runs");
+    cmd.stdin(std::process::Stdio::null())
+        .output()
+        .expect("hrls binary runs")
+}
+
+/// One-shot variant of [`hrls_at`] with a fresh temp `HOME` per call.
+fn hrls_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let home = temp_home();
+    let out = hrls_at(&home, args, env);
     let _ = std::fs::remove_dir_all(&home);
     out
 }
@@ -235,4 +250,141 @@ fn a_declared_tool_boots_and_runs_through_the_binary() {
     let out = hrls(&["run", "--patch", patch.to_str().unwrap(), "--", "call echo"]);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
+}
+
+// The session route at the process boundary (#72's "every CLI doc-claim
+// maps to ≥1 test"): mint line, `sessions list`, resume, fork, and the
+// named integrity refusals — each one a real `hrls` invocation against an
+// isolated `HOME`, never a real spawn race.
+
+/// Mint a fresh session and return its id (the mint line is the id's only
+/// machine-readable surface: stderr, `session: <id>`).
+fn mint(hrls_home: &std::path::Path, prompt: &str) -> String {
+    let out = hrls_at(hrls_home, &["run", "--", prompt], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let line = stderr(&out)
+        .lines()
+        .find(|l| l.starts_with("session: "))
+        .expect("a store-mounted run prints the mint line")
+        .to_string();
+    line["session: ".len()..].to_string()
+}
+
+#[test]
+fn fresh_run_mints_lists_and_resumes() {
+    let home = temp_home();
+    let id = mint(&home, "hello");
+    // The printed id resumes: same id on stderr, exit 0.
+    let out = hrls_at(&home, &["run", "--resume", &id, "--", "again"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains(&format!("session: {id}")),
+        "resume prints the resumed id: {}",
+        stderr(&out)
+    );
+    // `sessions list` sees it, with the first prompt excerpted.
+    let out = hrls_at(&home, &["sessions", "list"], &[]);
+    assert!(out.status.success());
+    let table = stdout(&out);
+    assert!(table.starts_with("id\tmodified\tevents\tfirst prompt\n"));
+    assert!(table.contains(&id), "list must show the minted id:\n{table}");
+    assert!(table.contains("hello"), "list excerpts the first prompt");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn resume_of_a_missing_id_is_a_named_error() {
+    let home = temp_home();
+    let out = hrls_at(&home, &["run", "--resume", "1", "--", "hi"], &[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).starts_with("session-not-found:"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn fork_prints_a_new_id_and_headers_the_source() {
+    let home = temp_home();
+    let source = mint(&home, "origin");
+    let out = hrls_at(&home, &["run", "--fork", &source, "--", "branch"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let target = stderr(&out)
+        .lines()
+        .find(|l| l.starts_with("session: "))
+        .expect("fork prints the target id")["session: ".len()..]
+        .to_string();
+    assert_ne!(target, source, "a fork runs under a new id");
+    // The source is byte-frozen: its file still carries its own header-free
+    // log; the target's file starts with the fork header naming the source.
+    let sessions = home.join(".harnless/sessions");
+    let target_bytes = std::fs::read(sessions.join(format!("{target}.jsonl"))).unwrap();
+    assert!(
+        String::from_utf8_lossy(&target_bytes).starts_with(&format!(
+            "{{\"header\":{{\"forked_from\":\"{source}\"}}}}"
+        )),
+        "the fork file headers the source"
+    );
+    let source_bytes = std::fs::read(sessions.join(format!("{source}.jsonl"))).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&source_bytes).starts_with("{\"header\""),
+        "the source stays byte-frozen"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn held_lock_refuses_with_session_locked() {
+    let home = temp_home();
+    let id = mint(&home, "hello");
+    // A second live holder of the session lock, in-process: the store's own
+    // `FileLock::hold` pins the lock file while the *child* `hrls` observes
+    // the refusal. Single-process by construction (#72's two-process rule).
+    let sessions = home.join(".harnless/sessions");
+    let holder = harnless_storage_jsonl::FileLock::hold(&sessions, id.parse().unwrap())
+        .expect("the test acquires the lock first");
+    let out = hrls_at(&home, &["run", "--resume", &id, "--", "x"], &[]);
+    drop(holder);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).starts_with("session-locked:"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn sessionless_profile_refuses_store_flags_with_storage_not_mounted() {
+    let home = temp_home();
+    let cfg = home.join("cfg");
+    std::fs::create_dir_all(cfg.join("profiles")).unwrap();
+    std::fs::write(
+        cfg.join("profiles/plain.yml"),
+        "name: plain\nbundles: [core]\n",
+    )
+    .unwrap();
+    let out = hrls_at(
+        &home,
+        &["--config", cfg.to_str().unwrap(), "--profile", "plain", "run", "--resume", "1", "--", "hi"],
+        &[],
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).starts_with("storage-not-mounted:"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn empty_store_lists_header_only_and_exits_zero() {
+    let home = temp_home();
+    let out = hrls_at(&home, &["sessions", "list"], &[]);
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "id\tmodified\tevents\tfirst prompt\n");
+    let _ = std::fs::remove_dir_all(&home);
 }

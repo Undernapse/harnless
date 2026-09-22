@@ -35,4 +35,4 @@ mod provider;
 mod session;
 
 pub use provider::{BackendNameExt, JsonlDomain, JsonlStorage};
-pub use session::{Header, LoadReport, SessionError, SessionMeta, SessionStore, SessionWriter, StoredLog};
+pub use session::{FileLock, Header, LoadReport, SessionError, SessionMeta, SessionStore, SessionWriter, StoredLog};

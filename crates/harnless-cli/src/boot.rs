@@ -72,11 +72,17 @@ pub trait BootComposer: Send + Sync + 'static {
     ///
     /// The resume/fork route: the log is seeded from the store's records,
     /// the id allocator floors at the store's max, and a writer mirrors
-    /// every append. The default is [`mount`](Self::mount) — a composer
-    /// that cannot seed says so through the seed's own refusal, never a
-    /// silently unseeded mount: the seam's test harness overrides this.
+    /// every append. A composer that cannot seed refuses a non-empty seed
+    /// by name — never a silently unseeded mount that prints a resume it
+    /// does not perform.
     fn mount_seeded(&self, doc: &ProfileDoc, seed: MountSeed) -> Result<Mounted, CliError> {
-        let _ = seed;
+        if !seed.is_empty() {
+            return Err(CliError::new(
+                "mount-failed",
+                "this composer cannot seed a mount; the resume/fork route \
+                 requires a seeding composer",
+            ));
+        }
         self.mount(doc)
     }
 }
@@ -626,7 +632,7 @@ fn merge_patch(doc: &mut ProfileDoc, patch: &str) -> Result<(), CliError> {
             .as_str()
             .ok_or_else(|| CliError::new("bad-patch", "patch keys must be strings"))?;
         match key_str {
-            "name" | "seams" | "model" | "tools" | "system_prompt" => {}
+            "name" | "seams" | "model" | "tools" | "system_prompt" | "store" => {}
             other => {
                 return Err(CliError::new(
                     "bad-patch",

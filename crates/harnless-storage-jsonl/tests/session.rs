@@ -249,6 +249,50 @@ fn fork_writes_header_seed_boundary_and_freezes_source_bytes() {
 }
 
 #[test]
+fn fork_of_a_non_contiguous_source_refuses_before_minting() {
+    // #67 §5: "a refused fork leaves no orphan". A source that parses but
+    // holds a position gap must refuse at the read, while only the source
+    // lock was ever taken — never a minted target file.
+    let dir = fixture("fork-gap");
+    let store = SessionStore::new(&dir);
+    let gapped = vec![record(0, SessionEvent::TurnOpen), record(2, SessionEvent::TurnClose { reason: TurnEndReason::Completed })];
+    write_lines(&dir, 21, &record_lines(&gapped));
+    let err = store.read_locked(21).unwrap_err();
+    assert_eq!(err.code, "session-corrupt");
+    assert!(err.message.contains("contiguous"), "{err}");
+    // No target was ever created: the dir holds only the source (+ lock).
+    let files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(files.iter().all(|f| f.starts_with("21.")), "{files:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lock_holder_record_is_exactly_the_current_pid() {
+    // The diagnostic half of the lock file: after a second acquisition the
+    // record must still parse as one pid, not a stack of them.
+    let dir = fixture("lockpid");
+    let store = SessionStore::new(&dir);
+    let w1 = store.create_new(31).unwrap();
+    let lock = dir.join("31.jsonl.lock");
+    assert_eq!(
+        std::fs::read_to_string(&lock).unwrap().trim().parse::<u32>().unwrap(),
+        std::process::id()
+    );
+    drop(w1);
+    let w2 = store.open_existing(31).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&lock).unwrap().trim().parse::<u32>().unwrap(),
+        std::process::id()
+    );
+    drop(w2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn list_orders_by_mtime_desc_and_marks_corrupt_files() {
     let dir = fixture("list");
     let store = SessionStore::new(&dir);

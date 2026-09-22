@@ -95,7 +95,12 @@ pub fn open_session(
     store_dir: Option<PathBuf>,
 ) -> Result<SessionMount, CliError> {
     match (resume, fork) {
-        (Some(_), Some(_)) => unreachable!("clap conflicts_with blocks the pair"),
+        // clap's `conflicts_with` blocks the pair in the binary; the library
+        // entry stays panic-free and names the misuse instead.
+        (Some(_), Some(_)) => Err(CliError::new(
+            "usage",
+            "--resume and --fork cannot combine",
+        )),
         (None, None) if doc.store.is_none() && store_dir.is_none() => Ok(SessionMount {
             mounted: composer.mount(doc)?,
             // Sessionless compositions have no id; the caller prints the
@@ -204,9 +209,8 @@ pub fn store_handle(
     store_dir: Option<PathBuf>,
 ) -> Result<std::sync::Arc<SessionStore>, CliError> {
     match (&doc.store, store_dir) {
-        (Some(spec), None) => Ok(std::sync::Arc::new(SessionStore::new(expand_home(
-            &spec.dir,
-        )))),
+        (Some(spec), None) => expand_home(&spec.dir)
+            .map(|dir| std::sync::Arc::new(SessionStore::new(dir))),
         (_, Some(dir)) => Ok(std::sync::Arc::new(SessionStore::new(dir))),
         (None, None) => Err(CliError::new(
             "storage-not-mounted",
@@ -217,11 +221,19 @@ pub fn store_handle(
 }
 
 /// Expand `${home}` in a store dir. The config-boot route expands at compose
-/// time; a raw plan (the seam harness) can still carry the token.
-fn expand_home(dir: &str) -> String {
+/// time; a raw plan (the seam harness) can still carry the token. The token
+/// without a `HOME` is a named failure, never a literal `${home}` directory
+/// — the wrong-dir mount class #69 §3 exists to refuse.
+fn expand_home(dir: &str) -> Result<String, CliError> {
+    if !dir.contains("${home}") {
+        return Ok(dir.to_string());
+    }
     match std::env::var("HOME") {
-        Ok(home) => dir.replace("${home}", &home),
-        Err(_) => dir.to_string(),
+        Ok(home) => Ok(dir.replace("${home}", &home)),
+        Err(_) => Err(CliError::new(
+            "storage-not-mounted",
+            format!("store dir {dir:?} names ${{home}} but HOME is unset"),
+        )),
     }
 }
 

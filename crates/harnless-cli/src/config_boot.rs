@@ -947,6 +947,10 @@ impl ConfigComposer {
                     ) {
                         Ok(mounted) => mounted,
                         Err(err) => {
+                            // Same rule as every other row's failure arm:
+                            // rows mounted before the spine dispose in
+                            // reverse order, never leak onto a context
+                            guard.dispose();
                             return Err(err);
                         }
                     };
@@ -1188,7 +1192,7 @@ impl BootComposer for ConfigComposer {
     fn compose(&self, name: &str, patch: Option<&str>) -> Result<ProfileDoc, CliError> {
         let overlays = parse_overlays(patch)?;
         let doc = self.compose_config(name, &overlays)?;
-        Ok(self.plan(&doc)?)
+        self.plan(&doc)
     }
 
     fn dump(&self, doc: &ProfileDoc) -> String {
@@ -1214,6 +1218,11 @@ impl BootComposer for ConfigComposer {
         // resume's mirroring log and seeded ids cannot share a spine with a
         // fresh or other-session mount (one spine, one log). It therefore
         // bypasses the warm-spine cache entirely and never populates it.
+        // The id allocator's scope is deliberately per-session (#68 §2): a
+        // fresh session's ids legitimately start at 1 even when another
+        // session file already holds 1..n — ids are message identity within
+        // one log, and the store's `max + 1` floor keeps them distinct
+        // *within* the session that continues here.
         let fresh = seed.is_empty();
         // The plan's wiring is computed from the plan alone — the same
         // projection `plan()` publishes — before any lock is taken.
@@ -1233,18 +1242,14 @@ impl BootComposer for ConfigComposer {
         // a patch that moved the store must not reuse a spine whose storage
         // row names another dir — the divergence is loud, never a silent
         // wrong-dir mount.
-        let plan_store_dir = doc
-            .store
-            .as_ref()
-            .map(|spec| {
-                harnless_config::subst::expand(
-                    &serde_yaml::to_value(spec).expect("store spec is plain YAML"),
-                    self.composer.subst(),
-                )
-                .ok()
-                .and_then(|v| v.get("dir").and_then(|d| d.as_str()).map(String::from))
-            })
-            .flatten();
+        let plan_store_dir = doc.store.as_ref().and_then(|spec| {
+            harnless_config::subst::expand(
+                &serde_yaml::to_value(spec).expect("store spec is plain YAML"),
+                self.composer.subst(),
+            )
+            .ok()
+            .and_then(|v| v.get("dir").and_then(|d| d.as_str()).map(String::from))
+        });
         let entry = match stored {
             Some(entry)
                 if entry.name == doc.name && {

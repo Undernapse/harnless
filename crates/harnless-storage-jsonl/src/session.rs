@@ -36,7 +36,7 @@
 //!   maintenance tool.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -142,11 +142,22 @@ pub struct LoadReport {
 
 /// The advisory session lock: `flock(LOCK_EX)` on `<file>.lock`, released on
 /// drop. The `credentials-local::FileLock` shape, copied not shared.
-struct FileLock {
+///
+/// Public so the durability seam's fixtures can hold a session's lock in a
+/// single process (#72's "two-process tests must be single-process
+/// lock-file fixtures, never real spawn races").
+pub struct FileLock {
     _file: File,
 }
 
 impl FileLock {
+    /// Hold session `id`'s lock from `dir` (`<dir>/<id>.jsonl.lock`) in this
+    /// process. The seam fixture's lock-holder; releasing is dropping.
+    pub fn hold(dir: &Path, id: u64) -> Result<Self, SessionError> {
+        let target = dir.join(format!("{id}.jsonl"));
+        Self::acquire(&target, id, true)
+    }
+
     /// Acquire the lock on `<target>.lock`, writing the holder pid after
     /// acquisition. A would-block is `Locked` naming the id and holder pid.
     fn acquire(target: &Path, id: u64, nonblocking: bool) -> Result<Self, SessionError> {
@@ -187,8 +198,15 @@ impl FileLock {
             return Err(would_block(std::io::Error::last_os_error()));
         }
         // The holder record is diagnostic only — flock dies with the process,
-        // so a stale lock cannot exist to be misread.
+        // so a stale lock cannot exist to be misread. The file is truncated
+        // under the held lock so the record is exactly this holder's pid;
+        // appending would stack pids and break `read_holder`'s parse after
+        // the first lock/unlock cycle.
         let mut file = file;
+        // Truncate under the held lock (no race: the lock is ours), then
+        // write. A stale longer content would otherwise leave tail bytes.
+        let _ = file.rewind();
+        let _ = file.set_len(0);
         let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
         let _ = file.flush();
         Ok(Self { _file: file })
@@ -224,6 +242,12 @@ impl SessionStore {
 
     fn path(&self, id: u64) -> PathBuf {
         self.dir.join(format!("{id}.jsonl"))
+    }
+
+    /// The store's session-file path — public so a fixture can name the
+    /// exact file whose lock it holds.
+    pub fn session_path(&self, id: u64) -> PathBuf {
+        self.path(id)
     }
 
     fn create_dir(&self) -> Result<(), SessionError> {
@@ -367,12 +391,31 @@ impl SessionStore {
             ));
         }
         let _lock = FileLock::acquire(&path, id, true)?;
-        self.load(id)?.ok_or_else(|| {
+        let stored = self.load(id)?.ok_or_else(|| {
             SessionError::new(
                 "session-not-found",
                 format!("no session {id} in {}", self.dir.display()),
             )
-        })
+        })?;
+        // Position contiguity is validated *here*, under the source lock and
+        // before any target exists (#67 §5's "a refused fork leaves no
+        // orphan"): a file that parses but holds non-contiguous positions
+        // would otherwise mint a target whose seed the log then refuses.
+        // The store's own writers append positions from `records.len()` and
+        // truncate-to-boundary on repair, so a gap can only come from a
+        // hand-edited file — and the fork route is where it surfaces.
+        if stored
+            .records
+            .iter()
+            .enumerate()
+            .any(|(i, r)| r.position != i)
+        {
+            return Err(SessionError::new(
+                "session-corrupt",
+                format!("session {id}: record positions are not contiguous"),
+            ));
+        }
+        Ok(stored)
     }
 
     /// Mint a fresh session id: `(unix_micros << 20) | rand(20 bits)` (#70 §5
@@ -496,8 +539,13 @@ impl SessionStore {
                     let first = first_prompt_of(&report.records);
                     (Some(report.records.len()), first, false)
                 }
+                // An absent file cannot appear in a directory listing; the
+                // arm exists only because `load_tolerant` speaks in Options.
                 Ok(None) => (None, None, true),
-                Err(e) if e.code == "session-corrupt" => (None, None, true),
+                // #71 §3: a corrupt file is shown, never refused. An io
+                // error (unreadable, EIO) is displayed as corrupt too — the
+                // table's job is "this file's facts are unavailable", and
+                // the two are indistinguishable to a shell reader.
                 Err(_) => (None, None, true),
             };
             out.push(SessionMeta {
@@ -520,16 +568,22 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// A tiny xorshift over the clock + pid. The mint's entropy contract (#70 §5)
-/// is "time-high + random-low, never a clock-only id"; the OS RNG dependency
-/// is not worth a crate edge for 20 bits whose correctness is owned by
-/// `O_EXCL` + flock anyway.
+/// A tiny xorshift over the clock + pid + a per-mint counter. The mint's
+/// entropy contract (#70 §5) is "time-high + random-low, never a clock-only
+/// id"; the OS RNG dependency is not worth a crate edge for 20 bits whose
+/// correctness is owned by `O_EXCL` + flock anyway. The counter makes two
+/// mints in the same nanosecond distinct even when the clock is frozen —
+/// without it, all 8 bounded retries would draw the same id and a coarse
+/// or frozen clock would deterministically exhaust the retry bound.
 fn own_rand() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let mut x = micros ^ ((std::process::id() as u64) << 32) ^ 0x9E3779B97F4A7C15;
+    let tick = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut x =
+        micros ^ ((std::process::id() as u64) << 32) ^ tick.wrapping_mul(0x9E3779B97F4A7C15);
     x ^= x << 13;
     x ^= x >> 7;
     x ^= x << 17;
@@ -565,9 +619,7 @@ fn parse_log(bytes: &[u8], id: u64) -> Result<LoadReport, SessionError> {
     // Split on newlines: a trailing segment after the last newline is the
     // only possible torn tail; every newline-terminated line before it must
     // parse.
-    let mut offset: u64 = 0;
     let lines = bytes.split_inclusive(|b| *b == b'\n');
-    let total = bytes.len() as u64;
     for raw in lines {
         let line_len = raw.len() as u64;
         let terminated = raw.last() == Some(&b'\n');
@@ -575,14 +627,12 @@ fn parse_log(bytes: &[u8], id: u64) -> Result<LoadReport, SessionError> {
         if text.trim().is_empty() {
             if terminated {
                 good_len += line_len;
-                offset += line_len;
             }
             continue;
         }
         if !terminated {
             // Trailing unterminated segment: a crash artifact iff it is the
             // very last segment. Drop it (torn tail), whatever it contains.
-            let _ = offset;
             torn_tail = true;
             break;
         }
@@ -606,7 +656,6 @@ fn parse_log(bytes: &[u8], id: u64) -> Result<LoadReport, SessionError> {
                     })?;
                 header = Some(Header { forked_from: forked });
                 good_len += line_len;
-                offset += line_len;
                 continue;
             }
             return Err(SessionError::new(
@@ -625,9 +674,7 @@ fn parse_log(bytes: &[u8], id: u64) -> Result<LoadReport, SessionError> {
         })?;
         records.push(record);
         good_len += line_len;
-        offset += line_len;
     }
-    let _ = total;
     Ok(LoadReport {
         header,
         records,
