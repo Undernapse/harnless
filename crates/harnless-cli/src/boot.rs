@@ -114,8 +114,8 @@ pub struct Mounted {
     pub _registry: Arc<Registry>,
     /// The composition's disposal owner. A config-boot mount hands the live
     /// spine here, so dropping (or `shutdown`) the `Mounted` unwinds the row
-    /// resources and the spine's fiber; the reference mount's spine is owned
-    /// by its registry and needs no separate handle.
+    /// resources and the spine's fiber; the reference mount hands its own
+    /// spine fiber here.
     pub _spine: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// The composed model provider, if the profile names one.
     pub model: Option<ModelHandle>,
@@ -133,6 +133,10 @@ pub struct Mounted {
     /// provider. `None` is sessionless mode: resume/fork/list fail
     /// `storage-not-mounted`, observable at the field, never inferred.
     pub store: Option<Arc<harnless_storage_jsonl::SessionStore>>,
+    /// A store-mounted composition's mirroring log handle. `Mounted::drop`
+    /// removes the service from the context map (see the `Drop` impl);
+    /// `None` for every sessionless mount.
+    pub(crate) mirror_log: Option<Arc<harnless_agent::session::SessionLog>>,
 }
 
 impl Mounted {
@@ -152,6 +156,20 @@ impl Drop for Mounted {
         // disposal and the spine fiber's unwind. A registry-owned spine
         // (`_spine: None`) has nothing extra to unwind here.
         self._spine = None;
+        // A store-mounted composition: the spine fiber's LIFO unwind removes
+        // the log from the context map, and with the loop's clone gone the
+        // map's boxed log was the mirror writer's last holder — so the
+        // writer drops and the session lock goes with it. That chain only
+        // runs if the fiber actually unwinds. The registry alone does not
+        // unwind its mounted fibers on drop (see `Registry`), so a
+        // store-mounted reference composition disposes the spine fiber
+        // explicitly here; the lock must never outlive the composition.
+        if self.mirror_log.is_some() {
+            for fiber in self._registry.fibers() {
+                fiber.dispose();
+            }
+            self.mirror_log = None;
+        }
     }
 }
 
@@ -258,16 +276,22 @@ impl BootComposer for DefaultComposer {
         let registry = Arc::new(Registry::new());
         let wiring = self.tools_wiring(doc)?;
         let id_seed = seed.id_seed;
-        let (tools, _fiber) = mount_spine(&ctx, &registry, wiring, seed)?;
+        let (tools, fiber, mirror_log) = mount_spine(&ctx, &registry, wiring, seed)?;
         let model = build_adapter(doc)?;
         Ok(Mounted {
             ctx,
             _registry: registry,
-            _spine: None,
+            // The reference mount's disposal owner is its own spine fiber:
+            // dropping (or `shutdown`) the `Mounted` unwinds it, which is
+            // what releases a seeded mount's mirroring writer — and its
+            // session lock. A registry-pinned fiber would keep the mirror
+            // (the log's last handle) alive past the composition's life.
+            _spine: Some(fiber),
             model,
             ids: if fresh { Ids::new() } else { Ids::seeded(id_seed) },
             tools,
             store: None,
+            mirror_log,
         })
     }
 }
@@ -339,6 +363,7 @@ pub(crate) fn mount_spine(
     (
         Option<Arc<harnless_agent::tools::ToolRegistry>>,
         Arc<harnless_runtime::fiber::Fiber>,
+        Option<Arc<harnless_agent::session::SessionLog>>,
     ),
     CliError,
 > {
@@ -380,7 +405,13 @@ pub(crate) fn mount_spine(
         // projected, and the loop keeps today's tool-less shape.
         ToolsWiring::None => None,
     };
-    Ok((tools, fiber))
+    // A store-mounted spine hands `Mounted` the mirroring log handle so its
+    // `Drop` can evict the service from the context map (see `Mounted`'s
+    // `Drop`). Sessionless mounts carry `None`.
+    let mirror_log = ctx
+        .get::<harnless_agent::session::SessionLog>()
+        .filter(|log| log.is_mirrored());
+    Ok((tools, fiber, mirror_log))
 }
 
 /// The mirror half of a store-mounted log (#67 §3): the writer every append

@@ -73,6 +73,13 @@ impl SessionLog {
         self
     }
 
+    /// Whether every append of this log mirrors to a persistence writer
+    /// (#67 §3). The CLI's `Mounted::drop` uses it to decide whether the
+    /// composition owns a mirroring writer whose lock must go with it.
+    pub fn is_mirrored(&self) -> bool {
+        self.mirror.is_some()
+    }
+
     /// The session this log belongs to.
     pub fn session(&self) -> SessionId {
         self.session_id

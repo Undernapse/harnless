@@ -161,6 +161,9 @@ pub struct CompositionMount {
     _registry: Arc<Registry>,
     /// The mount guard that disposes every row resource.
     _guard: harnless_config::MountGuard,
+    /// The mirroring log handle when the spine mounted a store-seeded log;
+    /// `Mounted::drop` evicts the service with it (see `Mounted`'s `Drop`).
+    mirror_log: Option<Arc<harnless_agent::session::SessionLog>>,
 }
 
 /// The plugin registry the config boot mounts through.
@@ -544,9 +547,6 @@ struct Entry {
 ///
 /// The state is **shared** across every `Mounted` of one composition: the
 /// log, event registry, tool pipeline, loop, and id allocator are one per
-/// composition — which is what a multi-turn session is. A caller that needs
-/// ids unique across *compositions* must hold one `Mounted`, not mount
-/// repeatedly.
 pub struct SpineMount {
     pub(crate) ctx: Context,
     pub(crate) registry: Arc<Registry>,
@@ -566,6 +566,10 @@ pub struct SpineMount {
     pub(crate) ids: crate::boot::Ids,
     /// The mounted session store, when a storage row mounted one (#69 §3).
     pub(crate) store: Option<Arc<harnless_storage_jsonl::SessionStore>>,
+    /// The mirroring log handle when the spine mounted a store-seeded log;
+    /// every `Mounted` of this spine carries it so the last drop evicts the
+    /// service (see `Mounted`'s `Drop`).
+    pub(crate) mirror_log: Option<Arc<harnless_agent::session::SessionLog>>,
     guard: Arc<std::sync::Mutex<harnless_config::MountGuard>>,
 }
 
@@ -913,6 +917,7 @@ impl ConfigComposer {
         let mut model: Option<ModelHandle> = None;
         let mut spine_tools: Option<Arc<harnless_agent::tools::ToolRegistry>> = None;
         let mut store: Option<Arc<harnless_storage_jsonl::SessionStore>> = None;
+        let mut spine_mirror_log: Option<Arc<harnless_agent::session::SessionLog>> = None;
         // The wiring is a property of the plan, computed once — the same
         // projection `plan()` publishes, so the mounted loop and the dumped
         // plan cannot disagree about whether tools were declared.
@@ -939,7 +944,7 @@ impl ConfigComposer {
                     // profile that declared tools gets the registry-backed
                     // loop as its `AgentLoop` service.
                     let registry = Arc::new(Registry::new());
-                    let (tools, fiber) = match crate::boot::mount_spine(
+                    let (tools, fiber, mirror_log) = match crate::boot::mount_spine(
                         &ctx,
                         &registry,
                         wiring.clone(),
@@ -968,6 +973,7 @@ impl ConfigComposer {
                     });
                     spine = Some(Arc::clone(&registry));
                     spine_tools = tools;
+                    spine_mirror_log = mirror_log;
                 }
                 // A storage row mounts the session store (#69 §3): pure path
                 // state, dir created lazily at first write — mounting never
@@ -1045,6 +1051,7 @@ impl ConfigComposer {
             tools: spine_tools,
             store,
             _registry: registry,
+            mirror_log: spine_mirror_log,
             // The caller owns the guard: dropping it (or `dispose`) unwinds
             // the row resources. A composition that never hands the guard
             // to a live owner disposes here, not never.
@@ -1085,6 +1092,7 @@ impl ConfigComposer {
             model,
             tools,
             store,
+            mirror_log,
             _registry,
             _guard,
         } = self.mount_config_with_seed(doc, seed)?;
@@ -1111,6 +1119,7 @@ impl ConfigComposer {
         Ok(SpineMount {
             ctx,
             registry: _registry,
+            mirror_log,
             fiber,
             model,
             tools,
@@ -1275,6 +1284,7 @@ impl BootComposer for ConfigComposer {
             // boot either.
             _ => {
                 let out = self.composer.compose(&doc.name, &[]).map_err(cli_error)?;
+                *self.last_warnings.lock() = out.warnings.clone();
                 Entry {
                     name: out.doc.name.clone(),
                     doc: out.doc.clone(),
@@ -1345,6 +1355,7 @@ impl BootComposer for ConfigComposer {
         };
         let ids = spine.ids.clone();
         let store = spine.store.clone();
+        let mirror_log = spine.mirror_log.clone();
         Ok(Mounted {
             ctx: spine.ctx.clone(),
             _registry: Arc::clone(&spine.registry),
@@ -1353,6 +1364,7 @@ impl BootComposer for ConfigComposer {
             model,
             ids,
             store,
+            mirror_log,
         })
     }
 }
