@@ -308,6 +308,33 @@ impl SessionStore {
         }
     }
 
+    /// Abandon a session file this process created but never wrote through:
+    /// unlink the file and its lock sibling. The caller holds no writer (a
+    /// mount that took the writer and then failed closed it — the file is
+    /// still this boot's orphan), so this is the by-id shape of
+    /// [`SessionWriter::abandon`]. Best-effort: a missing file is success.
+    pub fn abandon(&self, id: u64) -> Result<(), SessionError> {
+        let path = self.path(id);
+        let lock_path = {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(".lock");
+            std::path::PathBuf::from(p)
+        };
+        for p in [&path, &lock_path] {
+            match std::fs::remove_file(p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(SessionError::new(
+                        "io-error",
+                        format!("abandoning session {id}: {e}"),
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Create a brand-new session file: `O_EXCL` on the session file (an
     /// existing file is never silently appended-to by a mint), then the
     /// advisory lock. An existing file or a held lock is `session-locked` /
@@ -342,6 +369,7 @@ impl SessionStore {
             file,
             _lock: lock,
             id,
+            dir: self.dir.clone(),
         })
     }
 
@@ -387,6 +415,7 @@ impl SessionStore {
             file,
             _lock: lock,
             id,
+            dir: self.dir.clone(),
         })
     }
 
@@ -732,6 +761,7 @@ pub struct SessionWriter {
     file: File,
     _lock: FileLock,
     id: u64,
+    dir: PathBuf,
 }
 
 impl std::fmt::Debug for SessionWriter {
@@ -746,6 +776,32 @@ impl SessionWriter {
     /// The session id this writer appends to.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Abandon this session: release the lock, then remove the session file
+    /// and its lock sibling. The writer holds the only lock on the id, so
+    /// no concurrent writer can lose appends to the unlink. A caller that
+    /// created a session file and then failed before any composition owned
+    /// it uses this to leave no orphan — #67 §5's "a refused fork leaves no
+    /// orphan" extended to the mount-failure window.
+    pub fn abandon(self) -> Result<(), SessionError> {
+        let Self {
+            file,
+            _lock,
+            id,
+            dir,
+        } = self;
+        drop(file);
+        drop(_lock);
+        let path = dir.join(format!("{id}.jsonl"));
+        let lock_path = {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(".lock");
+            PathBuf::from(p)
+        };
+        std::fs::remove_file(&path)
+            .and_then(|()| std::fs::remove_file(&lock_path))
+            .map_err(|e| SessionError::new("io-error", format!("abandoning session {id}: {e}")))
     }
 
     /// Append one committed record: a single `write_all(line + "\n")`,

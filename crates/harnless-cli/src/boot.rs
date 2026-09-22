@@ -75,15 +75,103 @@ pub trait BootComposer: Send + Sync + 'static {
     /// every append. A composer that cannot seed refuses a non-empty seed
     /// by name — never a silently unseeded mount that prints a resume it
     /// does not perform.
-    fn mount_seeded(&self, doc: &ProfileDoc, seed: MountSeed) -> Result<Mounted, CliError> {
+    ///
+    /// A failure carries back the writer the mount never consumed (see
+    /// [`MountFailure`]): the seed owned it, so only the caller can decide
+    /// whether the session file survives the failed boot.
+    fn mount_seeded(&self, doc: &ProfileDoc, seed: MountSeed) -> Result<Mounted, MountFailure> {
         if !seed.is_empty() {
-            return Err(CliError::new(
+            return Err(MountFailure::from_cli(
                 "mount-failed",
                 "this composer cannot seed a mount; the resume/fork route \
                  requires a seeding composer",
+                seed,
             ));
         }
-        self.mount(doc)
+        self.mount(doc).map_err(|err| {
+            // The sessionless shape has no writer to carry back; the
+            // default seed's slot is empty by construction.
+            MountFailure {
+                err,
+                unconsumed_writer: None,
+            }
+        })
+    }
+}
+
+/// Classify a failed mount's seed: a writer the mount never consumed
+/// rides back to the caller — unless the file is one this boot created,
+/// in which case it is abandoned here (unlock + unlink, no orphan).
+/// A seed whose writer slot is empty had its writer taken by a mount that
+/// then failed *after* taking it; that failure arm already closed it.
+pub(crate) fn take_slot_of(seed: &MountSeed) -> Option<harnless_storage_jsonl::SessionWriter> {
+    let writer = seed.writer.lock().expect("seed lock").take();
+    match writer {
+        Some(writer) if seed.created_by_mount => {
+            let _ = writer.abandon();
+            None
+        }
+        other => other,
+    }
+}
+
+/// The [`take_slot_of`] shape for a seed held in a shared slot (the
+/// config route keeps the seed behind a lock until the mount consumes it).
+pub(crate) fn take_slot(
+    slot: &std::sync::Arc<std::sync::Mutex<Option<MountSeed>>>,
+) -> Option<harnless_storage_jsonl::SessionWriter> {
+    let mut guard = slot.lock().expect("seed slot lock");
+    match guard.as_mut() {
+        Some(seed) => take_slot_of(seed),
+        None => None, // the mount consumed it: a failure arm already ran
+    }
+}
+
+/// A failed seeded mount, plus the session writer the mount never
+/// consumed. A mount that fails *before* its spine took the writer leaves
+/// it in the seed's slot — the lock was never taken, and the file (a mint
+/// or fork target this route just created) is the caller's to abandon. A
+/// mount that fails *after* the spine took it has already closed the
+/// writer (every post-apply failure arm releases the session lock), so the
+/// slot is empty and the writer half is `None`.
+pub struct MountFailure {
+    /// The named boot failure.
+    pub err: CliError,
+    /// The writer the seed still holds, if the mount never reached it.
+    pub unconsumed_writer: Option<harnless_storage_jsonl::SessionWriter>,
+}
+
+impl MountFailure {
+    /// A named failure with no writer to hand back (the mount consumed it,
+    /// or the route never had one).
+    pub(crate) fn carried(
+        err: CliError,
+        unconsumed_writer: Option<harnless_storage_jsonl::SessionWriter>,
+    ) -> Self {
+        Self {
+            err,
+            unconsumed_writer,
+        }
+    }
+
+    /// Wrap a composer's plain failure, recovering whatever the seed's
+    /// slot still holds. A seeding composer whose mount never reached its
+    /// spine leaves the writer there; one that failed after the spine took
+    /// it left the slot empty (the failure arm closed the writer).
+    pub fn from_cli_error(err: CliError, seed: MountSeed) -> Self {
+        Self {
+            err,
+            unconsumed_writer: seed.writer.lock().expect("seed lock").take(),
+        }
+    }
+
+    /// Build a failure that recovers whatever the seed's shared writer
+    /// slot still holds.
+    fn from_cli(code: &'static str, message: impl Into<String>, seed: MountSeed) -> Self {
+        Self {
+            err: CliError::new(code, message),
+            unconsumed_writer: seed.writer.lock().expect("seed lock").take(),
+        }
     }
 }
 
@@ -264,9 +352,10 @@ impl BootComposer for DefaultComposer {
 
     fn mount(&self, doc: &ProfileDoc) -> Result<Mounted, CliError> {
         self.mount_seeded(doc, MountSeed::default())
+            .map_err(|failure| failure.err)
     }
 
-    fn mount_seeded(&self, doc: &ProfileDoc, seed: MountSeed) -> Result<Mounted, CliError> {
+    fn mount_seeded(&self, doc: &ProfileDoc, seed: MountSeed) -> Result<Mounted, MountFailure> {
         // The binary's composition root wires ConfigComposer (see
         // `crate::config_boot`); this body is the minimal reference mount the
         // seam's tests pin — and with the default seed it is exactly the
@@ -276,21 +365,36 @@ impl BootComposer for DefaultComposer {
         let fresh = seed.is_empty();
         let ctx = Context::root();
         let registry = Arc::new(Registry::new());
-        let wiring = self.tools_wiring(doc)?;
+        let wiring = match self.tools_wiring(doc) {
+            Ok(wiring) => wiring,
+            Err(err) => {
+                return Err(MountFailure::carried(err, take_slot_of(&seed)));
+            }
+        };
         let id_seed = seed.id_seed;
-        let (tools, fiber, mirror) = mount_spine(&ctx, &registry, wiring, seed)?;
+        // `mount_spine` borrows the seed: a failure leaves whatever the
+        // mount never consumed in the seed's own slots, and `take_slot`
+        // classifies it (abandon a created file, hand back a resume's
+        // writer) before the error rides back out.
+        let (tools, fiber, mirror) = match mount_spine(&ctx, &registry, wiring, &seed) {
+            Ok(mounted) => mounted,
+            Err(err) => {
+                return Err(MountFailure::carried(err, take_slot_of(&seed)));
+            }
+        };
         let model = match build_adapter(doc) {
             Ok(model) => model,
             Err(err) => {
                 // The spine mounted and took the session lock; the
                 // composition never exists to close it. Unwind the mount
                 // and release the writer — a failed boot unwinds, never
-                // leaks.
+                // leaks. The writer is gone (closed), so nothing rides
+                // back out.
                 drop(fiber);
                 if let Some(mirror) = mirror {
                     mirror.close();
                 }
-                return Err(err);
+                return Err(MountFailure::carried(err, take_slot_of(&seed)));
             }
         };
         Ok(Mounted {
@@ -330,9 +434,18 @@ pub struct MountSeed {
     /// The session writer the log mirrors appends to, when the composition
     /// is store-mounted. The writer holds the session lock for the mount's
     /// life; the mirror owns it and releases it when the composition drops.
-    /// `Mutex` because `Plugin::apply` runs on `&self` (the plugin must be
-    /// `Sync`) and the writer is not `Clone` — the mount takes it once.
-    pub writer: std::sync::Mutex<Option<harnless_storage_jsonl::SessionWriter>>,
+    /// `Arc<Mutex<..>>` because `Plugin::apply` runs on `&self` (the plugin
+    /// must be `Sync`), the writer is not `Clone`, and the slot is *shared*
+    /// between the route and the mount: the mount's plugin takes the writer
+    /// once; a failed apply moves whatever the plugin's slot still holds
+    /// back into this same cell, so the route's failure arm sees the writer
+    /// the mount never consumed.
+    pub writer: std::sync::Arc<std::sync::Mutex<Option<harnless_storage_jsonl::SessionWriter>>>,
+    /// The writer's session file was *created by this boot* (a mint or a
+    /// fork target). If no composition ever owns it, the mount unwinds the
+    /// file with it (#67 §5's no-orphan rule at the mount-failure window);
+    /// a resume's file predates the process and is never abandoned.
+    pub created_by_mount: bool,
 }
 
 impl Default for MountSeed {
@@ -340,10 +453,11 @@ impl Default for MountSeed {
     /// records, no seed, no writer.
     fn default() -> Self {
         Self {
+            created_by_mount: false,
             session: SessionId(1),
             records: None,
             id_seed: 0,
-            writer: std::sync::Mutex::new(None),
+            writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -377,7 +491,7 @@ pub(crate) fn mount_spine(
     ctx: &Context,
     registry: &Arc<Registry>,
     wiring: ToolsWiring,
-    seed: MountSeed,
+    seed: &MountSeed,
 ) -> Result<
     (
         Option<Arc<harnless_agent::tools::ToolRegistry>>,
@@ -407,9 +521,17 @@ pub(crate) fn mount_spine(
             "mount_spine called on a context already under a fiber",
         ));
     }
+    // The plugin's seed shares the route's writer cell (`Arc` clone) but
+    // owns the rest; `apply` consumes it exactly once.
     let spine = Arc::new(SpineWired {
         wiring: wiring.clone(),
-        seed,
+        seed: MountSeed {
+            session: seed.session,
+            records: seed.records.clone(),
+            id_seed: seed.id_seed,
+            writer: Arc::clone(&seed.writer),
+            created_by_mount: seed.created_by_mount,
+        },
         mounted_mirror: std::sync::Mutex::new(None),
     });
     let plugin: Arc<dyn harnless_runtime::plugin::Plugin> = spine.clone();
@@ -422,6 +544,10 @@ pub(crate) fn mount_spine(
         if let Some(mirror) = slot.as_ref() {
             mirror.close();
         }
+        // The guard (if the writer was taken) and the seed slot itself (if
+        // it never was) leave the unconsumed writer in the shared cell the
+        // caller reads — the route's failure arm abandons a created file
+        // or returns a resume's writer.
         CliError::new("mount-failed", format!("{}: {}", e.code, e.message))
     })?;
     let tools = match wiring {
@@ -512,8 +638,10 @@ impl MirroringLog {
 /// to the wrong fiber (or none).
 struct SpineWired {
     wiring: ToolsWiring,
-    /// The mount's seed inputs. The fresh route's defaults keep the mount
-    /// exactly the #64-pinned shape.
+    /// The mount's seed inputs. The writer slot is an `Arc` shared with
+    /// the route's seed: the plugin takes the writer once, and a failed
+    /// apply's rollback lands in the *shared* cell the route reads. The
+    /// fresh route's defaults keep the mount exactly the #64-pinned shape.
     seed: MountSeed,
     /// The mirror the mount installed, written by `apply` and read by
     /// `mount_spine` right after `Registry::mount` returns. Interior
@@ -554,7 +682,30 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
         // hands ownership over by taking it out of the seed. The seed is
         // built per mount and consumed here exactly once, so the interior
         // mutability is never observed.
+        // A mount that fails *after* the writer was taken — and so before
+        // any composition exists to own it — must not strand the session
+        // lock or orphan a file this boot created. Roll the writer back
+        // into the seed slot (the mount's failure path decides its fate)
+        // before propagating.
+        struct WriterGuard<'a> {
+            /// The shared seed slot — the rollback lands in the caller's
+            /// cell, where the route's failure arm reads it.
+            seed: &'a MountSeed,
+            writer: Option<harnless_storage_jsonl::SessionWriter>,
+        }
+        impl Drop for WriterGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(writer) = self.writer.take() {
+                    *self.seed.writer.lock().expect("seed lock") = Some(writer);
+                }
+            }
+        }
         let writer = self.seed.take_writer();
+        let mut guard = WriterGuard {
+            seed: &self.seed,
+            writer,
+        };
+        let writer = guard.writer.take();
         let (log, mirror) = match writer {
             Some(writer) => {
                 let mirror = Arc::new(MirroringLog::new(writer));
@@ -562,11 +713,17 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
             }
             None => (log, None),
         };
-        *self.mounted_mirror.lock().expect("mirror out lock") = mirror;
+        *self.mounted_mirror.lock().expect("mirror out lock") = mirror.clone();
+        // The mirror now owns the writer; disarm the rollback. A later
+        // `apply` failure unwinds the mirror with the fiber's registrations
+        // (its disposer closes the writer), so the lock never strands.
+        drop(guard.writer.take());
         Spine::new(self.seed.session).apply_with_log(ctx, log)?;
         let ToolsWiring::AutoAllow { declared } = &self.wiring else {
+            drop(guard);
             return Ok(());
         };
+        drop(guard);
         let tools = ctx
             .get::<harnless_agent::tools::ToolRegistry>()
             .ok_or_else(|| harnless_runtime::RuntimeError::new("MOUNT", "tool pipeline missing"))?;

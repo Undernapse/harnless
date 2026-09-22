@@ -589,6 +589,16 @@ impl Drop for SpineMount {
     }
 }
 
+thread_local! {
+    /// The spine the most recent *seeded* mount composed. A seeded mount
+    /// is its own composition and is never warm-cached, so a failure after
+    /// the spine mounted (a model the plan cannot build) has no other
+    /// owner to unwind it: the wrapper disposes this spine, releasing the
+    /// session lock the mirror took, before the failure rides back out.
+    static LAST_SEED_SPINE: std::sync::Mutex<Option<std::sync::Weak<SpineMount>>> =
+        const { std::sync::Mutex::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// The spine the most recent test-path `mount` composed or reused —
@@ -907,7 +917,7 @@ impl ConfigComposer {
     pub(crate) fn mount_config_with_seed(
         &self,
         doc: &ConfigDoc,
-        mut seed: crate::boot::MountSeed,
+        seed: crate::boot::MountSeed,
     ) -> Result<CompositionMount, CliError> {
         use harnless_config::doc::{DOC_PLUGIN_PREFIX, SYSTEM_PROMPT_ROW_KEY, TOOLS_ROW_KEY};
         let ctx = Context::root();
@@ -944,21 +954,17 @@ impl ConfigComposer {
                     // profile that declared tools gets the registry-backed
                     // loop as its `AgentLoop` service.
                     let registry = Arc::new(Registry::new());
-                    let (tools, fiber, mirror) = match crate::boot::mount_spine(
-                        &ctx,
-                        &registry,
-                        wiring.clone(),
-                        std::mem::take(&mut seed),
-                    ) {
-                        Ok(mounted) => mounted,
-                        Err(err) => {
-                            // Same rule as every other row's failure arm:
-                            // rows mounted before the spine dispose in
-                            // reverse order, never leak onto a context
-                            guard.dispose();
-                            return Err(err);
-                        }
-                    };
+                    let (tools, fiber, mirror) =
+                        match crate::boot::mount_spine(&ctx, &registry, wiring.clone(), &seed) {
+                            Ok(mounted) => mounted,
+                            Err(err) => {
+                                // Same rule as every other row's failure arm:
+                                // rows mounted before the spine dispose in
+                                // reverse order, never leak onto a context
+                                guard.dispose();
+                                return Err(err);
+                            }
+                        };
                     // The spine's fiber needs an explicit unwind: dropping
                     // the registry does not dispose mounted fibers, so a
                     // later row failure must unmount it or the spine's
@@ -1246,9 +1252,59 @@ impl BootComposer for ConfigComposer {
 
     fn mount(&self, doc: &ProfileDoc) -> Result<Mounted, CliError> {
         self.mount_seeded(doc, crate::boot::MountSeed::default())
+            .map_err(|failure| failure.err)
     }
 
     fn mount_seeded(
+        &self,
+        doc: &ProfileDoc,
+        seed: crate::boot::MountSeed,
+    ) -> Result<Mounted, crate::boot::MountFailure> {
+        // The seed moves into the mount; a failure must hand back whatever
+        // the seed's slot still holds (a mount that never reached its spine
+        // never took the writer — see `MountFailure`).
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(seed)));
+        let seed_for_mount = slot
+            .lock()
+            .expect("seed slot lock")
+            .take()
+            .expect("seed slot fresh");
+        match self.mount_seeded_inner(doc, seed_for_mount) {
+            Ok(mounted) => {
+                LAST_SEED_SPINE.with(|s| {
+                    *s.lock().expect("probe lock") = None;
+                });
+                Ok(mounted)
+            }
+            Err(err) => {
+                // A failure *after* the spine mounted holds the writer in
+                // the live spine, not the slot. Unwind the mount (which
+                // closes the mirror and releases the session lock) before
+                // classifying the slot. Take the entry first, so a
+                // concurrent failure on another thread cannot see it.
+                let spine = LAST_SEED_SPINE.with(|s| {
+                    let mut slot = s.lock().expect("probe lock");
+                    let spine = slot.clone();
+                    *slot = None;
+                    spine
+                });
+                if let Some(spine) = spine.and_then(|w| w.upgrade()) {
+                    spine.dispose();
+                }
+                Err(crate::boot::MountFailure::carried(
+                    err,
+                    crate::boot::take_slot(&slot),
+                ))
+            }
+        }
+    }
+}
+
+impl ConfigComposer {
+    /// The body of [`BootComposer::mount_seeded`], spelled against plain
+    /// `CliError`s; the trait impl wraps a failure with the seed's
+    /// unconsumed writer (see `MountFailure`).
+    fn mount_seeded_inner(
         &self,
         doc: &ProfileDoc,
         seed: crate::boot::MountSeed,
@@ -1327,7 +1383,14 @@ impl BootComposer for ConfigComposer {
         // one session file and its ids floor at that session's max, so it
         // can never share the warm spine — and it never populates the cache.
         let spine = if !fresh {
-            Arc::new(self.mount_spine_for(&entry.doc, wiring, seed)?)
+            let spine = Arc::new(self.mount_spine_for(&entry.doc, wiring, seed)?);
+            // A seeded mount is never warm-cached; keep a weak handle so a
+            // later failure in this body can unwind the live spine (and its
+            // session lock) before the mount is classified as failed. The
+            // wrapper clears the slot on success, so a later failure never
+            // sees an earlier mount's spine.
+            LAST_SEED_SPINE.with(|s| *s.lock().expect("probe lock") = Some(Arc::downgrade(&spine)));
+            spine
         } else {
             match entry.spine.as_ref().and_then(std::sync::Weak::upgrade) {
                 Some(spine) => {

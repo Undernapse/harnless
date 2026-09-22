@@ -727,3 +727,93 @@ fn failed_seeded_mount_releases_the_lock() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn failed_fork_mount_leaves_no_orphan() {
+    // #67 §5's no-orphan rule at the mount-failure window: `create_fork`
+    // writes the target before the composition mounts, so a mount that
+    // fails after it (here: an unreadable replay script) must abandon the
+    // target — otherwise `sessions list` renders a fork that never ran.
+    let dir = temp_store("forkorphan");
+    let store = SessionStore::new(&dir);
+    let source = 606u64;
+    std::fs::write(store.session_path(source), file_fixture_lines()).unwrap();
+
+    let doc = support::seam_profile_store(
+        "forkorphan",
+        Some(std::path::Path::new("/nonexistent/missing-script.json")),
+        &[],
+        Some(&dir),
+    );
+    let opened = open_session(&DefaultComposer, &doc, None, Some(source), None);
+    let err = match opened {
+        Ok(_) => panic!("a missing script must refuse the fork mount"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code, "bad-script");
+    // The store holds exactly the source: no target file, no lock sibling.
+    let ids: Vec<u64> = store.list().iter().map(|m| m.id).collect();
+    assert_eq!(ids, vec![source], "the failed fork left no orphan");
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    // The lock sibling is shared state, not an orphan: `read_locked` (the
+    // fork route's source read) creates it, and it is inert once no
+    // process holds the flock — the next open reuses it. The orphan the
+    // rule forbids is the *session file* (and a created fork target's
+    // pair); the source's lock residue is not one.
+    assert_eq!(
+        leftovers,
+        vec![format!("{source}.jsonl"), format!("{source}.jsonl.lock")],
+        "only the source remains (its lock sibling is inert shared state)"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn failed_fresh_mount_abandons_the_mint() {
+    // The fresh route's mint creates the file before the mount; a failed
+    // mount must leave neither a zero-byte phantom nor a lock sibling.
+    let dir = temp_store("freshorphan");
+
+    let doc = support::seam_profile_store(
+        "freshorphan",
+        Some(std::path::Path::new("/nonexistent/missing-script.json")),
+        &[],
+        Some(&dir),
+    );
+    let opened = open_session(&DefaultComposer, &doc, None, None, None);
+    assert!(opened.is_err(), "the missing script refuses the mount");
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the abandoned mint left {leftovers:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn tmp_debug_orphan() {
+    let dir = temp_store("dbg");
+    let doc = support::seam_profile_store(
+        "dbg",
+        Some(std::path::Path::new("/nonexistent/missing-script.json")),
+        &[],
+        Some(&dir),
+    );
+    let opened = open_session(&DefaultComposer, &doc, None, None, None);
+    eprintln!("opened err: {:?}", opened.as_ref().err().map(|e| &e.code));
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    eprintln!("leftovers: {leftovers:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
