@@ -797,3 +797,100 @@ fn failed_fresh_mount_abandons_the_mint() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// The ConfigComposer (the binary's composition root) route: a seeded mount
+// that fails *after* its spine mounted must unwind the live composition —
+// the registry pins the spine plugin, so the body's Arc drop alone never
+// runs `SpineMount::dispose`, and a live mirror would strand the session
+// lock for the process's life.
+// ---------------------------------------------------------------------------
+
+fn config_store_dir(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("hrls-cfgstore-{tag}-{}", std::process::id()))
+}
+
+fn config_composer_with_store(
+    tag: &str,
+    store_dir: &std::path::Path,
+) -> harnless_cli::config_boot::ConfigComposer {
+    let cfg = std::env::temp_dir().join(format!("hrls-cfg-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cfg);
+    std::fs::create_dir_all(cfg.join("profiles")).unwrap();
+    std::fs::create_dir_all(cfg.join("bundles")).unwrap();
+    // A composed profile whose model row names a corpus that does not
+    // exist: the spine mounts (taking the session lock through the seed's
+    // writer), and `build_adapter` is the failure *after* it — the exact
+    // window the DefaultComposer seam tests pin, on the production route.
+    std::fs::write(
+        cfg.join("profiles").join("p.yml"),
+        format!(
+            "name: p\nrows:\n- id: spine\n  plugin: spine\n- id: model\n  plugin: llm-replay\n  config:\n    kind: replay\n    provider: scripted\n    script: /nonexistent/missing-script.json\n- id: store\n  plugin: storage-jsonl\n  config:\n    dir: {}\n",
+            store_dir.display()
+        ),
+    )
+    .unwrap();
+    harnless_cli::config_boot::ConfigComposer::new(
+        std::sync::Arc::new(harnless_cli::config_boot::LayeredStore::new(Some(cfg))),
+        harnless_cli::config_boot::config::subst::Subst::new(),
+    )
+}
+
+#[test]
+fn config_route_failed_resume_mount_releases_the_lock() {
+    let dir = config_store_dir("resumelock");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = SessionStore::new(&dir);
+    let source = 707u64;
+    std::fs::write(store.session_path(source), file_fixture_lines()).unwrap();
+
+    let composer = config_composer_with_store("resumelock", &dir);
+    // `compose` is the trait method (the binary's route); the trait is in
+    // scope only for this call.
+    use harnless_cli::boot::BootComposer as _;
+    let doc = composer.compose("p", None).expect("profile composes");
+    let opened = super_support_open(&composer, &doc);
+    let err = match opened {
+        Ok(_) => panic!("a missing script must refuse the resume mount"),
+        Err(err) => err,
+    };
+    // The mount reaches the model's script through `build_adapter`; the
+    // named code is the one the adapter's loader gives an unreadable
+    // corpus (the same code the DefaultComposer seam pins).
+    assert!(
+        matches!(err.code, "bad-script" | "plugin-build-failed"),
+        "the mount must refuse at the model, not the lock: {}",
+        err.code
+    );
+
+    // The lock is gone: a fresh open of the same session gets past the
+    // lock and fails at the model again — the point is that taking the
+    // lock is possible at all. The first attempt's `open_existing` repaired
+    // the fixture's torn tail under its lock, so the second attempt loads
+    // cleanly and reaches the model too.
+    let again = super_support_open(&composer, &doc);
+    match again {
+        Ok(_) => panic!("the second mount must fail the same way"),
+        Err(err) => assert!(
+            matches!(err.code, "bad-script" | "plugin-build-failed"),
+            "the second attempt must reach the model too, not the lock: {}",
+            err.code
+        ),
+    }
+    // And the file is untouched: a resume never abandons its session.
+    let ids: Vec<u64> = store.list().iter().map(|m| m.id).collect();
+    assert_eq!(
+        ids,
+        vec![source],
+        "the resume's file survives the failed mount"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn super_support_open(
+    composer: &harnless_cli::config_boot::ConfigComposer,
+    doc: &harnless_cli::profile::ProfileDoc,
+) -> Result<harnless_cli::session::SessionMount, harnless_cli::CliError> {
+    harnless_cli::session::open_session(composer, doc, Some(707), None, None)
+}

@@ -589,6 +589,17 @@ impl Drop for SpineMount {
     }
 }
 
+thread_local! {
+    /// The spine the most recent *seeded* mount composed (never a warm
+    /// reuse). The `mount_seeded` wrapper disposes it when the body fails
+    /// after the spine mounted: the spine's registry entry pins the
+    /// plugin, so the body's `Arc<SpineMount>` drop alone never runs
+    /// `SpineMount::dispose`, and a live mirror would strand the session
+    /// lock for the process's life.
+    static LAST_MOUNTED_SPINE: std::sync::Mutex<std::sync::Weak<SpineMount>> =
+        const { std::sync::Mutex::new(std::sync::Weak::new()) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// The spine the most recent test-path `mount` composed or reused —
@@ -1262,11 +1273,27 @@ impl BootComposer for ConfigComposer {
         match self.mount_seeded_inner(doc, seed_for_mount) {
             Ok(mounted) => Ok(mounted),
             Err(err) => {
-                // A failure after the spine mounted unwinds with the
-                // body's `Arc<SpineMount>` drop (the seeded spine has no
-                // other owner — see `mount_seeded_inner`), which closes
-                // the mirror and releases the session lock. The slot
-                // holds whatever the seed never handed over.
+                // A failure *after* the spine mounted must unwind the live
+                // composition: dropping the body's `Arc<SpineMount>` is
+                // not enough, because the spine's registry entry pins the
+                // plugin (and through it the seed's writer cell), so the
+                // mount's drop never runs. Unmount the fiber (which
+                // unwinds the spine's services and closes the mirror,
+                // releasing the session lock) exactly as
+                // `DefaultComposer::mount_seeded`'s post-spine arm does.
+                // A pre-spine failure leaves the slot full and no spine —
+                // both unwinds are no-ops there.
+                if let Some(spine) =
+                    LAST_MOUNTED_SPINE.with(|s| s.lock().expect("probe lock").upgrade())
+                {
+                    spine.registry.unmount(&spine.fiber);
+                    if let Some(mirror) = spine.mirror.as_ref() {
+                        mirror.close();
+                    }
+                }
+                LAST_MOUNTED_SPINE.with(|s| {
+                    *s.lock().expect("probe lock") = std::sync::Weak::new();
+                });
                 Err(crate::boot::MountFailure::carried(
                     err,
                     crate::boot::take_slot(&slot),
@@ -1436,6 +1463,17 @@ impl ConfigComposer {
         let ids = spine.ids.clone();
         let store = spine.store.clone();
         let mirror = spine.mirror.clone();
+        // Record the mount's spine for the wrapper's failure unwind: a
+        // failure after this point must dispose the live composition (the
+        // registry pins the plugin, so the body's Arc drop alone never
+        // runs `SpineMount::dispose`). A warm-reused spine is already
+        // owned by a live `Mounted` — disposing it here would close a
+        // writer a sibling still needs, so only a *freshly composed*
+        // seeded spine is recorded.
+        if !fresh {
+            LAST_MOUNTED_SPINE
+                .with(|s| *s.lock().expect("probe lock") = std::sync::Arc::downgrade(&spine));
+        }
         Ok(Mounted {
             ctx: spine.ctx.clone(),
             _registry: Arc::clone(&spine.registry),
