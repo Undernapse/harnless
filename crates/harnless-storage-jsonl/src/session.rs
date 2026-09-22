@@ -100,12 +100,9 @@ impl StoredLog {
     /// Whether the loaded records carry at least one seed boundary — the
     /// derived seeding fact (#67): contains-≥1, never a counted marker.
     pub fn is_seeded(&self) -> bool {
-        self.records.iter().any(|r| {
-            matches!(
-                r.event,
-                harnless_agent::events::SessionEvent::SeedBoundary
-            )
-        })
+        self.records
+            .iter()
+            .any(|r| matches!(r.event, harnless_agent::events::SessionEvent::SeedBoundary))
     }
 }
 
@@ -170,7 +167,10 @@ impl FileLock {
             .truncate(false)
             .open(&path)
             .map_err(|e| {
-                SessionError::new("io-error", format!("opening lock file {}: {e}", path.display()))
+                SessionError::new(
+                    "io-error",
+                    format!("opening lock file {}: {e}", path.display()),
+                )
             })?;
         let would_block = |e: std::io::Error| {
             if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
@@ -329,7 +329,10 @@ impl SessionStore {
                         ),
                     )
                 } else {
-                    SessionError::new("io-error", format!("creating session {}: {e}", path.display()))
+                    SessionError::new(
+                        "io-error",
+                        format!("creating session {}: {e}", path.display()),
+                    )
                 }
             })?;
         // The lock is taken after the exclusive create: the create proves
@@ -370,7 +373,10 @@ impl SessionStore {
             _ => None,
         };
         let file = OpenOptions::new().append(true).open(&path).map_err(|e| {
-            SessionError::new("io-error", format!("opening session {} for append: {e}", path.display()))
+            SessionError::new(
+                "io-error",
+                format!("opening session {} for append: {e}", path.display()),
+            )
         })?;
         if let Some(good_len) = torn_len {
             file.set_len(good_len).map_err(|e| {
@@ -439,7 +445,12 @@ impl SessionStore {
     /// one `SeedBoundary`, under the *target's* `O_EXCL` create and lock.
     /// The caller holds the source lock for the read (#67 §5); lock order is
     /// always source-then-target, so no cycle is constructible.
-    pub fn create_fork(&self, target: u64, header: &Header, records: &[CommittedRecord]) -> Result<SessionWriter, SessionError> {
+    pub fn create_fork(
+        &self,
+        target: u64,
+        header: &Header,
+        records: &[CommittedRecord],
+    ) -> Result<SessionWriter, SessionError> {
         let mut writer = self.create_new(target)?;
         // The header line is file-level metadata, not a record.
         let line = format!(
@@ -472,9 +483,9 @@ impl SessionStore {
         // Non-blocking probe: a held lock refuses compaction before any temp
         // write, so a refusal leaves the log untouched by construction.
         let lock = FileLock::acquire(&path, id, true)?;
-        let stored = self.load(id)?.ok_or_else(|| {
-            SessionError::new("session-not-found", format!("no session {id}"))
-        })?;
+        let stored = self
+            .load(id)?
+            .ok_or_else(|| SessionError::new("session-not-found", format!("no session {id}")))?;
         let mut snapshot = String::new();
         if let Some(header) = &stored.header {
             snapshot.push_str(&format!(
@@ -503,7 +514,10 @@ impl SessionStore {
                 })?;
         }
         std::fs::rename(&tmp, &path).map_err(|e| {
-            SessionError::new("io-error", format!("publishing compacted session {id}: {e}"))
+            SessionError::new(
+                "io-error",
+                format!("publishing compacted session {id}: {e}"),
+            )
         })?;
         // The lock file is a sibling; the rename never disturbs it, and the
         // guard releases on return.
@@ -513,6 +527,8 @@ impl SessionStore {
 
     /// List sessions: directory metadata only, tolerant of a corrupt file
     /// (shown, never refused) and of a missing directory (empty list).
+    /// A zero-byte file — a mint that never wrote — is skipped: it has no
+    /// facts to show, and a phantom row would outlive every prune pass.
     /// Ordering is mtime descending (#71 §3).
     pub fn list(&self) -> Vec<SessionMeta> {
         let mut out = Vec::new();
@@ -525,18 +541,30 @@ impl SessionStore {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
+            // A zero-byte session is a mint that never wrote (the route
+            // mounted and ended, or a mint-side failure): it carries no
+            // facts, and a `0 events, - prompt` row would be a phantom.
+            // Skipping it keeps the table's rows real without a prune pass
+            // (retention stays out of scope, #72).
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if metadata.len() == 0 {
+                continue;
+            }
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let Ok(id) = stem.parse::<u64>() else { continue };
-            let mtime_secs = path
-                .metadata()
-                .and_then(|m| {
-                    m.modified().map(|t| {
-                        t.duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0)
-                    })
+            let Ok(id) = stem.parse::<u64>() else {
+                continue;
+            };
+            let mtime_secs = metadata
+                .modified()
+                .map(|t| {
+                    t.duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
                 })
                 .unwrap_or(0);
             let (event_count, first_prompt, corrupt) = match self.load_tolerant(id) {
@@ -644,7 +672,10 @@ fn parse_log(bytes: &[u8], id: u64) -> Result<LoadReport, SessionError> {
         let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
             SessionError::new(
                 "session-corrupt",
-                format!("session {id}: line {} is not a valid record", records.len() + header_line_offset(&header) + 1),
+                format!(
+                    "session {id}: line {} is not a valid record",
+                    records.len() + header_line_offset(&header) + 1
+                ),
             )
         })?;
         if let Some(h) = value.get("header") {
@@ -659,7 +690,9 @@ fn parse_log(bytes: &[u8], id: u64) -> Result<LoadReport, SessionError> {
                             format!("session {id}: line 1 header is malformed"),
                         )
                     })?;
-                header = Some(Header { forked_from: forked });
+                header = Some(Header {
+                    forked_from: forked,
+                });
                 good_len += line_len;
                 continue;
             }

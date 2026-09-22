@@ -73,13 +73,6 @@ impl SessionLog {
         self
     }
 
-    /// Whether every append of this log mirrors to a persistence writer
-    /// (#67 §3). The CLI's `Mounted::drop` uses it to decide whether the
-    /// composition owns a mirroring writer whose lock must go with it.
-    pub fn is_mirrored(&self) -> bool {
-        self.mirror.is_some()
-    }
-
     /// The session this log belongs to.
     pub fn session(&self) -> SessionId {
         self.session_id
@@ -120,10 +113,7 @@ impl SessionLog {
     /// `Err(session-corrupt)` refusal at the seam, never a repaired log.
     /// Appends after seeding continue positions from `records.len()`, so the
     /// contiguity invariant holds across the seed by construction.
-    pub fn seeded(
-        session_id: SessionId,
-        records: Vec<CommittedRecord>,
-    ) -> Result<Self, String> {
+    pub fn seeded(session_id: SessionId, records: Vec<CommittedRecord>) -> Result<Self, String> {
         for (position, record) in records.iter().enumerate() {
             if record.position != position {
                 return Err(format!(
@@ -139,7 +129,6 @@ impl SessionLog {
             mirror: None,
         })
     }
-
 
     /// Read a snapshot of the committed log.
     pub fn snapshot(&self) -> LogSnapshot {
@@ -199,7 +188,6 @@ impl SessionLog {
         records.push(record);
         Ok(())
     }
-
 
     /// Whether the log holds a turn close with
     /// [`TurnEndReason::MaxTokens`](crate::events::TurnEndReason::MaxTokens).
@@ -290,7 +278,6 @@ pub fn max_record_id(records: &[CommittedRecord]) -> u64 {
     }
     max
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -384,7 +371,9 @@ mod tests {
 
     #[test]
     fn max_record_id_scans_every_id_field() {
-        use crate::events::{ChunkRecord, ContentBlock, MessageRecord, ToolCallRecord, ToolResultRecord};
+        use crate::events::{
+            ChunkRecord, ContentBlock, MessageRecord, ToolCallRecord, ToolResultRecord,
+        };
         use harnless_seams::{CallId, MessageId};
         let records = vec![
             CommittedRecord {

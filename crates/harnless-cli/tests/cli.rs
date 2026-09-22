@@ -23,17 +23,16 @@ fn hrls(args: &[&str]) -> Output {
 /// A fresh isolated `HOME` for a session-route test that spans several
 /// invocations (mint → list → resume → fork share one store dir).
 ///
-/// `mktemp -d` is the collision authority: pid+clock alone can repeat across
-/// parallel test threads on coarse-clock platforms, and a shared dir would
-/// make two tests' session stores interfere.
+/// `tempfile` is the collision authority (the workspace's own precedent —
+/// no external `mktemp` spawn, no PATH dependency): pid+clock alone can
+/// repeat across parallel test threads on coarse-clock platforms, and a
+/// shared dir would make two tests' session stores interfere.
 fn temp_home() -> std::path::PathBuf {
-    let out = Command::new("mktemp")
-        .args(["-d"])
-        .output()
-        .expect("mktemp -d runs");
-    assert!(out.status.success(), "mktemp -d failed");
-    let dir = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    std::fs::create_dir_all(&dir).unwrap();
+    let root = tempfile::tempdir().expect("tempdir");
+    // The dir must outlive the test's explicit cleanup, so the guard is
+    // forgotten.
+    let dir = root.path().to_path_buf();
+    std::mem::forget(root);
     dir
 }
 
@@ -85,7 +84,11 @@ fn profile_list_shows_the_built_in_profile() {
 
 #[test]
 fn dump_config_prints_yaml_that_reloads() {
-    let out = hrls_env(&["--dump-config"], &[("HOME", "/tmp/hrls-fixed-home")]);
+    // A unique temp HOME, not a literal /tmp path: the expected store dir
+    // composes from it, so parallel runs and foreign leftovers can't collide.
+    let home = temp_home();
+    let home_str = home.display().to_string();
+    let out = hrls_at(&home, &["--dump-config"], &[]);
     assert!(out.status.success());
     let text = stdout(&out);
     // Valid YAML…
@@ -95,18 +98,19 @@ fn dump_config_prints_yaml_that_reloads() {
     assert_eq!(doc["model"]["kind"].as_str(), Some("replay"));
     // The shipped default is durable (#69 §2): the dump carries the store
     // row, with `${home}` expanded to this process's HOME.
-    let expected_dir = "/tmp/hrls-fixed-home/.harnless/sessions";
-    assert_eq!(doc["store"]["dir"].as_str(), Some(expected_dir));
+    let expected_dir = format!("{home_str}/.harnless/sessions");
+    assert_eq!(doc["store"]["dir"].as_str(), Some(expected_dir.as_str()));
     // …and reparses through the profile loader to an equal document.
     let reparsed = harnless_cli::profile::ProfileDoc::load(&text).expect("dump reloads");
     let mut expected = harnless_cli::profile::ProfileDoc::default_profile();
     expected.seams.push("store".to_string());
     expected.store = Some(harnless_cli::profile::StoreSpec {
-        dir: expected_dir.to_string(),
+        dir: expected_dir.clone(),
     });
     assert_eq!(reparsed, expected);
     // Re-dumping the reloaded document is byte-identical: fixed point.
     assert_eq!(reparsed.dump(), text);
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
@@ -292,7 +296,10 @@ fn fresh_run_mints_lists_and_resumes() {
     assert!(out.status.success());
     let table = stdout(&out);
     assert!(table.starts_with("id\tmodified\tevents\tfirst prompt\n"));
-    assert!(table.contains(&id), "list must show the minted id:\n{table}");
+    assert!(
+        table.contains(&id),
+        "list must show the minted id:\n{table}"
+    );
     assert!(table.contains("hello"), "list excerpts the first prompt");
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -327,9 +334,8 @@ fn fork_prints_a_new_id_and_headers_the_source() {
     let sessions = home.join(".harnless/sessions");
     let target_bytes = std::fs::read(sessions.join(format!("{target}.jsonl"))).unwrap();
     assert!(
-        String::from_utf8_lossy(&target_bytes).starts_with(&format!(
-            "{{\"header\":{{\"forked_from\":\"{source}\"}}}}"
-        )),
+        String::from_utf8_lossy(&target_bytes)
+            .starts_with(&format!("{{\"header\":{{\"forked_from\":\"{source}\"}}}}")),
         "the fork file headers the source"
     );
     let source_bytes = std::fs::read(sessions.join(format!("{source}.jsonl"))).unwrap();
@@ -373,7 +379,17 @@ fn sessionless_profile_refuses_store_flags_with_storage_not_mounted() {
     .unwrap();
     let out = hrls_at(
         &home,
-        &["--config", cfg.to_str().unwrap(), "--profile", "plain", "run", "--resume", "1", "--", "hi"],
+        &[
+            "--config",
+            cfg.to_str().unwrap(),
+            "--profile",
+            "plain",
+            "run",
+            "--resume",
+            "1",
+            "--",
+            "hi",
+        ],
         &[],
     );
     assert!(!out.status.success());
@@ -394,7 +410,6 @@ fn empty_store_lists_header_only_and_exits_zero() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-
 #[test]
 fn dump_config_touches_nothing() {
     // T3's purity half: `--dump-config` is a pure offline operation — no
@@ -414,7 +429,11 @@ fn resume_and_fork_cannot_combine() {
     // T1's flag half: clap rejects the pair before any composition runs.
     let out = hrls(&["run", "--resume", "1", "--fork", "2", "--", "hi"]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("cannot be used with"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("cannot be used with"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]

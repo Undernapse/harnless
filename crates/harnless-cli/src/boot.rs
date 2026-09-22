@@ -22,10 +22,10 @@ use harnless_runtime::plugin::Registry;
 use harnless_seams::SessionId;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use harnless_agent::events::CommittedRecord;
 use crate::model::{build_adapter, ModelHandle};
 use crate::profile::ProfileDoc;
 use crate::CliError;
+use harnless_agent::events::CommittedRecord;
 
 /// The boot seam: compose a profile document, dump it, and mount it.
 ///
@@ -133,10 +133,11 @@ pub struct Mounted {
     /// provider. `None` is sessionless mode: resume/fork/list fail
     /// `storage-not-mounted`, observable at the field, never inferred.
     pub store: Option<Arc<harnless_storage_jsonl::SessionStore>>,
-    /// A store-mounted composition's mirroring log handle. `Mounted::drop`
-    /// removes the service from the context map (see the `Drop` impl);
+    /// A store-mounted composition's mirror handle. `Mounted::drop` closes
+    /// it — the writer (and the session lock) goes with the composition,
+    /// never with a surviving service handle (see the `Drop` impl);
     /// `None` for every sessionless mount.
-    pub(crate) mirror_log: Option<Arc<harnless_agent::session::SessionLog>>,
+    pub(crate) mirror: Option<Arc<MirroringLog>>,
 }
 
 impl Mounted {
@@ -156,19 +157,20 @@ impl Drop for Mounted {
         // disposal and the spine fiber's unwind. A registry-owned spine
         // (`_spine: None`) has nothing extra to unwind here.
         self._spine = None;
-        // A store-mounted composition: the spine fiber's LIFO unwind removes
-        // the log from the context map, and with the loop's clone gone the
-        // map's boxed log was the mirror writer's last holder — so the
-        // writer drops and the session lock goes with it. That chain only
-        // runs if the fiber actually unwinds. The registry alone does not
-        // unwind its mounted fibers on drop (see `Registry`), so a
-        // store-mounted reference composition disposes the spine fiber
-        // explicitly here; the lock must never outlive the composition.
-        if self.mirror_log.is_some() {
+        // A store-mounted composition owns its session writer's release:
+        // closing the mirror takes the writer out and drops it, so the
+        // session lock goes with the composition no matter which service
+        // handles (`Arc<SessionLog>`, `Arc<AgentLoop>`) outlive it — a
+        // surviving handle's next append fails loudly, never silently.
+        // Disposing the registry's fibers first keeps the fiber's LIFO
+        // services (the loop's log clone) from dropping after the writer
+        // is gone; `Fiber::dispose` is idempotent, so a spine that already
+        // unwound via `_spine` is unaffected.
+        if let Some(mirror) = self.mirror.take() {
             for fiber in self._registry.fibers() {
                 fiber.dispose();
             }
-            self.mirror_log = None;
+            mirror.close();
         }
     }
 }
@@ -276,7 +278,7 @@ impl BootComposer for DefaultComposer {
         let registry = Arc::new(Registry::new());
         let wiring = self.tools_wiring(doc)?;
         let id_seed = seed.id_seed;
-        let (tools, fiber, mirror_log) = mount_spine(&ctx, &registry, wiring, seed)?;
+        let (tools, fiber, mirror) = mount_spine(&ctx, &registry, wiring, seed)?;
         let model = build_adapter(doc)?;
         Ok(Mounted {
             ctx,
@@ -288,10 +290,14 @@ impl BootComposer for DefaultComposer {
             // (the log's last handle) alive past the composition's life.
             _spine: Some(fiber),
             model,
-            ids: if fresh { Ids::new() } else { Ids::seeded(id_seed) },
+            ids: if fresh {
+                Ids::new()
+            } else {
+                Ids::seeded(id_seed)
+            },
             tools,
             store: None,
-            mirror_log,
+            mirror,
         })
     }
 }
@@ -363,7 +369,7 @@ pub(crate) fn mount_spine(
     (
         Option<Arc<harnless_agent::tools::ToolRegistry>>,
         Arc<harnless_runtime::fiber::Fiber>,
-        Option<Arc<harnless_agent::session::SessionLog>>,
+        Option<Arc<MirroringLog>>,
     ),
     CliError,
 > {
@@ -388,14 +394,14 @@ pub(crate) fn mount_spine(
             "mount_spine called on a context already under a fiber",
         ));
     }
+    let spine = Arc::new(SpineWired {
+        wiring: wiring.clone(),
+        seed,
+        mounted_mirror: std::sync::Mutex::new(None),
+    });
+    let plugin: Arc<dyn harnless_runtime::plugin::Plugin> = spine.clone();
     let fiber = registry
-        .mount(
-            ctx,
-            Arc::new(SpineWired {
-                wiring: wiring.clone(),
-                seed,
-            }),
-        )
+        .mount(ctx, plugin)
         .map_err(|e| CliError::new("mount-failed", format!("{}: {}", e.code, e.message)))?;
     let tools = match wiring {
         // The registry-backed loop is live: the handle rides on `Mounted` so
@@ -405,13 +411,11 @@ pub(crate) fn mount_spine(
         // projected, and the loop keeps today's tool-less shape.
         ToolsWiring::None => None,
     };
-    // A store-mounted spine hands `Mounted` the mirroring log handle so its
-    // `Drop` can evict the service from the context map (see `Mounted`'s
-    // `Drop`). Sessionless mounts carry `None`.
-    let mirror_log = ctx
-        .get::<harnless_agent::session::SessionLog>()
-        .filter(|log| log.is_mirrored());
-    Ok((tools, fiber, mirror_log))
+    // A store-mounted spine hands `Mounted` the mirror handle so its `Drop`
+    // closes the writer and releases the session lock with the composition
+    // (see `Mounted`'s `Drop`). Sessionless mounts carry `None`.
+    let mirror = spine.mounted_mirror.lock().expect("mirror out lock").take();
+    Ok((tools, fiber, mirror))
 }
 
 /// The mirror half of a store-mounted log (#67 §3): the writer every append
@@ -427,29 +431,47 @@ pub(crate) fn mount_spine(
 /// `SessionLog::append_with`, under the log's lock, so position, mirrored
 /// line, and commit can never interleave.
 ///
-/// The writer holds the session lock for the composition's life; dropping
-/// the mirror (the last handle of the mounted log) releases it.
+/// The writer holds the session lock for the composition's life, and the
+/// composition — not any surviving `Arc<SessionLog>` service handle — owns
+/// its release: `Mounted::drop` calls [`MirroringLog::close`] after the
+/// fiber unwind, which takes the writer out of the mirror and drops it. A
+/// consumer that keeps a log handle past the composition then fails loudly
+/// on append (`writer closed`) instead of keeping the lock alive.
 pub(crate) struct MirroringLog {
-    writer: std::sync::Mutex<harnless_storage_jsonl::SessionWriter>,
+    writer: std::sync::Mutex<Option<harnless_storage_jsonl::SessionWriter>>,
 }
 
 impl MirroringLog {
     /// A mirror that writes each committed record to `writer`.
     pub fn new(writer: harnless_storage_jsonl::SessionWriter) -> Self {
         Self {
-            writer: std::sync::Mutex::new(writer),
+            writer: std::sync::Mutex::new(Some(writer)),
         }
     }
 
     /// The mirror function installed on the mounted log. A mirror failure is
     /// loud — the append fails and the log stays unchanged, never a silently
-    /// unpersisted event.
+    /// unpersisted event. After [`Self::close`] the mirror refuses every
+    /// append the same loud way: the writer is gone.
     pub fn mirror_fn(self: &Arc<Self>) -> Arc<harnless_agent::session::Mirror> {
         let this = Arc::clone(self);
-        Arc::new(move |record| {
-            let mut writer = this.writer.lock().expect("mirror writer lock");
-            writer.append(record).map_err(|e| e.message)
-        })
+        Arc::new(
+            move |record| match &mut *this.writer.lock().expect("mirror writer lock") {
+                Some(writer) => writer.append(record).map_err(|e| e.message),
+                None => Err("session writer closed (the composition ended)".to_string()),
+            },
+        )
+    }
+
+    /// Release the session lock: take the writer out of the mirror and drop
+    /// it. Idempotent — a second call finds `None` and no-ops. The mirror
+    /// closure's `Arc` may still be held by a surviving log handle; it sees
+    /// the taken slot and refuses appends, so a post-composition append is
+    /// a loud failure, never a silently unpersisted event and never a lock
+    /// that outlives its owner.
+    pub fn close(&self) {
+        let writer = self.writer.lock().expect("mirror writer lock").take();
+        drop(writer);
     }
 }
 
@@ -472,6 +494,12 @@ struct SpineWired {
     /// The mount's seed inputs. The fresh route's defaults keep the mount
     /// exactly the #64-pinned shape.
     seed: MountSeed,
+    /// The mirror the mount installed, written by `apply` and read by
+    /// `mount_spine` right after `Registry::mount` returns. Interior
+    /// mutability because `Plugin::apply` runs on `&self`; the mount builds
+    /// the plugin per mount and consumes the slot exactly once, so the
+    /// value is never observed twice.
+    mounted_mirror: std::sync::Mutex<Option<Arc<MirroringLog>>>,
 }
 
 impl harnless_runtime::plugin::Plugin for SpineWired {
@@ -491,9 +519,11 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
         // installs the mirror so every append lands in the session file.
         // The stock `Spine::apply` is this with a fresh, unmirrored log.
         let log = match &self.seed.records {
-            Some(records) => SessionLog::seeded(self.seed.session, records.clone()).map_err(
-                |_| harnless_runtime::RuntimeError::new("MOUNT", "session seed is not contiguous"),
-            )?,
+            Some(records) => {
+                SessionLog::seeded(self.seed.session, records.clone()).map_err(|_| {
+                    harnless_runtime::RuntimeError::new("MOUNT", "session seed is not contiguous")
+                })?
+            }
             None => SessionLog::new(self.seed.session),
         };
         // The store-mounted route installs the mirror on the log *before*
@@ -504,10 +534,14 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
         // built per mount and consumed here exactly once, so the interior
         // mutability is never observed.
         let writer = self.seed.take_writer();
-        let log = match writer {
-            Some(writer) => log.with_mirror(Arc::new(MirroringLog::new(writer)).mirror_fn()),
-            None => log,
+        let (log, mirror) = match writer {
+            Some(writer) => {
+                let mirror = Arc::new(MirroringLog::new(writer));
+                (log.with_mirror(mirror.mirror_fn()), Some(mirror))
+            }
+            None => (log, None),
         };
+        *self.mounted_mirror.lock().expect("mirror out lock") = mirror;
         Spine::new(self.seed.session).apply_with_log(ctx, log)?;
         let ToolsWiring::AutoAllow { declared } = &self.wiring else {
             return Ok(());

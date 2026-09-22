@@ -108,7 +108,10 @@ fn one_record_is_one_line_one_write() {
     drop(writer);
     let bytes = std::fs::read(dir.join("1.jsonl")).unwrap();
     assert_eq!(bytes.last(), Some(&b'\n'));
-    let lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&[u8]> = bytes
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect();
     assert_eq!(lines.len(), 2);
     for line in lines {
         let _: CommittedRecord = serde_json::from_slice(line).unwrap();
@@ -151,14 +154,20 @@ fn torn_tail_loads_tolerantly_and_first_append_truncates() {
     // Hand-tear: append garbage with no trailing newline.
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(b"{\"position\":2,\"time_m").unwrap();
     }
     // Tolerant load returns the good prefix.
     let report = store.load_tolerant(3).unwrap().unwrap();
     assert!(report.torn_tail);
     assert_eq!(report.records, records);
-    assert_eq!(report.good_len, std::fs::metadata(&path).unwrap().len() - 21);
+    assert_eq!(
+        report.good_len,
+        std::fs::metadata(&path).unwrap().len() - 21
+    );
     // Strict load refuses until repaired.
     assert_eq!(store.load(3).unwrap_err().code, "session-corrupt");
     // Opening the mounted writer repairs: truncate to the boundary, then
@@ -255,7 +264,15 @@ fn fork_of_a_non_contiguous_source_refuses_before_minting() {
     // lock was ever taken — never a minted target file.
     let dir = fixture("fork-gap");
     let store = SessionStore::new(&dir);
-    let gapped = vec![record(0, SessionEvent::TurnOpen), record(2, SessionEvent::TurnClose { reason: TurnEndReason::Completed })];
+    let gapped = vec![
+        record(0, SessionEvent::TurnOpen),
+        record(
+            2,
+            SessionEvent::TurnClose {
+                reason: TurnEndReason::Completed,
+            },
+        ),
+    ];
     write_lines(&dir, 21, &record_lines(&gapped));
     let err = store.read_locked(21).unwrap_err();
     assert_eq!(err.code, "session-corrupt");
@@ -279,13 +296,21 @@ fn lock_holder_record_is_exactly_the_current_pid() {
     let w1 = store.create_new(31).unwrap();
     let lock = dir.join("31.jsonl.lock");
     assert_eq!(
-        std::fs::read_to_string(&lock).unwrap().trim().parse::<u32>().unwrap(),
+        std::fs::read_to_string(&lock)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap(),
         std::process::id()
     );
     drop(w1);
     let w2 = store.open_existing(31).unwrap();
     assert_eq!(
-        std::fs::read_to_string(&lock).unwrap().trim().parse::<u32>().unwrap(),
+        std::fs::read_to_string(&lock)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap(),
         std::process::id()
     );
     drop(w2);
@@ -305,7 +330,10 @@ fn list_orders_by_mtime_desc_and_marks_corrupt_files() {
     let torn = write_lines(&dir, 3, &record_lines(&bracket(0)));
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&torn).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&torn)
+            .unwrap();
         f.write_all(b"{\"pos").unwrap();
     }
     // Distinct mtimes so ordering is deterministic without sleeps: set them
@@ -316,15 +344,15 @@ fn list_orders_by_mtime_desc_and_marks_corrupt_files() {
         (dir.join("2.jsonl"), 1_700_000_002),
     ];
     for (path, secs) in times {
-        let file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         unsafe {
-            let timespec = [
-                libc::timespec {
-                    tv_sec: secs as libc::time_t,
-                    tv_nsec: 0,
-                };
-                2
-            ];
+            let timespec = [libc::timespec {
+                tv_sec: secs as libc::time_t,
+                tv_nsec: 0,
+            }; 2];
             libc::futimens(file.as_raw_fd(), timespec.as_ptr());
         }
     }
@@ -337,6 +365,26 @@ fn list_orders_by_mtime_desc_and_marks_corrupt_files() {
     let torn_meta = metas.iter().find(|m| m.id == 3).unwrap();
     assert!(!torn_meta.corrupt);
     assert_eq!(torn_meta.event_count, Some(2));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn list_skips_zero_byte_mints() {
+    // A mint that never wrote (route mounted and ended, or a mint-side
+    // failure) leaves a zero-byte file. It is not a session with facts to
+    // show — the table must not render a phantom row for it.
+    let dir = fixture("list3");
+    let store = SessionStore::new(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    write_lines(&dir, 1, &record_lines(&bracket(0)));
+    std::fs::write(dir.join("2.jsonl"), b"").unwrap();
+    let rows = store.list();
+    let ids: Vec<u64> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        ids,
+        vec![1],
+        "the zero-byte mint is skipped, the real one shown"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -97,10 +97,7 @@ pub fn open_session(
     match (resume, fork) {
         // clap's `conflicts_with` blocks the pair in the binary; the library
         // entry stays panic-free and names the misuse instead.
-        (Some(_), Some(_)) => Err(CliError::new(
-            "usage",
-            "--resume and --fork cannot combine",
-        )),
+        (Some(_), Some(_)) => Err(CliError::new("usage", "--resume and --fork cannot combine")),
         (None, None) if doc.store.is_none() && store_dir.is_none() => Ok(SessionMount {
             mounted: composer.mount(doc)?,
             // Sessionless compositions have no id; the caller prints the
@@ -118,27 +115,16 @@ pub fn open_session(
             // Load first (a clean file or a named refusal), then take the
             // writer: `open_existing` repairs a torn tail under the lock it
             // just took (#70 §3), so the seed and the file agree.
-            let stored = store
-                .load(id)
-                .map_err(session_cli_error)?
-                .ok_or_else(|| {
-                    CliError::new(
-                        "session-not-found",
-                        format!(
-                            "no session {id} in {}",
-                            store.dir().display()
-                        ),
-                    )
-                })?;
+            let stored = store.load(id).map_err(session_cli_error)?.ok_or_else(|| {
+                CliError::new(
+                    "session-not-found",
+                    format!("no session {id} in {}", store.dir().display()),
+                )
+            })?;
             let writer = store.open_existing(id).map_err(session_cli_error)?;
             let max = harnless_agent::session::max_record_id(&stored.records);
-            let mounted = mount_seeded(
-                composer,
-                doc,
-                id,
-                Some((stored.records, max)),
-                Some(writer),
-            )?;
+            let mounted =
+                mount_seeded(composer, doc, id, Some((stored.records, max)), Some(writer))?;
             Ok(SessionMount { mounted, id })
         }
         (None, Some(source)) => {
@@ -209,8 +195,9 @@ pub fn store_handle(
     store_dir: Option<PathBuf>,
 ) -> Result<std::sync::Arc<SessionStore>, CliError> {
     match (&doc.store, store_dir) {
-        (Some(spec), None) => expand_home(&spec.dir)
-            .map(|dir| std::sync::Arc::new(SessionStore::new(dir))),
+        (Some(spec), None) => {
+            expand_home(&spec.dir).map(|dir| std::sync::Arc::new(SessionStore::new(dir)))
+        }
         (_, Some(dir)) => Ok(std::sync::Arc::new(SessionStore::new(dir))),
         (None, None) => Err(CliError::new(
             "storage-not-mounted",
@@ -307,7 +294,10 @@ mod tests {
     #[test]
     fn truncate_marks_overflow() {
         assert_eq!(truncate("hello", 40), "hello");
-        assert_eq!(truncate(&"x".repeat(41), 40), format!("{}…", "x".repeat(40)));
+        assert_eq!(
+            truncate(&"x".repeat(41), 40),
+            format!("{}…", "x".repeat(40))
+        );
         // Char-count: a 40-char cut of a multi-byte string is 40 chars.
         assert_eq!(truncate("héllo wörld", 5), "héllo…");
     }
@@ -315,7 +305,8 @@ mod tests {
     #[test]
     fn mint_retry_bound_is_bounded() {
         // An always-colliding creator exhausts the bound, loudly.
-        let err = mint_with(|_id| Err::<(), _>(SessionError::new("session-locked", "x"))).err()
+        let err = mint_with(|_id| Err::<(), _>(SessionError::new("session-locked", "x")))
+            .err()
             .expect("mint fails");
         assert_eq!(err.code, "session-mint-failed");
         assert!(err.message.contains(&MINT_RETRIES.to_string()));
@@ -332,15 +323,9 @@ mod tests {
     #[test]
     fn sessionless_plan_refuses_store_flags_before_touching_disk() {
         let doc = crate::profile::ProfileDoc::default_profile();
-        let err = open_session(
-            &crate::boot::DefaultComposer,
-            &doc,
-            Some(1),
-            None,
-            None,
-        )
-        .err()
-        .expect("storage-not-mounted");
+        let err = open_session(&crate::boot::DefaultComposer, &doc, Some(1), None, None)
+            .err()
+            .expect("storage-not-mounted");
         assert_eq!(err.code, "storage-not-mounted");
     }
 }

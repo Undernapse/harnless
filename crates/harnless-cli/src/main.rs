@@ -199,7 +199,13 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             let session =
                 harnless_cli::session::open_session(&composer, &doc, *resume, *fork, None)?;
             let stdin = std::io::stdin();
-            repl::repl_named(&session.mounted, session.id, doc.store.is_some(), stdin.lock(), std::io::stdout())
+            repl::repl_named(
+                &session.mounted,
+                session.id,
+                doc.store.is_some(),
+                stdin.lock(),
+                std::io::stdout(),
+            )
         }
         Some(Command::Sessions { action }) => match action {
             // `sessions list` reads the composed plan's store dir — so

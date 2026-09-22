@@ -47,11 +47,7 @@ impl Spine {
     /// tool-less loop all register exactly as `apply` does, on the mount's
     /// fiber, unwinding in the same LIFO order. `apply` is this with its own
     /// fresh log.
-    pub fn apply_with_log(
-        &self,
-        ctx: &Context,
-        log: SessionLog,
-    ) -> Result<()> {
+    pub fn apply_with_log(&self, ctx: &Context, log: SessionLog) -> Result<()> {
         ctx.provide(log)?;
 
         // The tool registry hosts the guarded pipeline's extension points.

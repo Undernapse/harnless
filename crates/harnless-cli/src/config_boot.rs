@@ -28,7 +28,6 @@
 //! routes on: `unknown-profile`, `unknown-bundle`, `unknown-plugin`,
 //! `plugin-build-failed`, `bad-patch`, `unknown-substitution`.
 
-use std::sync::Arc;
 use harnless_config::compose::{Composer, Composition, ProfileStore, Warning};
 use harnless_config::doc::{BundleDoc, ConfigDoc, Layer, ProfileSpec, Row};
 use harnless_config::error::ConfigError;
@@ -36,6 +35,7 @@ use harnless_config::subst::Subst;
 use harnless_config::{MountedResource, PluginRegistry};
 use harnless_runtime::context::Context;
 use harnless_runtime::plugin::Registry;
+use std::sync::Arc;
 
 use crate::boot::{BootComposer, Mounted, ToolsWiring};
 use crate::model::{build_adapter, ModelHandle};
@@ -161,9 +161,9 @@ pub struct CompositionMount {
     _registry: Arc<Registry>,
     /// The mount guard that disposes every row resource.
     _guard: harnless_config::MountGuard,
-    /// The mirroring log handle when the spine mounted a store-seeded log;
+    /// The composition's mirror handle when the spine mounted a store-seeded log;
     /// `Mounted::drop` evicts the service with it (see `Mounted`'s `Drop`).
-    mirror_log: Option<Arc<harnless_agent::session::SessionLog>>,
+    mirror: Option<Arc<crate::boot::MirroringLog>>,
 }
 
 /// The plugin registry the config boot mounts through.
@@ -566,10 +566,10 @@ pub struct SpineMount {
     pub(crate) ids: crate::boot::Ids,
     /// The mounted session store, when a storage row mounted one (#69 §3).
     pub(crate) store: Option<Arc<harnless_storage_jsonl::SessionStore>>,
-    /// The mirroring log handle when the spine mounted a store-seeded log;
+    /// The spine's mirror handle when it mounted a store-seeded log;
     /// every `Mounted` of this spine carries it so the last drop evicts the
     /// service (see `Mounted`'s `Drop`).
-    pub(crate) mirror_log: Option<Arc<harnless_agent::session::SessionLog>>,
+    pub(crate) mirror: Option<Arc<crate::boot::MirroringLog>>,
     guard: Arc<std::sync::Mutex<harnless_config::MountGuard>>,
 }
 
@@ -917,7 +917,7 @@ impl ConfigComposer {
         let mut model: Option<ModelHandle> = None;
         let mut spine_tools: Option<Arc<harnless_agent::tools::ToolRegistry>> = None;
         let mut store: Option<Arc<harnless_storage_jsonl::SessionStore>> = None;
-        let mut spine_mirror_log: Option<Arc<harnless_agent::session::SessionLog>> = None;
+        let mut spine_mirror: Option<Arc<crate::boot::MirroringLog>> = None;
         // The wiring is a property of the plan, computed once — the same
         // projection `plan()` publishes, so the mounted loop and the dumped
         // plan cannot disagree about whether tools were declared.
@@ -944,7 +944,7 @@ impl ConfigComposer {
                     // profile that declared tools gets the registry-backed
                     // loop as its `AgentLoop` service.
                     let registry = Arc::new(Registry::new());
-                    let (tools, fiber, mirror_log) = match crate::boot::mount_spine(
+                    let (tools, fiber, mirror) = match crate::boot::mount_spine(
                         &ctx,
                         &registry,
                         wiring.clone(),
@@ -973,7 +973,7 @@ impl ConfigComposer {
                     });
                     spine = Some(Arc::clone(&registry));
                     spine_tools = tools;
-                    spine_mirror_log = mirror_log;
+                    spine_mirror = mirror;
                 }
                 // A storage row mounts the session store (#69 §3): pure path
                 // state, dir created lazily at first write — mounting never
@@ -982,14 +982,14 @@ impl ConfigComposer {
                 // `${home}/state` expands here exactly as it does in the
                 // dump; an unknown expression is the same named failure.
                 Seam::Storage => {
-                    let config = match harnless_config::subst::expand(&row.config, self.composer.subst())
-                    {
-                        Ok(config) => config,
-                        Err(err) => {
-                            guard.dispose();
-                            return Err(cli_error(err));
-                        }
-                    };
+                    let config =
+                        match harnless_config::subst::expand(&row.config, self.composer.subst()) {
+                            Ok(config) => config,
+                            Err(err) => {
+                                guard.dispose();
+                                return Err(cli_error(err));
+                            }
+                        };
                     match storage_spec_from_config(&config) {
                         Ok(spec) => {
                             store = Some(Arc::new(harnless_storage_jsonl::SessionStore::new(
@@ -1051,7 +1051,7 @@ impl ConfigComposer {
             tools: spine_tools,
             store,
             _registry: registry,
-            mirror_log: spine_mirror_log,
+            mirror: spine_mirror,
             // The caller owns the guard: dropping it (or `dispose`) unwinds
             // the row resources. A composition that never hands the guard
             // to a live owner disposes here, not never.
@@ -1092,7 +1092,7 @@ impl ConfigComposer {
             model,
             tools,
             store,
-            mirror_log,
+            mirror,
             _registry,
             _guard,
         } = self.mount_config_with_seed(doc, seed)?;
@@ -1119,7 +1119,7 @@ impl ConfigComposer {
         Ok(SpineMount {
             ctx,
             registry: _registry,
-            mirror_log,
+            mirror,
             fiber,
             model,
             tools,
@@ -1129,7 +1129,6 @@ impl ConfigComposer {
             guard: Arc::new(std::sync::Mutex::new(_guard)),
         })
     }
-
 }
 
 /// A mounted spine's unwind handle, held as a guard resource.
@@ -1179,10 +1178,7 @@ fn one_row(doc: &ConfigDoc, row: &Row) -> ConfigDoc {
 /// Resolve a configuration document's store dir the way the rows' mount
 /// resolves it (#69 §3): the `storage-jsonl` row's config through the
 /// composer's substitution pass. `None` when the document has no store row.
-fn resolve_store_dir(
-    doc: &ConfigDoc,
-    subst: &harnless_config::subst::Subst,
-) -> Option<String> {
+fn resolve_store_dir(doc: &ConfigDoc, subst: &harnless_config::subst::Subst) -> Option<String> {
     doc.rows
         .iter()
         .find(|r| r.plugin == STORAGE_PLUGIN)
@@ -1222,7 +1218,11 @@ impl BootComposer for ConfigComposer {
         self.mount_seeded(doc, crate::boot::MountSeed::default())
     }
 
-    fn mount_seeded(&self, doc: &ProfileDoc, seed: crate::boot::MountSeed) -> Result<Mounted, CliError> {
+    fn mount_seeded(
+        &self,
+        doc: &ProfileDoc,
+        seed: crate::boot::MountSeed,
+    ) -> Result<Mounted, CliError> {
         // A session-seeded mount (#67 §5) is its *own* composition: a
         // resume's mirroring log and seeded ids cannot share a spine with a
         // fresh or other-session mount (one spine, one log). It therefore
@@ -1355,7 +1355,7 @@ impl BootComposer for ConfigComposer {
         };
         let ids = spine.ids.clone();
         let store = spine.store.clone();
-        let mirror_log = spine.mirror_log.clone();
+        let mirror = spine.mirror.clone();
         Ok(Mounted {
             ctx: spine.ctx.clone(),
             _registry: Arc::clone(&spine.registry),
@@ -1364,7 +1364,7 @@ impl BootComposer for ConfigComposer {
             model,
             ids,
             store,
-            mirror_log,
+            mirror,
         })
     }
 }

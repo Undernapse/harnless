@@ -28,18 +28,15 @@ use harnless_seams::{CallId, ErrorCode, MessageId};
 use harnless_storage_jsonl::{FileLock, Header, SessionError, SessionStore};
 use support::{failing_recording, text_recording, write_corpus};
 
-/// A fresh temp store dir, collision authority `mktemp -d`.
+/// A fresh temp store dir, collision authority `tempfile` (the workspace's
+/// own precedent — no external `mktemp` spawn, no PATH dependency).
 fn temp_store(tag: &str) -> PathBuf {
-    let out = std::process::Command::new("mktemp")
-        .args(["-d"])
-        .output()
-        .expect("mktemp -d runs");
-    assert!(out.status.success(), "mktemp -d failed");
-    let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    // A per-test name suffix keeps a leaked dir attributable; mktemp already
-    // guarantees no collision.
-    let dir = dir.join(tag);
+    let root = tempfile::tempdir().expect("tempdir");
+    // The dir must outlive the test's explicit `remove_dir_all`, so the
+    // guard is forgotten and the cleanup stays the test's own.
+    let dir = root.path().join(tag);
     std::fs::create_dir_all(&dir).unwrap();
+    std::mem::forget(root);
     dir
 }
 
@@ -161,6 +158,11 @@ fn fresh_run_mirrors_the_log_event_for_event() {
     // A fresh file has no header and no boundary.
     assert_eq!(file_header(&SessionStore::new(&dir), route.id), None);
     assert_eq!(boundary_count(&stored), 0);
+    // Release the fixture's own handle before ending the route: the
+    // composition owns the writer's release (its lock goes with the
+    // composition), but the test's handle would otherwise keep the *log*
+    // alive, and a release assertion must not race the fixture itself.
+    drop(log);
     end_route(route);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -203,6 +205,7 @@ fn resume_seeds_verbatim_and_appends_past_the_seed() {
 
     // The next turn appends at positions continuing from the store, and the
     // file grows only at the tail (prefix bytes identical).
+    drop(log);
     drive_turn(&resumed.mounted, "third").unwrap();
     let after = std::fs::read(store.session_path(id)).unwrap();
     assert!(after.starts_with(&before), "resume grows only at the tail");
@@ -218,10 +221,7 @@ fn resume_seeds_verbatim_and_appends_past_the_seed() {
     // onward, contiguous.
     let base = seeded.len();
     assert_eq!(
-        grown[base..]
-            .iter()
-            .map(|r| r.position)
-            .collect::<Vec<_>>(),
+        grown[base..].iter().map(|r| r.position).collect::<Vec<_>>(),
         (base..grown.len()).collect::<Vec<_>>()
     );
     end_route(resumed);
@@ -318,6 +318,7 @@ fn resume_ids_seed_from_store_max_and_never_reuse() {
         .expect("spine provides the log");
     assert_eq!(log.snapshot().records.len(), 7);
     assert_eq!(resumed.mounted.ids.message().0, 59);
+    drop(log);
     end_route(resumed);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -384,6 +385,7 @@ fn resume_after_errored_turn_replays_history_and_starts_clean() {
     let texts = project(&after);
     assert!(texts.contains(&"boom".to_string()));
     assert!(texts.contains(&"recovered".to_string()));
+    drop(grown_log);
     end_route(resumed);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -427,10 +429,7 @@ fn fork_writes_header_seed_boundary_and_freezes_source() {
     // s2 = header(forked_from=s1) + s1's records verbatim + exactly one
     // boundary + the fork's own turns.
     let s2_records = file_records(&store, s2);
-    assert_eq!(
-        file_header(&store, s2),
-        Some(Header { forked_from: s1 })
-    );
+    assert_eq!(file_header(&store, s2), Some(Header { forked_from: s1 }));
     assert_eq!(s2_records[..s1_records.len()], s1_records[..]);
     assert!(matches!(
         s2_records[s1_records.len()].event,
@@ -563,10 +562,7 @@ fn torn_tail_dropped_then_truncated() {
     // The file re-loads clean.
     let loaded = store.load(id).unwrap().unwrap();
     assert_eq!(loaded.records.len(), 2);
-    assert_eq!(
-        loaded.records[0],
-        fixture_record(0, SessionEvent::TurnOpen)
-    );
+    assert_eq!(loaded.records[0], fixture_record(0, SessionEvent::TurnOpen));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -650,9 +646,10 @@ fn mint_collision_refuses_not_interleaves() {
 
 #[test]
 fn mount_seeded_writer_frees_when_the_mount_ends() {
-    // The mirror owns the writer: ending the composition (the binary's
-    // shutdown path) releases the lock — the composition's life == the
-    // lock's life, boot.rs's rule.
+    // The composition owns the writer's release: ending it frees the lock
+    // even while service handles outlive it (boot.rs's rule). The fixture
+    // deliberately keeps both `Arc` handles past the composition — the
+    // exact shape that used to wedge the session file.
     let dir = temp_store("freedrop");
     let store = SessionStore::new(&dir);
     let id = 606u64;
@@ -668,7 +665,31 @@ fn mount_seeded_writer_frees_when_the_mount_ends() {
     .unwrap();
     // While mounted, a second handle refuses.
     assert_eq!(store.open_existing(id).unwrap_err().code, "session-locked");
+    // Hold the log and the loop past the composition's end.
+    let log = route
+        .mounted
+        .ctx
+        .get::<SessionLog>()
+        .expect("spine provides the log");
+    let loop_ = route
+        .mounted
+        .ctx
+        .get::<harnless_agent::loop_::AgentLoop>()
+        .expect("spine provides the loop");
     end_route(route);
+    // The lock is free with both handles still alive…
     drop(store.open_existing(id).unwrap());
+    // …and a surviving handle's append fails loudly, never silently.
+    assert!(
+        !log.append(SessionEvent::UserMessage(MessageRecord {
+            id: MessageId(999),
+            blocks: vec![],
+            provider: None,
+            model: None,
+        })),
+        "a post-composition append must be refused"
+    );
+    drop(loop_);
+    drop(log);
     std::fs::remove_dir_all(&dir).unwrap();
 }

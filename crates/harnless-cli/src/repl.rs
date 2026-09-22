@@ -25,11 +25,7 @@ use crate::CliError;
 /// Returns `Ok(())` on a clean end (EOF or `exit`). A per-turn error is
 /// printed and the session continues — one bad model call never kills the
 /// REPL; only a failed write to the output stream ends it early.
-pub fn repl(
-    mounted: &Mounted,
-    input: impl BufRead,
-    output: impl Write,
-) -> Result<(), CliError> {
+pub fn repl(mounted: &Mounted, input: impl BufRead, output: impl Write) -> Result<(), CliError> {
     repl_named(mounted, 0, false, input, output)
 }
 
