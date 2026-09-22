@@ -9,10 +9,13 @@ rust-version.workspace = true
 [dependencies]
 base64 = "0.22"
 harnless-seams = { path = "../harnless-seams" }
+harnless-agent = { path = "../harnless-agent" }
+libc = "0.2"
 parking_lot = "0.12"
 serde_json = "1"
 
 [dev-dependencies]
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 harnless-conformance = { path = "../harnless-conformance" }

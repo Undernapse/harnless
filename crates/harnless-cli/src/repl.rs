@@ -1,11 +1,13 @@
 //! The interactive REPL entry.
 //!
-//! The REPL composes and mounts a profile once, then reads prompts from
-//! stdin line by line, driving one agent turn per line against the same
-//! live composition — so the session log accumulates across turns exactly
-//! as the headless runner builds it for a single turn. EOF or `exit` ends
-//! the session cleanly: neither opens a turn, and the log ends at the last
-//! completed turn's close. Blank lines are skipped without a turn.
+//! The REPL composes and mounts a profile once (through the session route:
+//! mint, `--resume`, or `--fork`, with the session id named in the banner),
+//! then reads prompts from stdin line by line, driving one agent turn per
+//! line against the same live composition — so the session log accumulates
+//! across turns and mirrors to the session file exactly as the headless
+//! runner builds it for a single turn. EOF or `exit` ends the session
+//! cleanly: neither opens a turn, and the log ends at the last completed
+//! turn's close. Blank lines are skipped without a turn.
 //!
 //! The loop is deliberately dumb: no line editing, no history. The value it
 //! pins is the composition shape — mount once, drive many turns through the
@@ -23,16 +25,26 @@ use crate::CliError;
 /// Returns `Ok(())` on a clean end (EOF or `exit`). A per-turn error is
 /// printed and the session continues — one bad model call never kills the
 /// REPL; only a failed write to the output stream ends it early.
-pub fn repl(
+pub fn repl(mounted: &Mounted, input: impl BufRead, output: impl Write) -> Result<(), CliError> {
+    repl_named(mounted, 0, false, input, output)
+}
+
+/// As [`repl`], with the session banner (#71 §2): a store-mounted session
+/// names its id in the banner slot; a sessionless composition keeps the
+/// generic line.
+pub fn repl_named(
     mounted: &Mounted,
+    id: u64,
+    named: bool,
     input: impl BufRead,
     mut output: impl Write,
 ) -> Result<(), CliError> {
-    writeln!(
-        output,
-        "hrls interactive session — type `exit` or Ctrl-D to end"
-    )
-    .map_err(|e| CliError::new("io-error", e.to_string()))?;
+    let banner = if named {
+        format!("harnless — session {id} (exit or Ctrl-D to end)")
+    } else {
+        "hrls interactive session — type `exit` or Ctrl-D to end".to_string()
+    };
+    writeln!(output, "{banner}").map_err(|e| CliError::new("io-error", e.to_string()))?;
     for line in input.lines() {
         let line = line.map_err(|e| CliError::new("io-error", e.to_string()))?;
         let line = line.trim();

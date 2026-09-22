@@ -28,8 +28,6 @@
 //! routes on: `unknown-profile`, `unknown-bundle`, `unknown-plugin`,
 //! `plugin-build-failed`, `bad-patch`, `unknown-substitution`.
 
-use std::sync::Arc;
-
 use harnless_config::compose::{Composer, Composition, ProfileStore, Warning};
 use harnless_config::doc::{BundleDoc, ConfigDoc, Layer, ProfileSpec, Row};
 use harnless_config::error::ConfigError;
@@ -37,10 +35,11 @@ use harnless_config::subst::Subst;
 use harnless_config::{MountedResource, PluginRegistry};
 use harnless_runtime::context::Context;
 use harnless_runtime::plugin::Registry;
+use std::sync::Arc;
 
 use crate::boot::{BootComposer, Mounted, ToolsWiring};
 use crate::model::{build_adapter, ModelHandle};
-use crate::profile::{ModelSpec, ProfileDoc};
+use crate::profile::{ModelSpec, ProfileDoc, StoreSpec};
 use crate::CliError;
 
 /// The config crate, re-exported so callers (and tests) name composition
@@ -55,6 +54,13 @@ pub const REPLAY_PLUGIN: &str = "llm-replay";
 pub const NO_MODEL_PLUGIN: &str = "none";
 /// The plugin implementing a tool-pipeline row.
 pub const TOOL_PLUGIN: &str = "tool";
+
+/// The session-store plugin row's name (#69 §1).
+pub const STORAGE_PLUGIN: &str = "storage-jsonl";
+
+/// The plan seam a storage row projects to (#69 §1).
+pub const STORAGE_SEAM: &str = "store";
+
 /// The row id the built-in model composition lives under.
 pub const MODEL_ROW: &str = "model";
 
@@ -81,6 +87,9 @@ pub enum Seam {
     Tool,
     /// A plugin the CLI mount does not interpret yet.
     Unknown,
+    /// The session-store row (#69 §1): mounts the session store, projects
+    /// the plan's tail `store:` key.
+    Storage,
 }
 
 /// The plugin-name → [`Seam`] table.
@@ -95,6 +104,7 @@ impl PluginSpecs {
         specs.register(REPLAY_PLUGIN, Seam::Model);
         specs.register(NO_MODEL_PLUGIN, Seam::Model);
         specs.register(TOOL_PLUGIN, Seam::Tool);
+        specs.register(STORAGE_PLUGIN, Seam::Storage);
         specs
     }
 
@@ -145,18 +155,28 @@ pub struct CompositionMount {
     pub model: Option<ModelHandle>,
     /// The mounted tool registry, when the profile's plan declared tools.
     pub tools: Option<Arc<harnless_agent::tools::ToolRegistry>>,
+    /// The mounted session store, when a storage row mounted one (#69 §3).
+    pub store: Option<Arc<harnless_storage_jsonl::SessionStore>>,
     /// The spine's registry — kept alive so its services stay mounted.
     _registry: Arc<Registry>,
     /// The mount guard that disposes every row resource.
     _guard: harnless_config::MountGuard,
+    /// The composition's mirror handle when the spine mounted a store-seeded log;
+    /// `Mounted::drop` evicts the service with it (see `Mounted`'s `Drop`).
+    mirror: Option<Arc<crate::boot::MirroringLog>>,
 }
 
 /// The plugin registry the config boot mounts through.
 ///
 /// Registered out of the box: [`SPINE_PLUGIN`] (mounts the agent spine),
-/// [`REPLAY_PLUGIN`] (composes the network-free replay adapter), and
-/// [`NO_MODEL_PLUGIN`] (a providerless composition). An unregistered plugin
-/// name is a named `unknown-plugin` mount failure, never a skipped row.
+/// [`REPLAY_PLUGIN`] (composes the network-free replay adapter),
+/// [`NO_MODEL_PLUGIN`] (a providerless composition), [`TOOL_PLUGIN`] (plan
+/// content, inert here), and [`STORAGE_PLUGIN`] (the session store's plan
+/// projection; the live *mount* is the CLI's `Seam::Storage` arm, so the
+/// registry entry is the inert placeholder that lets a raw
+/// `harnless_config::mount` of a store-carrying document validate the row).
+/// An unregistered plugin name is a named `unknown-plugin` mount failure,
+/// never a skipped row.
 pub fn default_plugins() -> PluginRegistry {
     let mut registry = PluginRegistry::new();
     registry.register_fn(REPLAY_PLUGIN, |id: &str, config| {
@@ -178,8 +198,16 @@ pub fn default_plugins() -> PluginRegistry {
     // resolves to an inert resource. The tool bodies themselves are
     // registered by `crate::boot::register_builtins` on the spine's
     // pipeline; a declared name with no built-in body is a named mount
-    // failure there, never a silently unregistered tool.
     registry.register_fn(TOOL_PLUGIN, |id: &str, _config| {
+        Ok(InertResource { id: id.to_string() })
+    });
+    // A `storage-jsonl` row is mounted by the CLI's own `Seam::Storage` arm
+    // (#69 §3), not by a resource builder here — but a raw config-crate
+    // mount of a store-carrying document must still *validate* the row, so
+    // the name resolves to an inert placeholder. The config is validated at
+    // build time so a malformed store row fails the same way everywhere.
+    registry.register_fn(STORAGE_PLUGIN, |id: &str, config| {
+        storage_spec_from_config(config).map_err(|e| format!("invalid store row: {e}"))?;
         Ok(InertResource { id: id.to_string() })
     });
     registry
@@ -212,6 +240,7 @@ fn model_plan(id: &str, config: &serde_yaml::Value) -> Result<ProfileDoc, String
         model: model_spec_from_config(config)?,
         tools: Vec::new(),
         system_prompt: String::new(),
+        store: None,
     })
 }
 
@@ -231,8 +260,14 @@ pub fn model_spec_from_config(config: &serde_yaml::Value) -> Result<ModelSpec, S
     serde_yaml::from_value(config.clone()).map_err(|e| format!("invalid model config: {e}"))
 }
 
+/// Parse a storage row's config into the plan's [`StoreSpec`] (#69 §1).
+/// A null config is the authoring error — a store row must name its dir.
+pub fn storage_spec_from_config(config: &serde_yaml::Value) -> Result<StoreSpec, String> {
+    serde_yaml::from_value(config.clone()).map_err(|e| format!("invalid store config: {e}"))
+}
+
 /// The home directory `${home}` expands to.
-fn default_home() -> Option<String> {
+pub(crate) fn default_home() -> Option<String> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| h.to_string_lossy().into_owned())
@@ -294,10 +329,17 @@ pub fn parse_overlays(patch: Option<&str>) -> Result<Vec<Layer>, CliError> {
 /// declaring rows, a profile naming it — which is what lets the default
 /// profile go through the same fold as a user profile instead of a special
 /// case that `--dump-config` could drift from.
+///
+/// Two built-in bundles: `core` (spine + replay model, sessionless) and
+/// `sessions` (#69 §2: the store row the *binary's* default profile names,
+/// `${home}/.harnless/sessions`). The reference `ProfileDoc::default_profile`
+/// stays sessionless — it is the seam-test fixture and must never touch
+/// `$HOME` — while the *composed* default gains durability through the
+/// bundle layer.
 pub struct BuiltInStore;
 
 impl BuiltInStore {
-    /// The `core` bundle: the agent spine plus the replay model.
+    /// The `core` bundle: the agent spine plus the replay model, sessionless.
     pub fn core_bundle() -> BundleDoc {
         BundleDoc {
             name: "core".to_string(),
@@ -312,12 +354,47 @@ impl BuiltInStore {
         }
     }
 
-    /// The built-in `default` profile.
+    /// The `sessions` bundle (#69 §2): the session-store row a user profile
+    /// can name to gain durability — the same row shape the built-in
+    /// `default` profile carries as its own row. Row order is spine-then-
+    /// store, so the store mounts after the spine and a later row's failure
+    /// disposes in reverse mount order with the spine unwinding last.
+    pub fn sessions_bundle() -> BundleDoc {
+        BundleDoc {
+            name: "sessions".to_string(),
+            rows: vec![Row {
+                id: STORAGE_SEAM.to_string(),
+                plugin: STORAGE_PLUGIN.to_string(),
+                config: serde_yaml::to_value(StoreSpec {
+                    dir: "${home}/.harnless/sessions".to_string(),
+                })
+                .expect("store spec is plain YAML"),
+            }],
+        }
+    }
+
+    /// The built-in `default` profile: `core` plus the store row — the
+    /// binary's default is durable (#69 §2). The *reference* plan
+    /// ([`ProfileDoc::default_profile`]) stays sessionless; the composed
+    /// plan gains the tail `store:` key through this profile row.
+    ///
+    /// The store row rides the profile's own rows, not a bundle: a bundle
+    /// layer folds as a whole and a profile's rows layer above every bundle,
+    /// so the row cannot be shadowed away by a `core`-only fold — and
+    /// `LayeredStore`'s same-name shadowing still lets a user directory
+    /// replace the whole `default` profile.
     pub fn default_profile() -> ProfileSpec {
         ProfileSpec {
             name: "default".to_string(),
             bundles: vec!["core".to_string()],
-            rows: Vec::new(),
+            rows: vec![Row {
+                id: STORAGE_SEAM.to_string(),
+                plugin: STORAGE_PLUGIN.to_string(),
+                config: serde_yaml::to_value(StoreSpec {
+                    dir: "${home}/.harnless/sessions".to_string(),
+                })
+                .expect("store spec is plain YAML"),
+            }],
             patch: Vec::new(),
             system_prompt: Some(ProfileDoc::default_profile().system_prompt),
             model: None,
@@ -331,7 +408,7 @@ impl BuiltInStore {
 
     /// Every built-in bundle.
     pub fn bundles() -> Vec<BundleDoc> {
-        vec![Self::core_bundle()]
+        vec![Self::core_bundle(), Self::sessions_bundle()]
     }
 }
 
@@ -451,6 +528,11 @@ struct Entry {
     name: String,
     doc: ConfigDoc,
     spine: Option<std::sync::Weak<SpineMount>>,
+    /// The store dir the cached composition's rows mounted, resolved. The
+    /// warm reuse must agree with the plan it is handed (#69 §3): a patch
+    /// that moved the store cannot reuse a spine whose storage row names
+    /// another dir.
+    store_dir: Option<String>,
 }
 
 /// A live spine composition: the mounted context, its registry, the model
@@ -465,15 +547,12 @@ struct Entry {
 ///
 /// The state is **shared** across every `Mounted` of one composition: the
 /// log, event registry, tool pipeline, loop, and id allocator are one per
-/// composition — which is what a multi-turn session is. A caller that needs
-/// ids unique across *compositions* must hold one `Mounted`, not mount
-/// repeatedly.
 pub struct SpineMount {
-    ctx: Context,
-    registry: Arc<Registry>,
+    pub(crate) ctx: Context,
+    pub(crate) registry: Arc<Registry>,
     fiber: Arc<harnless_runtime::Fiber>,
-    model: Option<ModelHandle>,
-    tools: Option<Arc<harnless_agent::tools::ToolRegistry>>,
+    pub(crate) model: Option<ModelHandle>,
+    pub(crate) tools: Option<Arc<harnless_agent::tools::ToolRegistry>>,
     /// The wiring the spine was mounted with — the plan's tool declarations
     /// it implements. A warm reuse must agree with the plan on this axis
     /// (see [`ConfigComposer::mount`]); disagreement is a named failure,
@@ -484,7 +563,13 @@ pub struct SpineMount {
     /// counter, so ids stay unique across turns and mounts of the same
     /// session. The log's positions and the loop's ids share no allocator,
     /// so this is the only cross-mount identity source.
-    ids: crate::boot::Ids,
+    pub(crate) ids: crate::boot::Ids,
+    /// The mounted session store, when a storage row mounted one (#69 §3).
+    pub(crate) store: Option<Arc<harnless_storage_jsonl::SessionStore>>,
+    /// The spine's mirror handle when it mounted a store-seeded log;
+    /// every `Mounted` of this spine carries it so the last drop evicts the
+    /// service (see `Mounted`'s `Drop`).
+    pub(crate) mirror: Option<Arc<crate::boot::MirroringLog>>,
     guard: Arc<std::sync::Mutex<harnless_config::MountGuard>>,
 }
 
@@ -658,6 +743,7 @@ impl ConfigComposer {
             name: out.doc.name.clone(),
             doc: out.doc.clone(),
             spine: None,
+            store_dir: None,
         });
         Ok(out)
     }
@@ -683,6 +769,7 @@ impl ConfigComposer {
         let mut seams = Vec::new();
         let mut tools = Vec::new();
         let mut model = ModelSpec::None;
+        let mut store: Option<StoreSpec> = None;
         // A field-wise patch's `system_prompt:` outranks the profile's own
         // document field, exactly as a later row outranks an earlier one.
         let mut system_prompt = doc.system_prompt.clone();
@@ -753,6 +840,25 @@ impl ConfigComposer {
                     })?;
                 }
                 Seam::Tool => tools.push(tool_name(row)),
+                // A storage row projects exactly one plan entry: the plan's
+                // tail `store:` key (#69 §1). A second storage row is the
+                // authoring error — the plan names one store, and a silent
+                // last-row-wins would diverge the dump from what mounts.
+                Seam::Storage => {
+                    if store.is_some() {
+                        return Err(CliError::new(
+                            "plugin-build-failed",
+                            format!("store row {:?}: the plan names one store", row.id),
+                        ));
+                    }
+                    store = Some(storage_spec_from_config(&row.config).map_err(|e| {
+                        CliError::new(
+                            "plugin-build-failed",
+                            format!("store row {:?}: {e}", row.id),
+                        )
+                    })?);
+                    seams.push(STORAGE_SEAM.to_string());
+                }
                 Seam::Unknown => {}
             }
         }
@@ -762,6 +868,7 @@ impl ConfigComposer {
             model,
             tools,
             system_prompt: system_prompt.unwrap_or_default(),
+            store,
         })
     }
 
@@ -789,6 +896,19 @@ impl ConfigComposer {
     /// unwinds (dropping the registry alone does not dispose fibers) — so a
     /// failed boot leaves no half-mounted service holding a context.
     pub fn mount_config(&self, doc: &ConfigDoc) -> Result<CompositionMount, CliError> {
+        self.mount_config_with_seed(doc, crate::boot::MountSeed::default())
+    }
+
+    /// [`mount_config`](Self::mount_config) with the spine mounted from
+    /// `seed` (#67 §5): the resume/fork route's spine is seeded — stored
+    /// records, id floor, mirroring writer — while the model/tool rows stay
+    /// sessionless. The spine row's mount consumes the seed exactly once;
+    /// the fresh shape (default seed) is byte-identical to the #64 route.
+    pub(crate) fn mount_config_with_seed(
+        &self,
+        doc: &ConfigDoc,
+        mut seed: crate::boot::MountSeed,
+    ) -> Result<CompositionMount, CliError> {
         use harnless_config::doc::{DOC_PLUGIN_PREFIX, SYSTEM_PROMPT_ROW_KEY, TOOLS_ROW_KEY};
         let ctx = Context::root();
         let mut guard = harnless_config::MountGuard::new();
@@ -796,6 +916,8 @@ impl ConfigComposer {
         let mut spine_unwind: Option<SpineUnwind> = None;
         let mut model: Option<ModelHandle> = None;
         let mut spine_tools: Option<Arc<harnless_agent::tools::ToolRegistry>> = None;
+        let mut store: Option<Arc<harnless_storage_jsonl::SessionStore>> = None;
+        let mut spine_mirror: Option<Arc<crate::boot::MirroringLog>> = None;
         // The wiring is a property of the plan, computed once — the same
         // projection `plan()` publishes, so the mounted loop and the dumped
         // plan cannot disagree about whether tools were declared.
@@ -822,14 +944,21 @@ impl ConfigComposer {
                     // profile that declared tools gets the registry-backed
                     // loop as its `AgentLoop` service.
                     let registry = Arc::new(Registry::new());
-                    let (tools, fiber) =
-                        match crate::boot::mount_spine(&ctx, &registry, wiring.clone()) {
-                            Ok(mounted) => mounted,
-                            Err(err) => {
-                                guard.dispose();
-                                return Err(err);
-                            }
-                        };
+                    let (tools, fiber, mirror) = match crate::boot::mount_spine(
+                        &ctx,
+                        &registry,
+                        wiring.clone(),
+                        std::mem::take(&mut seed),
+                    ) {
+                        Ok(mounted) => mounted,
+                        Err(err) => {
+                            // Same rule as every other row's failure arm:
+                            // rows mounted before the spine dispose in
+                            // reverse order, never leak onto a context
+                            guard.dispose();
+                            return Err(err);
+                        }
+                    };
                     // The spine's fiber needs an explicit unwind: dropping
                     // the registry does not dispose mounted fibers, so a
                     // later row failure must unmount it or the spine's
@@ -844,6 +973,49 @@ impl ConfigComposer {
                     });
                     spine = Some(Arc::clone(&registry));
                     spine_tools = tools;
+                    spine_mirror = mirror;
+                }
+                // A storage row mounts the session store (#69 §3): pure path
+                // state, dir created lazily at first write — mounting never
+                // touches the filesystem. The row's config rides the same
+                // substitution pass every other row's config gets, so
+                // `${home}/state` expands here exactly as it does in the
+                // dump; an unknown expression is the same named failure.
+                Seam::Storage => {
+                    let config =
+                        match harnless_config::subst::expand(&row.config, self.composer.subst()) {
+                            Ok(config) => config,
+                            Err(err) => {
+                                guard.dispose();
+                                if let Some(mirror) = spine_mirror.take() {
+                                    // The spine mounted and took the session lock; no
+                                    // composition ever owns it. A failed boot unwinds,
+                                    // never leaks.
+                                    mirror.close();
+                                }
+                                return Err(cli_error(err));
+                            }
+                        };
+                    match storage_spec_from_config(&config) {
+                        Ok(spec) => {
+                            store = Some(Arc::new(harnless_storage_jsonl::SessionStore::new(
+                                spec.dir,
+                            )))
+                        }
+                        Err(e) => {
+                            guard.dispose();
+                            if let Some(mirror) = spine_mirror.take() {
+                                // The spine mounted and took the session lock; no
+                                // composition ever owns it. A failed boot unwinds,
+                                // never leaks.
+                                mirror.close();
+                            }
+                            return Err(CliError::new(
+                                "plugin-build-failed",
+                                format!("store row {:?}: {e}", row.id),
+                            ));
+                        }
+                    }
                 }
                 Seam::Model | Seam::Tool | Seam::Unknown => {
                     match harnless_config::mount(&one_row(doc, row), &self.plugins) {
@@ -859,6 +1031,12 @@ impl ConfigComposer {
                         }
                         Err(err) => {
                             guard.dispose();
+                            if let Some(mirror) = spine_mirror.take() {
+                                // The spine mounted and took the session lock; no
+                                // composition ever owns it. A failed boot unwinds,
+                                // never leaks.
+                                mirror.close();
+                            }
                             return Err(cli_error(err));
                         }
                     }
@@ -869,7 +1047,6 @@ impl ConfigComposer {
         // teardown disposes every row resource before the spine's fiber
         // unwinds (the documented reverse-mount-order rule). The push is
         // deliberately post-loop: the in-loop error paths already `dispose`
-        // the guard, so `MountGuard::push`'s disposed-guard branch stays
         // belt-and-braces here rather than a live path.
         if let Some(unwind) = spine_unwind {
             guard.push(Box::new(unwind));
@@ -881,6 +1058,12 @@ impl ConfigComposer {
         // declared", not "the spine row was missing".
         if !matches!(wiring, crate::boot::ToolsWiring::None) && spine_tools.is_none() {
             guard.dispose();
+            if let Some(mirror) = spine_mirror.take() {
+                // The spine mounted and took the session lock; no
+                // composition ever owns it. A failed boot unwinds,
+                // never leaks.
+                mirror.close();
+            }
             return Err(CliError::new(
                 "mount-failed",
                 "the plan declared tools but no spine row mounted a tool pipeline",
@@ -890,7 +1073,9 @@ impl ConfigComposer {
             ctx,
             model,
             tools: spine_tools,
+            store,
             _registry: registry,
+            mirror: spine_mirror,
             // The caller owns the guard: dropping it (or `dispose`) unwinds
             // the row resources. A composition that never hands the guard
             // to a live owner disposes here, not never.
@@ -900,22 +1085,41 @@ impl ConfigComposer {
 
     /// Mount a composition and capture its spine as a reusable handle.
     ///
-    /// The returned `SpineMount` owns the disposal chain: dropping the last
-    /// handle unwinds the row resources and the spine's fiber. A `mount`
-    /// through the seam reuses the live handle stored on the entry rather
-    /// than mounting a second spine.
+    /// The seed threads through to the spine row's mount (#67 §5).
     pub(crate) fn mount_spine_for(
         &self,
         doc: &ConfigDoc,
         wiring: ToolsWiring,
+        seed: crate::boot::MountSeed,
     ) -> Result<SpineMount, CliError> {
+        // The spine row's mount consumes the seed exactly once (#67 §5): the
+        // resume/fork route's spine is seeded — stored records, id floor,
+        // mirroring writer — while the model/tool rows stay sessionless.
+        // The plan's rows must carry a spine row for the seed to reach the
+        // spine at all; a seed with no spine row is a named failure, never a
+        // silently unseeded mount.
+        if !seed.is_empty()
+            && !doc
+                .rows
+                .iter()
+                .any(|r| self.specs.seam(&r.plugin) == Seam::Spine)
+        {
+            return Err(CliError::new(
+                "mount-failed",
+                "a session-seeded mount requires a document with a spine row",
+            ));
+        }
+        // The id floor is read before the mount consumes the seed.
+        let id_seed = seed.id_seed;
         let CompositionMount {
             ctx,
             model,
             tools,
+            store,
+            mut mirror,
             _registry,
             _guard,
-        } = self.mount_config(doc)?;
+        } = self.mount_config_with_seed(doc, seed)?;
         // The spine is the only plugin this composition mounts through this
         // registry — model/tool rows mount through their own guards, never
         // here — so the registry's last fiber *is* the spine's. No spine
@@ -930,6 +1134,12 @@ impl ConfigComposer {
                 // boot unwinds, never leaks.
                 let mut guard = _guard;
                 guard.dispose();
+                if let Some(mirror) = mirror.take() {
+                    // The spine mounted and took the session lock; no
+                    // composition ever owns it. A failed boot unwinds,
+                    // never leaks.
+                    mirror.close();
+                }
                 return Err(CliError::new(
                     "mount-failed",
                     "composition mounted no spine fiber",
@@ -939,11 +1149,13 @@ impl ConfigComposer {
         Ok(SpineMount {
             ctx,
             registry: _registry,
+            mirror,
             fiber,
             model,
             tools,
             wiring,
-            ids: crate::boot::Ids::new(),
+            ids: crate::boot::Ids::seeded(id_seed),
+            store,
             guard: Arc::new(std::sync::Mutex::new(_guard)),
         })
     }
@@ -993,6 +1205,20 @@ fn one_row(doc: &ConfigDoc, row: &Row) -> ConfigDoc {
     }
 }
 
+/// Resolve a configuration document's store dir the way the rows' mount
+/// resolves it (#69 §3): the `storage-jsonl` row's config through the
+/// composer's substitution pass. `None` when the document has no store row.
+fn resolve_store_dir(doc: &ConfigDoc, subst: &harnless_config::subst::Subst) -> Option<String> {
+    doc.rows
+        .iter()
+        .find(|r| r.plugin == STORAGE_PLUGIN)
+        .and_then(|row| {
+            harnless_config::subst::expand(&row.config, subst)
+                .ok()
+                .and_then(|v| v.get("dir").and_then(|d| d.as_str()).map(String::from))
+        })
+}
+
 impl BootComposer for ConfigComposer {
     fn profiles(&self) -> Vec<String> {
         self.composer.profiles()
@@ -1001,7 +1227,7 @@ impl BootComposer for ConfigComposer {
     fn compose(&self, name: &str, patch: Option<&str>) -> Result<ProfileDoc, CliError> {
         let overlays = parse_overlays(patch)?;
         let doc = self.compose_config(name, &overlays)?;
-        Ok(self.plan(&doc)?)
+        self.plan(&doc)
     }
 
     fn dump(&self, doc: &ProfileDoc) -> String {
@@ -1019,6 +1245,24 @@ impl BootComposer for ConfigComposer {
     }
 
     fn mount(&self, doc: &ProfileDoc) -> Result<Mounted, CliError> {
+        self.mount_seeded(doc, crate::boot::MountSeed::default())
+    }
+
+    fn mount_seeded(
+        &self,
+        doc: &ProfileDoc,
+        seed: crate::boot::MountSeed,
+    ) -> Result<Mounted, CliError> {
+        // A session-seeded mount (#67 §5) is its *own* composition: a
+        // resume's mirroring log and seeded ids cannot share a spine with a
+        // fresh or other-session mount (one spine, one log). It therefore
+        // bypasses the warm-spine cache entirely and never populates it.
+        // The id allocator's scope is deliberately per-session (#68 §2): a
+        // fresh session's ids legitimately start at 1 even when another
+        // session file already holds 1..n — ids are message identity within
+        // one log, and the store's `max + 1` floor keeps them distinct
+        // *within* the session that continues here.
+        let fresh = seed.is_empty();
         // The plan's wiring is computed from the plan alone — the same
         // projection `plan()` publishes — before any lock is taken.
         let wiring = self.tools_wiring(doc)?;
@@ -1032,8 +1276,34 @@ impl BootComposer for ConfigComposer {
         // never through `compose_full`, which takes the same lock.
         let _mount_guard = self.mount_lock.lock();
         let stored = self.last_config.lock().clone();
+        // The plan's store dir, resolved from its own rows the way the
+        // mount resolves them (#69 §3). The warm reuse compares against it:
+        // a patch that moved the store must not reuse a spine whose storage
+        // row names another dir — the divergence is loud, never a silent
+        // wrong-dir mount.
+        let plan_store_dir = doc.store.as_ref().and_then(|spec| {
+            harnless_config::subst::expand(
+                &serde_yaml::to_value(spec).expect("store spec is plain YAML"),
+                self.composer.subst(),
+            )
+            .ok()
+            .and_then(|v| v.get("dir").and_then(|d| d.as_str()).map(String::from))
+        });
         let entry = match stored {
-            Some(entry) if entry.name == doc.name => entry,
+            Some(entry)
+                if entry.name == doc.name && {
+                    // The entry's rows are what mount; its resolved store
+                    // dir is the truth the plan must agree with (#69 §3).
+                    // A plan that names no store defers to the entry.
+                    let entry_dir = entry
+                        .store_dir
+                        .clone()
+                        .or_else(|| resolve_store_dir(&entry.doc, self.composer.subst()));
+                    plan_store_dir.is_none() || entry_dir == plan_store_dir
+                } =>
+            {
+                entry
+            }
             // A stale or foreign entry re-composes the plan's own name from
             // the stored layers — without the overlays the lost composition
             // applied. The divergence is loud, never silent: the wiring
@@ -1049,45 +1319,71 @@ impl BootComposer for ConfigComposer {
                     name: out.doc.name.clone(),
                     doc: out.doc.clone(),
                     spine: None,
+                    store_dir: resolve_store_dir(&out.doc, self.composer.subst()),
                 }
             }
         };
-        let spine = match entry.spine.as_ref().and_then(std::sync::Weak::upgrade) {
-            Some(spine) => {
-                // A warm reuse must implement the *shape* of the plan it is
-                // handed: the spine's loop is either tool-less or
-                // registry-backed, and that axis is frozen at mount time.
-                // The registry-backed loop decides allow/deny by name
-                // membership in what it registered, so a plan whose
-                // `declared` list differs only in content or order is still
-                // served by the live spine — only the None/AutoAllow
-                // mismatch boots the wrong loop shape, and it fails loudly.
-                let same_shape = matches!(
-                    (&spine.wiring, &wiring),
-                    (ToolsWiring::None, ToolsWiring::None)
-                        | (ToolsWiring::AutoAllow { .. }, ToolsWiring::AutoAllow { .. })
-                );
-                if !same_shape {
-                    return Err(CliError::new(
-                        "mount-failed",
-                        "a spine with different tool wiring is already live for this profile; \
-                         drop its last Mounted before mounting the other plan",
-                    ));
+        // A seeded mount is its own composition (#67 §5): its log mirrors
+        // one session file and its ids floor at that session's max, so it
+        // can never share the warm spine — and it never populates the cache.
+        let spine = if !fresh {
+            Arc::new(self.mount_spine_for(&entry.doc, wiring, seed)?)
+        } else {
+            match entry.spine.as_ref().and_then(std::sync::Weak::upgrade) {
+                Some(spine) => {
+                    // A warm reuse must implement the *shape* of the plan it is
+                    // handed: the spine's loop is either tool-less or
+                    // registry-backed, and that axis is frozen at mount time.
+                    // The registry-backed loop decides allow/deny by name
+                    // membership in what it registered, so a plan whose
+                    // `declared` list differs only in content or order is still
+                    // served by the live spine — only the None/AutoAllow
+                    // mismatch boots the wrong loop shape, and it fails loudly.
+                    let same_shape = matches!(
+                        (&spine.wiring, &wiring),
+                        (ToolsWiring::None, ToolsWiring::None)
+                            | (ToolsWiring::AutoAllow { .. }, ToolsWiring::AutoAllow { .. })
+                    );
+                    if !same_shape {
+                        return Err(CliError::new(
+                            "mount-failed",
+                            "a spine with different tool wiring is already live for this profile; \
+                             drop its last Mounted before mounting the other plan",
+                        ));
+                    }
+                    // The invariant that keeps `Mounted::drop`'s mirror-close
+                    // safe under warm reuse: a cached spine is always built
+                    // from the default seed, so it never owns a mirroring
+                    // writer. If a future change ever cached a store-mounted
+                    // spine, the first `Mounted` to drop would close a writer
+                    // a live sibling still needs — refuse it at boot instead.
+                    if spine.mirror.is_some() {
+                        return Err(CliError::new(
+                            "mount-failed",
+                            "a store-mounted spine is never warm-reusable; \
+                             this is a bug in the spine cache",
+                        ));
+                    }
+                    spine
                 }
-                spine
-            }
-            None => {
-                let spine = Arc::new(self.mount_spine_for(&entry.doc, wiring)?);
-                // The composition's spine is now live; the entry keeps it
-                // weakly, so every later `mount` of the same plan reuses it
-                // while it is alive, and the last `Mounted` to drop disposes
-                // it for real.
-                *self.last_config.lock() = Some(Entry {
-                    name: entry.name.clone(),
-                    doc: entry.doc.clone(),
-                    spine: Some(Arc::downgrade(&spine)),
-                });
-                spine
+                None => {
+                    let spine = Arc::new(self.mount_spine_for(
+                        &entry.doc,
+                        wiring,
+                        crate::boot::MountSeed::default(),
+                    )?);
+                    // The composition's spine is now live; the entry keeps it
+                    // weakly, so every later `mount` of the same plan reuses it
+                    // while it is alive, and the last `Mounted` to drop disposes
+                    // it for real.
+                    *self.last_config.lock() = Some(Entry {
+                        name: entry.name.clone(),
+                        doc: entry.doc.clone(),
+                        spine: Some(Arc::downgrade(&spine)),
+                        store_dir: entry.store_dir.clone(),
+                    });
+                    spine
+                }
             }
         };
         #[cfg(test)]
@@ -1101,6 +1397,8 @@ impl BootComposer for ConfigComposer {
             build_adapter(doc)?
         };
         let ids = spine.ids.clone();
+        let store = spine.store.clone();
+        let mirror = spine.mirror.clone();
         Ok(Mounted {
             ctx: spine.ctx.clone(),
             _registry: Arc::clone(&spine.registry),
@@ -1108,10 +1406,11 @@ impl BootComposer for ConfigComposer {
             _spine: Some(spine as Arc<dyn std::any::Any + Send + Sync>),
             model,
             ids,
+            store,
+            mirror,
         })
     }
 }
-
 /// Whether a composed model handle is the one a plan names.
 ///
 /// The identity that matters at this boundary is the plan's `ModelSpec` in
@@ -1150,7 +1449,27 @@ mod tests {
     fn the_built_in_profile_composes_to_the_shipped_plan() {
         let composer = composer();
         let doc = composer.compose("default", None).unwrap();
-        assert_eq!(doc, ProfileDoc::default_profile());
+        // The shipped plan is the reference plan plus the store row (#69 §2):
+        // the binary's default is durable; the reference fixture is not.
+        // `${home}` is expanded by the fold's substitution pass, so the
+        // golden asserts the row's *shape*, with the expansion checked here.
+        let mut expected = ProfileDoc::default_profile();
+        expected.seams.push(STORAGE_SEAM.to_string());
+        expected.store = Some(StoreSpec {
+            dir: doc
+                .store
+                .as_ref()
+                .expect("the shipped plan names a store")
+                .dir
+                .clone(),
+        });
+        assert_eq!(doc, expected);
+        assert!(doc
+            .store
+            .as_ref()
+            .unwrap()
+            .dir
+            .ends_with("/.harnless/sessions"));
     }
 
     #[test]
@@ -1422,8 +1741,11 @@ mod tests {
         let plan = composer.plan(&doc).expect("plan projects doc rows");
         assert_eq!(plan.system_prompt, "be terse");
         assert_eq!(plan.tools, vec!["echo"]);
-        // The doc rows never appear as seams and never mount.
-        assert_eq!(plan.seams, SPINE_SEAMS);
+        // The doc rows never appear as seams and never mount. The plan's
+        // own store row rides on top of the spine seams (#69 §2).
+        let mut expected_seams = SPINE_SEAMS.to_vec();
+        expected_seams.push(STORAGE_SEAM);
+        assert_eq!(plan.seams, expected_seams);
         let mounted = composer
             .mount_config(&doc)
             .expect("doc rows are inert at mount");
