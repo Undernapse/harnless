@@ -154,14 +154,15 @@ impl MountFailure {
         }
     }
 
-    /// Wrap a composer's plain failure, recovering whatever the seed's
-    /// slot still holds. A seeding composer whose mount never reached its
-    /// spine leaves the writer there; one that failed after the spine took
-    /// it left the slot empty (the failure arm closed the writer).
+    /// Wrap a composer's plain failure, classifying whatever the seed's
+    /// slot still holds: a created file's writer is abandoned here (the
+    /// [`take_slot_of`] rule), a resume's writer rides back out. A
+    /// composer that bypassed this rule would strand an orphan or strand
+    /// a lock, so the classification happens at the boundary.
     pub fn from_cli_error(err: CliError, seed: MountSeed) -> Self {
         Self {
             err,
-            unconsumed_writer: seed.writer.lock().expect("seed lock").take(),
+            unconsumed_writer: take_slot_of(&seed),
         }
     }
 

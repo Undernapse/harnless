@@ -1404,6 +1404,13 @@ impl ConfigComposer {
             // the slot for the wrapper's full unwind. A warm-reused spine
             // is owned by live `Mounted` siblings and is never recorded:
             // disposing it would close a writer a sibling still needs.
+            //
+            // Same-thread contract: the slot is a `thread_local`, and the
+            // wrapper's failure arm reads it back on the *calling* thread.
+            // `mount_seeded` must therefore run start-to-finish on one
+            // thread (true for the binary's route and every caller in
+            // tree); a cross-thread entry would make the dispose a silent
+            // no-op and strand the session lock.
             LAST_MOUNTED_SPINE
                 .with(|s| *s.lock().expect("probe lock") = std::sync::Arc::downgrade(&spine));
             spine

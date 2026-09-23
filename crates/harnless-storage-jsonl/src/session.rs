@@ -332,10 +332,20 @@ impl SessionStore {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
+                    // The unlink is the no-orphan rule's last step; an
+                    // I/O fault here strands residue the caller cannot
+                    // see (the route discards this error — the mount
+                    // failure it follows is the loud one). Name it on
+                    // stderr so the residue is never silent.
+                    eprintln!(
+                        "warning: abandoning session {id}: {} (residue left at {})",
+                        e,
+                        p.display()
+                    );
                     return Err(SessionError::new(
                         "io-error",
                         format!("abandoning session {id}: {e}"),
-                    ))
+                    ));
                 }
             }
         }
@@ -816,10 +826,15 @@ impl SessionWriter {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
+                    eprintln!(
+                        "warning: abandoning session {id}: {} (residue left at {})",
+                        e,
+                        p.display()
+                    );
                     return Err(SessionError::new(
                         "io-error",
                         format!("abandoning session {id}: {e}"),
-                    ))
+                    ));
                 }
             }
         }
