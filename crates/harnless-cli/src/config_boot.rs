@@ -1273,20 +1273,21 @@ impl BootComposer for ConfigComposer {
         match self.mount_seeded_inner(doc, seed_for_mount) {
             Ok(mounted) => Ok(mounted),
             Err(err) => {
-                // A failure *after* the spine mounted must unwind the live
-                // composition: dropping the body's `Arc<SpineMount>` is
-                // not enough, because the spine's registry entry pins the
-                // plugin (and through it the seed's writer cell), so the
-                // mount's drop never runs. Unmount the fiber (which
-                // unwinds the spine's services and closes the mirror,
-                // releasing the session lock) exactly as
-                // `DefaultComposer::mount_seeded`'s post-spine arm does.
-                // A pre-spine failure leaves the slot full and no spine —
-                // both unwinds are no-ops there.
+                // A failure *after* the spine mounted must tear the whole
+                // composition down — every row resource in the spine's
+                // mount guard and the spine fiber. Dropping the body's
+                // `Arc<SpineMount>` is not enough: the spine's registry
+                // entry pins the plugin (and through it the seed's writer
+                // cell and the context's services), so the mount's drop
+                // never runs. `SpineMount::dispose` is the full unwind
+                // (guard dispose + fiber unmount, idempotent); the mirror
+                // close releases the session lock with it. A pre-spine
+                // failure leaves the slot full and no spine — the dispose
+                // is a no-op there.
                 if let Some(spine) =
                     LAST_MOUNTED_SPINE.with(|s| s.lock().expect("probe lock").upgrade())
                 {
-                    spine.registry.unmount(&spine.fiber);
+                    spine.dispose();
                     if let Some(mirror) = spine.mirror.as_ref() {
                         mirror.close();
                     }
