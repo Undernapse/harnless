@@ -714,16 +714,16 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
             None => (log, None),
         };
         *self.mounted_mirror.lock().expect("mirror out lock") = mirror.clone();
-        // The mirror now owns the writer; disarm the rollback. A later
-        // `apply` failure unwinds the mirror with the fiber's registrations
-        // (its disposer closes the writer), so the lock never strands.
-        drop(guard.writer.take());
+        // The guard stays armed until `apply` returns Ok: every Err *and
+        // every panic* after this point rolls the writer back into the
+        // shared cell (the guard's Drop runs before any unwind handler),
+        // and mount_spine's failure arm closes the mirror it published.
+        // Disarming here would strand the lock on a panic path that no
+        // `?` handler reaches.
         Spine::new(self.seed.session).apply_with_log(ctx, log)?;
         let ToolsWiring::AutoAllow { declared } = &self.wiring else {
-            drop(guard);
             return Ok(());
         };
-        drop(guard);
         let tools = ctx
             .get::<harnless_agent::tools::ToolRegistry>()
             .ok_or_else(|| harnless_runtime::RuntimeError::new("MOUNT", "tool pipeline missing"))?;
@@ -781,6 +781,9 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
         // two fibers would race over the one `AgentLoop` key.
         ctx.remove::<harnless_agent::loop_::AgentLoop>();
         ctx.provide_shared(&fiber, Arc::new(loop_))?;
+        // The composition exists now: the mirror's writer rides with it,
+        // and `Mounted::drop` owns the release. Disarm the rollback.
+        drop(guard);
         Ok(())
     }
 }

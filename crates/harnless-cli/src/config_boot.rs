@@ -1387,12 +1387,18 @@ impl ConfigComposer {
         // one session file and its ids floor at that session's max, so it
         // can never share the warm spine — and it never populates the cache.
         let spine = if !fresh {
-            // A seeded mount is never warm-cached: its `Arc<SpineMount>`
-            // is owned solely by this body, so a later failure here drops
-            // it and `SpineMount::drop` unwinds the composition (closing
-            // the mirror, releasing the session lock) before the error
-            // rides back out.
-            Arc::new(self.mount_spine_for(&entry.doc, wiring, seed)?)
+            let spine = Arc::new(self.mount_spine_for(&entry.doc, wiring, seed)?);
+            // Record the freshly-composed seeded spine *now*, before any
+            // later fallible step: the registry pins the plugin (and
+            // through it the seed's writer cell), so the body's Arc drop
+            // alone never runs `SpineMount::dispose` — a failure after
+            // this point (the model step below) must find the spine in
+            // the slot for the wrapper's full unwind. A warm-reused spine
+            // is owned by live `Mounted` siblings and is never recorded:
+            // disposing it would close a writer a sibling still needs.
+            LAST_MOUNTED_SPINE
+                .with(|s| *s.lock().expect("probe lock") = std::sync::Arc::downgrade(&spine));
+            spine
         } else {
             match entry.spine.as_ref().and_then(std::sync::Weak::upgrade) {
                 Some(spine) => {
@@ -1464,17 +1470,6 @@ impl ConfigComposer {
         let ids = spine.ids.clone();
         let store = spine.store.clone();
         let mirror = spine.mirror.clone();
-        // Record the mount's spine for the wrapper's failure unwind: a
-        // failure after this point must dispose the live composition (the
-        // registry pins the plugin, so the body's Arc drop alone never
-        // runs `SpineMount::dispose`). A warm-reused spine is already
-        // owned by a live `Mounted` — disposing it here would close a
-        // writer a sibling still needs, so only a *freshly composed*
-        // seeded spine is recorded.
-        if !fresh {
-            LAST_MOUNTED_SPINE
-                .with(|s| *s.lock().expect("probe lock") = std::sync::Arc::downgrade(&spine));
-        }
         Ok(Mounted {
             ctx: spine.ctx.clone(),
             _registry: Arc::clone(&spine.registry),
