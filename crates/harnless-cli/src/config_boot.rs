@@ -639,8 +639,9 @@ struct UnwindSlot {
 struct SpineUnwindGuard;
 
 impl SpineUnwindGuard {
-    /// Take the wrapper's unwind handle for the spine the body just
-    /// composed, so the wrapper's exits own the dispose.
+    /// Clear the panic-path unwind slot: after a successful mount,
+    /// neither the spine nor the cell may be disposed or classified by
+    /// a later mount's failure.
     fn disarm() {
         SPINE_UNWIND.with(|g| *g.lock().expect("unwind lock") = UnwindSlot::default());
     }
@@ -695,11 +696,14 @@ impl Drop for SpineUnwindGuard {
             .and_then(|s| s.store.as_ref())
             .map(|st| st.dir().to_path_buf());
         if let Some(spine) = spine_live {
-            // The handle rides `ManuallyDrop` so this scope's end never
-            // runs `SpineMount::drop` implicitly: the dispose is *this*
+            // The handle rides `ManuallyDrop` so the dispose is *this*
             // call's decision, taken only on the unwind path (the
-            // wrapper's Ok/Err exits disarm the slot first), and it runs
-            // explicitly through `into_inner` below. The dispose closes
+            // wrapper's Ok/Err exits disarm the slot first); the Arc is
+            // released at the explicit `into_inner` below, where it may
+            // run `SpineMount::drop` if this is the last strong handle
+            // (the seam hook keeps one alive; production unwinds every
+            // other). Correctness rests on the dispose being idempotent,
+            // not on drop never running. Either way the dispose closes
             // the mirror, releasing the flock — every handle to the
             // mirror goes through this one spine, so no writer outlives
             // the abandon below and re-creates the lock sibling.
@@ -1242,8 +1246,9 @@ impl ConfigComposer {
         wiring: ToolsWiring,
         seed: crate::boot::MountSeed,
     ) -> Result<SpineMount, CliError> {
-        // The spine row's mount consumes the seed exactly once (#67 §5): the
-        // mirroring writer — while the model/tool rows stay sessionless.
+        // The spine row's mount consumes the seed exactly once (#67 §5) —
+        // stored records, id floor, mirroring writer — while the
+        // model/tool rows stay sessionless.
         // The plan's rows must carry a spine row for the seed to reach the
         // spine at all; a seed with no spine row is a named failure, never a
         // silently unseeded mount.
@@ -1315,8 +1320,9 @@ impl ConfigComposer {
     /// integration test drives the panic path through the `BootComposer`
     /// wrapper, so the crate keeps the direct-spine call crate-internal
     /// and the test reaches it only under the `test-cfg` feature. The
-    /// return is the type-erased `Arc` — the seam only needs the handle to
-    /// live until the panic, never the spine's surface.
+    /// return is the type-erased `Arc`: the seam only needs the mount to
+    /// stay alive until the panic; the surface is never read, so the
+    /// handle's type is not part of the contract.
     #[cfg(any(test, feature = "test-cfg"))]
     pub fn mount_spine_for_for_test(
         &self,
@@ -1369,13 +1375,15 @@ pub fn mount_seeded_panicking_after_spine_for_test(
         // through the slot's weak handle, exactly as the production
         // body's window does (there the composition is owned by the
         // `Mounted` that never gets built). It is the one strong ref
-        // that outlives the unwind *by design* — the guard's own
-        // `into_inner` is a decrement against it, so `SpineMount::drop`
-        // never runs and the disposed `SpineMount` allocation leaks for
-        // the test process's life. The teardown that matters is not the
-        // allocation: `unwind_after_failure` ran the guard dispose, the
-        // registry unmount, and the mirror close, so the flock is free
-        // and no registry entry pins anything.
+        // that outlives the unwind *by design*, so the guard's Arc
+        // release is a decrement against it and `SpineMount::drop` does
+        // not run here (the guard's own comment in `Drop` states when it
+        // does): the disposed `SpineMount` allocation and the Arc graph
+        // it roots outlive the unwind for the test process's life. The
+        // teardown that matters is not the allocation:
+        // `unwind_after_failure` ran the guard dispose, the registry
+        // unmount, and the mirror close, so the flock is free and no
+        // registry entry pins anything.
         let _spine = std::mem::ManuallyDrop::new(spine);
         panic!("the model step panicked after the spine mounted");
     };
@@ -1686,10 +1694,11 @@ impl ConfigComposer {
             // silent no-op and strand the session lock.
             let spine = Arc::new(self.mount_spine_for(&entry.doc, wiring, seed)?);
             // The composition returned Ok: the spine row consumed the
-            // writer into the mirror (or there was none). The shared
-            // cell is empty now, so the guard's classification is inert
-            // from here — the mirror (closed by the dispose or the
-            // plugin's unwind guards) owns the writer.
+            // writer into the mirror (or there was none), so the cell's
+            // *writer* is gone — but the guard's classification is not
+            // inert: a panic after this point abandons the created file
+            // through the mirror's `held_id`, the path the created-file
+            // seam pins.
             // The cell's writer moved into the mirror during the
             // composition; keep the *cell* (the same Arc the wrapper
             // holds) and let the guard's Drop read the consumed state
