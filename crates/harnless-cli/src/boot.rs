@@ -113,11 +113,7 @@ pub(crate) fn classify_failed_seed(
     Option<harnless_storage_jsonl::SessionWriter>,
     Result<(), harnless_storage_jsonl::SessionError>,
 ) {
-    let writer = seed.writer.lock().expect("seed lock").take();
-    match writer {
-        Some(writer) if seed.created_by_mount => (None, writer.abandon()),
-        other => (other, Ok(())),
-    }
+    classify_failed_cell(&seed.writer, seed.created_by_mount)
 }
 
 /// The [`classify_failed_seed`] shape for a writer cell the caller keeps
@@ -384,9 +380,9 @@ impl BootComposer for DefaultComposer {
         };
         let id_seed = seed.id_seed;
         // `mount_spine` borrows the seed: a failure leaves whatever the
-        // mount never consumed in the seed's own slots, and `classify_failed_slot`
-        // classifies it (abandon a created file, hand back a resume's
-        // writer) before the error rides back out.
+        // mount never consumed in the seed's own slots, and
+        // `classify_failed_seed` classifies it (abandon a created file,
+        // hand back a resume's writer) before the error rides back out.
         let (tools, fiber, mirror) = match mount_spine(&ctx, &registry, wiring, &seed) {
             Ok(mounted) => mounted,
             Err(err) => {

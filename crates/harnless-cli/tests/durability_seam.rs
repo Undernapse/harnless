@@ -1213,11 +1213,20 @@ fn config_route_pre_spine_failure_abandons_the_created_file() {
         Err(failure) => failure,
     };
     assert_eq!(failure.err.code, "mount-failed");
-    // The route's unwind shape (`unwind_created`): the writer rode back
-    // out of the shared cell, so the created file abandons cleanly.
-    if let Some(writer) = failure.unconsumed_writer {
-        writer.abandon().expect("writer abandon");
-    }
+    // The config route's classification abandons a created file *at the
+    // mount failure* (the cell's writer never rides out here): the outcome
+    // is Ok, the writer slot is empty, and the file is gone before the
+    // error returns. The pre-fix shape lost the cell, fell to the route's
+    // by-id abandon, and left the file plus its lock sibling.
+    assert!(
+        failure.unconsumed_writer.is_none(),
+        "the classification owns the created file's writer"
+    );
+    assert!(
+        failure.abandon_outcome.is_ok(),
+        "{:?}",
+        failure.abandon_outcome
+    );
     let leftovers: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().file_name())

@@ -1380,9 +1380,12 @@ impl BootComposer for ConfigComposer {
                 LAST_MOUNTED_SPINE.with(|s| {
                     *s.lock().expect("probe lock") = std::sync::Weak::new();
                 });
-                // The Err arm disposed above; the panic handle must not
-                // dispose again on the guard's Drop (it is idempotent, but
-                // the slot's handle is the single source).
+                // The classification's abandon (when this boot created the
+                // file) runs *before* the failure rides out, while the
+                // spine slot is already cleared — the created file never
+                // unlinks under a live composition that names its id
+                // (#67 §5). A carried-back writer means nothing was
+                // abandoned yet: the route's `unwind_created` owns it.
                 Err(crate::boot::MountFailure::carried(
                     err,
                     crate::boot::classify_failed_cell(&cell, created_by_mount),
