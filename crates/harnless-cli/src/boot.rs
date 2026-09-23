@@ -120,19 +120,21 @@ pub(crate) fn classify_failed_seed(
     }
 }
 
-/// The [`classify_failed_seed`] shape for a seed held in a shared slot (the
-/// config route keeps the seed behind a lock until the mount consumes it).
-pub(crate) fn classify_failed_slot(
-    slot: &std::sync::Arc<std::sync::Mutex<Option<MountSeed>>>,
+/// The [`classify_failed_seed`] shape for a writer cell the caller keeps
+/// beside a seed it moved elsewhere (the config wrapper's route: the body
+/// owns the seed, the wrapper owns the cell). `created_by_mount` rides
+/// from the seed the wrapper took before the move.
+pub(crate) fn classify_failed_cell(
+    cell: &std::sync::Arc<std::sync::Mutex<Option<harnless_storage_jsonl::SessionWriter>>>,
+    created_by_mount: bool,
 ) -> (
     Option<harnless_storage_jsonl::SessionWriter>,
     Result<(), harnless_storage_jsonl::SessionError>,
 ) {
-    let mut guard = slot.lock().expect("seed slot lock");
-    match guard.as_mut() {
-        Some(seed) => classify_failed_seed(seed),
-        // The mount consumed it: a failure arm already ran.
-        None => (None, Ok(())),
+    let writer = cell.lock().expect("seed lock").take();
+    match writer {
+        Some(writer) if created_by_mount => (None, writer.abandon()),
+        other => (other, Ok(())),
     }
 }
 

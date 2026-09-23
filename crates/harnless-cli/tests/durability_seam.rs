@@ -1163,3 +1163,69 @@ fn config_route_pre_spine_failure_never_disposes_a_live_sibling() {
         .expect("lock free after the mount drops");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn config_route_pre_spine_failure_abandons_the_created_file() {
+    // The wrapper's shared-cell rule: the seed's writer cell outlives the
+    // body's seed copy, so a mount that fails BEFORE the spine row mounts
+    // still classifies the unconsumed writer and abandons the file this
+    // boot created. Shape: a profile with a store row but no spine row —
+    // the seed can never reach a spine, so `mount_spine_for` refuses
+    // pre-spine. The created file and its lock sibling must both be gone
+    // when the mount fails (the round-ten defect: the wrapper took the
+    // seed out of its own slot, the body's `?` dropped the writer, and
+    // the route's by-id abandon left the orphan).
+    use harnless_cli::boot::{BootComposer as _, MountSeed};
+    let dir = config_store_dir("presine");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = SessionStore::new(&dir);
+
+    let cfg = config_store_dir("presine-cfg");
+    let _ = std::fs::remove_dir_all(&cfg);
+    std::fs::create_dir_all(cfg.join("profiles")).unwrap();
+    std::fs::write(
+        cfg.join("profiles").join("p.yml"),
+        format!(
+            "name: p\nrows:\n- id: store\n  plugin: storage-jsonl\n  config:\n    dir: {}\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    let composer = harnless_cli::config_boot::ConfigComposer::new(
+        std::sync::Arc::new(harnless_cli::config_boot::LayeredStore::new(Some(
+            cfg.clone(),
+        ))),
+        harnless_cli::config_boot::config::subst::Subst::new(),
+    );
+    let doc = composer.compose("p", None).expect("profile composes");
+
+    let (id, writer) = mint_with(|id| store.create_new(id)).expect("mint");
+    let seed = MountSeed {
+        session: harnless_seams::SessionId(id),
+        records: Some(vec![]),
+        id_seed: 0,
+        writer: std::sync::Arc::new(std::sync::Mutex::new(Some(writer))),
+        created_by_mount: true,
+    };
+    let failure = match composer.mount_seeded(&doc, seed) {
+        Ok(_) => panic!("a seeded mount with no spine row must refuse"),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.err.code, "mount-failed");
+    // The route's unwind shape (`unwind_created`): the writer rode back
+    // out of the shared cell, so the created file abandons cleanly.
+    if let Some(writer) = failure.unconsumed_writer {
+        writer.abandon().expect("writer abandon");
+    }
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "pre-spine failure orphaned: {leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&cfg);
+}

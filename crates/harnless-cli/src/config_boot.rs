@@ -1338,20 +1338,19 @@ impl BootComposer for ConfigComposer {
         doc: &ProfileDoc,
         seed: crate::boot::MountSeed,
     ) -> Result<Mounted, crate::boot::MountFailure> {
-        // The seed moves into the mount; a failure must hand back whatever
-        // the seed's slot still holds (a mount that never reached its spine
-        // never took the writer — see `MountFailure`).
-        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(seed)));
-        let seed_for_mount = slot
-            .lock()
-            .expect("seed slot lock")
-            .take()
-            .expect("seed slot fresh");
+        // The seed's writer cell is *shared* with the body: the wrapper
+        // keeps its own `Arc` clone of the cell, so a failure before the
+        // spine row mounts — when the body drops its seed copy — still
+        // leaves the unconsumed writer in the cell for the classification
+        // below (a mount that never reached its spine never took the
+        // writer; see `MountFailure`).
+        let created_by_mount = seed.created_by_mount;
+        let cell = seed.writer.clone();
         // The panic-path unwind: armed by the body when its spine
         // composes, disarmed here at both exits. A panic past this point
         // runs the guard's Drop — the same dispose the Err arm performs.
         let _unwind = SpineUnwindGuard;
-        match self.mount_seeded_inner(doc, seed_for_mount) {
+        match self.mount_seeded_inner(doc, seed) {
             Ok(mounted) => {
                 // The composition is live and owned by its `Mounted`;
                 // clear the unwind slots so a *later* mount's failure can
@@ -1384,10 +1383,9 @@ impl BootComposer for ConfigComposer {
                 // The Err arm disposed above; the panic handle must not
                 // dispose again on the guard's Drop (it is idempotent, but
                 // the slot's handle is the single source).
-                SpineUnwindGuard::disarm();
                 Err(crate::boot::MountFailure::carried(
                     err,
-                    crate::boot::classify_failed_slot(&slot),
+                    crate::boot::classify_failed_cell(&cell, created_by_mount),
                 ))
             }
         }
