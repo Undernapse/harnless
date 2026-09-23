@@ -104,7 +104,9 @@ pub trait BootComposer: Send + Sync + 'static {
 /// in which case it is abandoned here (unlock + unlink, no orphan).
 /// A seed whose writer slot is empty had its writer taken by a mount that
 /// then failed *after* taking it; that failure arm already closed it.
-pub(crate) fn take_slot_of(seed: &MountSeed) -> Option<harnless_storage_jsonl::SessionWriter> {
+pub(crate) fn classify_failed_seed(
+    seed: &MountSeed,
+) -> Option<harnless_storage_jsonl::SessionWriter> {
     let writer = seed.writer.lock().expect("seed lock").take();
     match writer {
         Some(writer) if seed.created_by_mount => {
@@ -115,14 +117,14 @@ pub(crate) fn take_slot_of(seed: &MountSeed) -> Option<harnless_storage_jsonl::S
     }
 }
 
-/// The [`take_slot_of`] shape for a seed held in a shared slot (the
+/// The [`classify_failed_seed`] shape for a seed held in a shared slot (the
 /// config route keeps the seed behind a lock until the mount consumes it).
-pub(crate) fn take_slot(
+pub(crate) fn classify_failed_slot(
     slot: &std::sync::Arc<std::sync::Mutex<Option<MountSeed>>>,
 ) -> Option<harnless_storage_jsonl::SessionWriter> {
     let mut guard = slot.lock().expect("seed slot lock");
     match guard.as_mut() {
-        Some(seed) => take_slot_of(seed),
+        Some(seed) => classify_failed_seed(seed),
         None => None, // the mount consumed it: a failure arm already ran
     }
 }
@@ -357,18 +359,18 @@ impl BootComposer for DefaultComposer {
         let wiring = match self.tools_wiring(doc) {
             Ok(wiring) => wiring,
             Err(err) => {
-                return Err(MountFailure::carried(err, take_slot_of(&seed)));
+                return Err(MountFailure::carried(err, classify_failed_seed(&seed)));
             }
         };
         let id_seed = seed.id_seed;
         // `mount_spine` borrows the seed: a failure leaves whatever the
-        // mount never consumed in the seed's own slots, and `take_slot`
+        // mount never consumed in the seed's own slots, and `classify_failed_slot`
         // classifies it (abandon a created file, hand back a resume's
         // writer) before the error rides back out.
         let (tools, fiber, mirror) = match mount_spine(&ctx, &registry, wiring, &seed) {
             Ok(mounted) => mounted,
             Err(err) => {
-                return Err(MountFailure::carried(err, take_slot_of(&seed)));
+                return Err(MountFailure::carried(err, classify_failed_seed(&seed)));
             }
         };
         let model = match build_adapter(doc) {
@@ -383,7 +385,7 @@ impl BootComposer for DefaultComposer {
                 if let Some(mirror) = mirror {
                     mirror.close();
                 }
-                return Err(MountFailure::carried(err, take_slot_of(&seed)));
+                return Err(MountFailure::carried(err, classify_failed_seed(&seed)));
             }
         };
         Ok(Mounted {

@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use harnless_seams::SessionId;
-use harnless_storage_jsonl::{Header, SessionError, SessionMeta, SessionStore};
+use harnless_storage_jsonl::{Header, SessionError, SessionMeta, SessionStore, SessionWriter};
 
 use crate::boot::{BootComposer, MountSeed, Mounted};
 use crate::CliError;
@@ -111,24 +111,9 @@ pub fn open_session(
                 Ok(mounted) => mounted,
                 Err((err, writer)) => {
                     // The mint created the file; the composition that would
-                    // own it never mounted. Leave no orphan behind (see the
-                    // fork arm's identical unwind). The writer may already
-                    // be gone (a mount that took it and then failed closed
-                    // it) — the *file* is still this boot's creation, so
-                    // abandon by id when the writer did not ride back.
-                    match writer {
-                        Some(writer) => {
-                            let _ = writer.abandon();
-                        }
-                        None => {
-                            // The writer is gone (a post-mirror failure
-                            // arm closed it), so the flock is free and a
-                            // concurrent open could already own the file.
-                            // `abandon` re-takes the lock first and
-                            // refuses rather than unlink under a writer.
-                            let _ = store.abandon(id);
-                        }
-                    }
+                    // own it never mounted. Leave no orphan behind (see
+                    // `unwind_created`).
+                    unwind_created(&store, id, writer);
                     return Err(err);
                 }
             };
@@ -204,19 +189,8 @@ pub fn open_session(
                     // that fails after `create_fork` must leave no orphan
                     // (#67 §5's rule, extended to the mount-failure window)
                     // — otherwise `sessions list` renders a fork that never
-                    // ran, and the user can resume it. The writer may
-                    // already be gone (a mount that took it and then failed
-                    // closed it) — the file is still this boot's creation,
-                    // so abandon by id when the writer did not ride back.
-                    match writer {
-                        Some(writer) => {
-                            let _ = writer.abandon();
-                        }
-                        None => {
-                            // Lock-first abandon; see the fresh arm.
-                            let _ = store.abandon(target);
-                        }
-                    }
+                    // ran, and the user can resume it.
+                    unwind_created(&store, target, writer);
                     return Err(err);
                 }
             };
@@ -261,6 +235,26 @@ fn mount_seeded(
     match composer.mount_seeded(doc, seed) {
         Ok(mounted) => Ok(mounted),
         Err(failure) => Err((failure.err, failure.unconsumed_writer)),
+    }
+}
+
+/// Leave no orphan behind a failed created-by-mount mount: abandon the
+/// file via its writer when the mount never consumed it, or by id when a
+/// post-mirror failure arm already closed the writer (`abandon` re-takes
+/// the lock first and refuses rather than unlink under a live writer).
+/// A refusal or I/O fault names the residue on stderr — the orphan must
+/// never be silent: `sessions list` will still render it, and the mount
+/// error the caller returns says nothing about the file.
+fn unwind_created(store: &SessionStore, id: u64, writer: Option<SessionWriter>) {
+    let result = match writer {
+        Some(writer) => writer.abandon(),
+        None => store.abandon(id),
+    };
+    if let Err(e) = result {
+        eprintln!(
+            "warning: session {id} was created by this run and could not be abandoned ({}): {}",
+            e.code, e.message
+        );
     }
 }
 

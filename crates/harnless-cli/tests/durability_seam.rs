@@ -1027,8 +1027,7 @@ fn panic_after_spine_mount_disposes_the_composition_and_releases_the_lock() {
             &self,
             doc: &harnless_cli::profile::ProfileDoc,
             seed: MountSeed,
-        ) -> Result<harnless_cli::boot::Mounted, harnless_cli::boot::MountFailure>
-        {
+        ) -> Result<harnless_cli::boot::Mounted, harnless_cli::boot::MountFailure> {
             // The production row-mount machinery composes the spine and
             // takes the session lock through the mirror; the panic is the
             // fallible step *after* the spine. The seeded spine mounts
@@ -1047,7 +1046,7 @@ fn panic_after_spine_mount_disposes_the_composition_and_releases_the_lock() {
             };
             let _spine = self
                 .inner
-                .mount_spine_for(&config_doc, wiring, seed)
+                .mount_spine_for_for_test(&config_doc, wiring, seed)
                 .expect("the seeded spine mounts");
             panic!("the model step panicked after the spine mounted");
         }

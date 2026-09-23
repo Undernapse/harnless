@@ -547,7 +547,7 @@ struct Entry {
 ///
 /// The state is **shared** across every `Mounted` of one composition: the
 /// log, event registry, tool pipeline, loop, and id allocator are one per
-pub struct SpineMount {
+pub(crate) struct SpineMount {
     pub(crate) ctx: Context,
     pub(crate) registry: Arc<Registry>,
     fiber: Arc<harnless_runtime::Fiber>,
@@ -582,12 +582,14 @@ impl SpineMount {
         self.registry.unmount(&self.fiber);
     }
 
-
-    /// The spine's session mirror, when it mounted a store-seeded log.
-    /// `pub(crate)` so the `mount_seeded` wrapper's unwind paths can
-    /// release the session lock without going through the full `dispose`.
-    pub(crate) fn mirror(&self) -> Option<&Arc<crate::boot::MirroringLog>> {
-        self.mirror.as_ref()
+    /// The full failure unwind: dispose the composition *and* close the
+    /// session mirror (releasing the flock). The wrapper's Err arm and the
+    /// panic guard share this one shape.
+    pub(crate) fn unwind_after_failure(&self) {
+        self.dispose();
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.close();
+        }
     }
 }
 
@@ -642,11 +644,11 @@ impl Drop for SpineUnwindGuard {
             spine
         });
         if let Some(spine) = spine {
+            // `ManuallyDrop`'s holder keeps the Arc from running
+            // `SpineMount::drop` when this scope ends: only the unwind's
+            // Drop path gets drop glue here.
             let held = std::mem::ManuallyDrop::new(spine);
-            held.dispose();
-            if let Some(mirror) = held.mirror.as_ref() {
-                mirror.close();
-            }
+            held.unwind_after_failure();
         }
     }
 }
@@ -1152,14 +1154,13 @@ impl ConfigComposer {
     /// spine outside the `mount_seeded` wrapper (the seam tests) must
     /// hold the `Arc<SpineMount>` until the fallible step completes, or
     /// dispose explicitly. The wrapper is the tested production route.
-    pub fn mount_spine_for(
+    pub(crate) fn mount_spine_for(
         &self,
         doc: &ConfigDoc,
         wiring: ToolsWiring,
         seed: crate::boot::MountSeed,
     ) -> Result<SpineMount, CliError> {
         // The spine row's mount consumes the seed exactly once (#67 §5): the
-        // resume/fork route's spine is seeded — stored records, id floor,
         // mirroring writer — while the model/tool rows stay sessionless.
         // The plan's rows must carry a spine row for the seed to reach the
         // spine at all; a seed with no spine row is a named failure, never a
@@ -1224,6 +1225,23 @@ impl ConfigComposer {
             store,
             guard: Arc::new(std::sync::Mutex::new(_guard)),
         })
+    }
+
+    /// The seam tests' window onto [`Self::mount_spine_for`]: an
+    /// integration test drives the panic path through the `BootComposer`
+    /// wrapper, so the crate keeps the direct-spine call crate-internal
+    /// and the test reaches it only under the `test-cfg` feature. The
+    /// return is the type-erased `Arc` — the seam only needs the handle to
+    /// live until the panic, never the spine's surface.
+    #[cfg(any(test, feature = "test-cfg"))]
+    pub fn mount_spine_for_for_test(
+        &self,
+        doc: &ConfigDoc,
+        wiring: ToolsWiring,
+        seed: crate::boot::MountSeed,
+    ) -> Result<Arc<dyn std::any::Any + Send + Sync>, CliError> {
+        self.mount_spine_for(doc, wiring, seed)
+            .map(|spine| Arc::new(spine) as Arc<dyn std::any::Any + Send + Sync>)
     }
 }
 
@@ -1351,18 +1369,14 @@ impl BootComposer for ConfigComposer {
                 // `Arc<SpineMount>` is not enough: the spine's registry
                 // entry pins the plugin (and through it the seed's writer
                 // cell and the context's services), so the mount's drop
-                // never runs. `SpineMount::dispose` is the full unwind
-                // (guard dispose + fiber unmount, idempotent); the mirror
-                // close releases the session lock with it. A pre-spine
-                // failure leaves the slot full and no spine — the dispose
-                // is a no-op there.
+                // never runs. `SpineMount::unwind_after_failure` is the
+                // full unwind (guard dispose + fiber unmount + mirror
+                // close, idempotent). A pre-spine failure leaves the slot
+                // full and no spine — the unwind is a no-op there.
                 if let Some(spine) =
                     LAST_MOUNTED_SPINE.with(|s| s.lock().expect("probe lock").upgrade())
                 {
-                    spine.dispose();
-                    if let Some(mirror) = spine.mirror.as_ref() {
-                        mirror.close();
-                    }
+                    spine.unwind_after_failure();
                 }
                 LAST_MOUNTED_SPINE.with(|s| {
                     *s.lock().expect("probe lock") = std::sync::Weak::new();
@@ -1373,7 +1387,7 @@ impl BootComposer for ConfigComposer {
                 SpineUnwindGuard::disarm();
                 Err(crate::boot::MountFailure::carried(
                     err,
-                    crate::boot::take_slot(&slot),
+                    crate::boot::classify_failed_slot(&slot),
                 ))
             }
         }
@@ -1486,9 +1500,8 @@ impl ConfigComposer {
             // live composition the way the wrapper's Err arm does. The
             // wrapper disarms at both exits, so a clean or named-failure
             // finish never double-disposes.
-            SPINE_UNWIND.with(|g| {
-                *g.lock().expect("unwind lock") = std::sync::Arc::downgrade(&spine)
-            });
+            SPINE_UNWIND
+                .with(|g| *g.lock().expect("unwind lock") = std::sync::Arc::downgrade(&spine));
             spine
         } else {
             match entry.spine.as_ref().and_then(std::sync::Weak::upgrade) {
