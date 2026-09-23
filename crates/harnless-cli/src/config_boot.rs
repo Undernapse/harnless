@@ -577,9 +577,17 @@ impl SpineMount {
     /// Tear the composition down: dispose every row resource, then unwind
     /// the spine's fiber. Idempotent — the guard's latch and the fiber's
     /// state both make a second call a no-op.
-    fn dispose(&self) {
+    pub(crate) fn dispose(&self) {
         self.guard.lock().expect("guard lock").dispose();
         self.registry.unmount(&self.fiber);
+    }
+
+
+    /// The spine's session mirror, when it mounted a store-seeded log.
+    /// `pub(crate)` so the `mount_seeded` wrapper's unwind paths can
+    /// release the session lock without going through the full `dispose`.
+    pub(crate) fn mirror(&self) -> Option<&Arc<crate::boot::MirroringLog>> {
+        self.mirror.as_ref()
     }
 }
 
@@ -598,6 +606,49 @@ thread_local! {
     /// lock for the process's life.
     static LAST_MOUNTED_SPINE: std::sync::Mutex<std::sync::Weak<SpineMount>> =
         const { std::sync::Mutex::new(std::sync::Weak::new()) };
+    /// The same spine behind an RAII handle: a panic between the spine's
+    /// composition and the wrapper's return disposes it on unwind, the
+    /// way the wrapper's Err arm disposes it on a named failure. The
+    /// wrapper disarms the handle at both exits.
+    static SPINE_UNWIND: std::sync::Mutex<std::sync::Weak<SpineMount>> =
+        const { std::sync::Mutex::new(std::sync::Weak::new()) };
+}
+
+/// Arms the panic-path unwind for a freshly-composed seeded spine; the
+/// `mount_seeded` wrapper disarms it once the body returns (either way).
+struct SpineUnwindGuard;
+
+impl SpineUnwindGuard {
+    /// Take the wrapper's unwind handle for the spine the body just
+    /// composed, so the wrapper's exits own the dispose.
+    fn disarm() {
+        SPINE_UNWIND.with(|g| *g.lock().expect("unwind lock") = std::sync::Weak::new());
+    }
+}
+
+impl Drop for SpineUnwindGuard {
+    fn drop(&mut self) {
+        // Panic path: dispose the live composition (guard + fiber) and
+        // close its mirror, releasing the session lock. The handle is
+        // taken *inside* `ManuallyDrop`: a taken `Arc<SpineMount>` whose
+        // scope ends normally would run `SpineMount::drop` a second time
+        // — on the wrapper's Ok exit that resurrects the healthy spine
+        // and disposes it while its `Mounted` still serves. Only the
+        // unwind's Drop path gets `ManuallyDrop`'s drop glue.
+        let spine = SPINE_UNWIND.with(|g| {
+            let mut slot = g.lock().expect("unwind lock");
+            let spine = slot.upgrade();
+            *slot = std::sync::Weak::new();
+            spine
+        });
+        if let Some(spine) = spine {
+            let held = std::mem::ManuallyDrop::new(spine);
+            held.dispose();
+            if let Some(mirror) = held.mirror.as_ref() {
+                mirror.close();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1093,6 +1144,14 @@ impl ConfigComposer {
     /// Mount a composition and capture its spine as a reusable handle.
     ///
     /// The seed threads through to the spine row's mount (#67 §5).
+    ///
+    /// **Unwind contract.** A seeded spine's registry entry pins the
+    /// plugin (and through it the seed's writer cell), so dropping the
+    /// returned `SpineMount` alone never runs its `Drop` — the session
+    /// mirror's flock would outlive the mount. Callers that compose a
+    /// spine outside the `mount_seeded` wrapper (the seam tests) must
+    /// hold the `Arc<SpineMount>` until the fallible step completes, or
+    /// dispose explicitly. The wrapper is the tested production route.
     pub fn mount_spine_for(
         &self,
         doc: &ConfigDoc,
@@ -1270,14 +1329,19 @@ impl BootComposer for ConfigComposer {
             .expect("seed slot lock")
             .take()
             .expect("seed slot fresh");
+        // The panic-path unwind: armed by the body when its spine
+        // composes, disarmed here at both exits. A panic past this point
+        // runs the guard's Drop — the same dispose the Err arm performs.
+        let _unwind = SpineUnwindGuard;
         match self.mount_seeded_inner(doc, seed_for_mount) {
             Ok(mounted) => {
                 // The composition is live and owned by its `Mounted`;
-                // clear the unwind slot so a *later* mount's failure can
+                // clear the unwind slots so a *later* mount's failure can
                 // never dispose this healthy spine.
                 LAST_MOUNTED_SPINE.with(|s| {
                     *s.lock().expect("probe lock") = std::sync::Weak::new();
                 });
+                SpineUnwindGuard::disarm();
                 Ok(mounted)
             }
             Err(err) => {
@@ -1303,6 +1367,10 @@ impl BootComposer for ConfigComposer {
                 LAST_MOUNTED_SPINE.with(|s| {
                     *s.lock().expect("probe lock") = std::sync::Weak::new();
                 });
+                // The Err arm disposed above; the panic handle must not
+                // dispose again on the guard's Drop (it is idempotent, but
+                // the slot's handle is the single source).
+                SpineUnwindGuard::disarm();
                 Err(crate::boot::MountFailure::carried(
                     err,
                     crate::boot::take_slot(&slot),
@@ -1413,6 +1481,14 @@ impl ConfigComposer {
             // no-op and strand the session lock.
             LAST_MOUNTED_SPINE
                 .with(|s| *s.lock().expect("probe lock") = std::sync::Arc::downgrade(&spine));
+            // Arm the wrapper's panic-path unwind (see `SpineUnwindGuard`):
+            // a panic between here and the wrapper's return disposes the
+            // live composition the way the wrapper's Err arm does. The
+            // wrapper disarms at both exits, so a clean or named-failure
+            // finish never double-disposes.
+            SPINE_UNWIND.with(|g| {
+                *g.lock().expect("unwind lock") = std::sync::Arc::downgrade(&spine)
+            });
             spine
         } else {
             match entry.spine.as_ref().and_then(std::sync::Weak::upgrade) {

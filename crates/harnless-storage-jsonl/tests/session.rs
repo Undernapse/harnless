@@ -146,6 +146,32 @@ fn lock_held_second_open_refuses_and_compaction_refuses() {
 }
 
 #[test]
+fn abandon_refuses_under_a_held_lock_and_removes_both_files_after() {
+    // Lock-first rule: `abandon` takes the flock *before* any unlink and
+    // holds it through both. An opener of the lock sibling is a live
+    // holder — the abandon must refuse (`session-locked`) and touch
+    // nothing. Without the lock-first step the unlink runs through the
+    // held lock, and the next creator's fresh sibling is a different
+    // inode: two holders of one session.
+    let dir = fixture("abandon");
+    let store = SessionStore::new(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("11.jsonl"), "").unwrap();
+    let lock_path = dir.join("11.jsonl.lock");
+    std::fs::write(&lock_path, "").unwrap();
+    let probe = FileLock::hold(&dir, 11).expect("probe takes the lock");
+    let err = store.abandon(11).unwrap_err();
+    assert_eq!(err.code, "session-locked");
+    assert!(dir.join("11.jsonl").exists(), "refused abandon keeps file");
+    assert!(lock_path.exists(), "refused abandon keeps sibling");
+    drop(probe);
+    store.abandon(11).expect("abandon after release");
+    assert!(!dir.join("11.jsonl").exists());
+    assert!(!lock_path.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn torn_tail_loads_tolerantly_and_first_append_truncates() {
     let dir = fixture("torn");
     let store = SessionStore::new(&dir);

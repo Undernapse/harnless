@@ -949,6 +949,144 @@ fn toolless_seeded_mount_keeps_one_writer_owner() {
 }
 
 #[test]
+fn panic_after_spine_mount_disposes_the_composition_and_releases_the_lock() {
+    // SPINE_UNWIND's rule: the wrapper's Err arm is not the only unwind
+    // path. A panic *after* the spine composed (the registry pins the
+    // plugin, so the body's `Arc<SpineMount>` drop never disposes) must
+    // still tear the composition down and release the session lock —
+    // the round-two defect's shape, on the panic path.
+    //
+    // The panic is injected at the seam the guard exists for: a
+    // `BootComposer` whose `mount_seeded` *is* the wrapper — it mounts a
+    // real seeded spine (taking the session lock through the mirror) and
+    // then panics at the fallible step after the spine, exactly where
+    // `config_route_failed_resume_mount_releases_the_lock` pins the model
+    // step's Err path. The guard's Drop must run the same dispose the Err
+    // arm runs.
+    use harnless_cli::boot::{BootComposer, MountSeed};
+    let dir = config_store_dir("panicunwind");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = SessionStore::new(&dir);
+    let source = 4061u64;
+    std::fs::write(store.session_path(source), file_fixture_lines()).unwrap();
+
+    let cfg = config_store_dir("panicunwind-cfg");
+    let _ = std::fs::remove_dir_all(&cfg);
+    std::fs::create_dir_all(cfg.join("profiles")).unwrap();
+    std::fs::create_dir_all(cfg.join("bundles")).unwrap();
+    let corpus = support::write_corpus("panicunwind", &[text_recording("(idle)")]);
+    std::fs::write(
+        cfg.join("profiles").join("p.yml"),
+        format!(
+            "name: p\nrows:\n- id: spine\n  plugin: spine\n- id: model\n  plugin: llm-replay\n  config:\n    kind: replay\n    provider: scripted\n    script: {}\n- id: store\n  plugin: storage-jsonl\n  config:\n    dir: {}\n",
+            corpus.display(),
+            dir.display()
+        ),
+    )
+    .unwrap();
+    let composer = harnless_cli::config_boot::ConfigComposer::new(
+        std::sync::Arc::new(harnless_cli::config_boot::LayeredStore::new(Some(cfg))),
+        harnless_cli::config_boot::config::subst::Subst::new(),
+    );
+    let doc = composer.compose("p", None).expect("profile composes");
+
+    // The seam: the panic stands in for the wrapper body's post-spine
+    // fallible step (the model step
+    // `config_route_failed_resume_mount_releases_the_lock` pins on its
+    // Err path). It is injected at the composer's own seam: a
+    // `BootComposer` adapter that mounts a real seeded spine through the
+    // production machinery — the spine composes, the session lock is
+    // taken through the mirror — and then panics at the post-spine step.
+    // The unwind must dispose what mounted and release the flock; the
+    // round-two defect's shape, on the panic path.
+    struct PanicAtModelStep {
+        inner: harnless_cli::config_boot::ConfigComposer,
+    }
+    impl BootComposer for PanicAtModelStep {
+        fn profiles(&self) -> Vec<String> {
+            self.inner.profiles()
+        }
+        fn compose(
+            &self,
+            name: &str,
+            patch: Option<&str>,
+        ) -> Result<harnless_cli::profile::ProfileDoc, harnless_cli::CliError> {
+            self.inner.compose(name, patch)
+        }
+        fn dump(&self, doc: &harnless_cli::profile::ProfileDoc) -> String {
+            self.inner.dump(doc)
+        }
+        fn mount(
+            &self,
+            doc: &harnless_cli::profile::ProfileDoc,
+        ) -> Result<harnless_cli::boot::Mounted, harnless_cli::CliError> {
+            self.inner.mount(doc)
+        }
+        fn mount_seeded(
+            &self,
+            doc: &harnless_cli::profile::ProfileDoc,
+            seed: MountSeed,
+        ) -> Result<harnless_cli::boot::Mounted, harnless_cli::boot::MountFailure>
+        {
+            // The production row-mount machinery composes the spine and
+            // takes the session lock through the mirror; the panic is the
+            // fallible step *after* the spine. The seeded spine mounts
+            // through `mount_spine_for` — the same call the production
+            // wrapper's body makes — so the live composition the unwind
+            // must tear down is real.
+            let config_doc = self
+                .inner
+                .compose_config(&doc.name, &[])
+                .expect("the plan re-composes");
+            let wiring = match &doc.tools[..] {
+                [] => harnless_cli::boot::ToolsWiring::None,
+                declared => harnless_cli::boot::ToolsWiring::AutoAllow {
+                    declared: declared.to_vec(),
+                },
+            };
+            let _spine = self
+                .inner
+                .mount_spine_for(&config_doc, wiring, seed)
+                .expect("the seeded spine mounts");
+            panic!("the model step panicked after the spine mounted");
+        }
+    }
+
+    let stored = store.load(source).expect("loads").expect("session exists");
+    let writer = store.open_existing(source).expect("writer");
+    let seed = MountSeed {
+        session: harnless_seams::SessionId(source),
+        records: Some(stored.records),
+        id_seed: 0,
+        writer: std::sync::Arc::new(std::sync::Mutex::new(Some(writer))),
+        created_by_mount: false,
+    };
+    let wrapper = PanicAtModelStep { inner: composer };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match wrapper.mount_seeded(&doc, seed) {
+            Ok(_) => unreachable!("the seam panics"),
+            Err(failure) => panic!("the seam must panic, not fail: {}", failure.err.code),
+        }
+    }))
+    .expect_err("the seam's post-spine step panics");
+    drop(outcome);
+
+    // The guard's Drop disposed the live spine and closed its mirror:
+    // the flock is free for the next open. Without the guard, the
+    // registry-pinned spine keeps the mirror's writer — and the flock —
+    // for the process's life, and this probe stays `session-locked`.
+    FileLock::hold(&dir, source)
+        .expect("the panic path must dispose the composition and release the lock");
+    assert!(
+        store.load(source).expect("load").is_some(),
+        "a resume's file is never abandoned"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(config_store_dir("panicunwind-cfg"));
+}
+
+#[test]
 fn config_route_pre_spine_failure_never_disposes_a_live_sibling() {
     // LAST_MOUNTED_SPINE's staleness rule: a *successful* seeded mount
     // clears the slot, so a later mount that fails *before* composing its

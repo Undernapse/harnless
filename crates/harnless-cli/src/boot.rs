@@ -154,18 +154,6 @@ impl MountFailure {
         }
     }
 
-    /// Wrap a composer's plain failure, classifying whatever the seed's
-    /// slot still holds: a created file's writer is abandoned here (the
-    /// [`take_slot_of`] rule), a resume's writer rides back out. A
-    /// composer that bypassed this rule would strand an orphan or strand
-    /// a lock, so the classification happens at the boundary.
-    pub fn from_cli_error(err: CliError, seed: MountSeed) -> Self {
-        Self {
-            err,
-            unconsumed_writer: take_slot_of(&seed),
-        }
-    }
-
     /// Build a failure that recovers whatever the seed's shared writer
     /// slot still holds.
     fn from_cli(code: &'static str, message: impl Into<String>, seed: MountSeed) -> Self {
@@ -618,7 +606,14 @@ impl MirroringLog {
     /// a loud failure, never a silently unpersisted event and never a lock
     /// that outlives its owner.
     pub fn close(&self) {
-        let writer = self.writer.lock().expect("mirror writer lock").take();
+        // Poison-tolerant: this runs on unwind paths (the guards' Drop,
+        // `Mounted::drop`), where a panic that held the slot must not
+        // strand the flock. The writer is taken and dropped either way.
+        let writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
         drop(writer);
     }
 }
@@ -697,7 +692,16 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
         impl Drop for WriterGuard<'_> {
             fn drop(&mut self) {
                 if let Some(writer) = self.writer.take() {
-                    *self.seed.writer.lock().expect("seed lock") = Some(writer);
+                    // Never panic inside Drop: a poisoned cell (a panic
+                    // that held its lock) still takes the writer back
+                    // through `into_inner`; aborting here would defeat the
+                    // very unwind this guard is for.
+                    let mut cell = self
+                        .seed
+                        .writer
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    *cell = Some(writer);
                 }
             }
         }
@@ -711,6 +715,9 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
         impl Drop for MirrorGuard {
             fn drop(&mut self) {
                 if let Some(mirror) = self.mirror.take() {
+                    // `close` locks the mirror's writer slot; a poisoned
+                    // slot (a panic that held it) must still release the
+                    // flock. `MirroringLog::close` is poison-tolerant.
                     mirror.close();
                 }
             }

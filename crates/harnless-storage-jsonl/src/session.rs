@@ -314,10 +314,18 @@ impl SessionStore {
     /// still this boot's orphan), so this is the by-id shape of
     /// [`SessionWriter::abandon`].
     ///
-    /// The flock is taken (non-blocking) *before* the unlink: the writer's
-    /// close released it, so a concurrent open may already own the file —
-    /// a held lock refuses the abandon (`session-locked`) rather than
-    /// unlinking under a live writer. A missing file or sibling is success.
+    /// The flock is taken (non-blocking) *before* both unlinks and held
+    /// through them: the writer's close released it, so a concurrent open
+    /// may already own the file — a held lock refuses the abandon
+    /// (`session-locked`) rather than unlinking under a live writer. The
+    /// guard must NOT be released between the unlinks: an opener that
+    /// acquires the old (unlinked) sibling's inode in that window locks an
+    /// inode nobody else can name, while the next creator's fresh sibling
+    /// is a different inode — two holders of one session. A fresh creator
+    /// is fenced by the `O_EXCL` file itself, so the session file's unlink
+    /// is the last step: once it goes, the next `create_new` builds a
+    /// wholly new file *and* sibling pair. A missing file or sibling is
+    /// success.
     pub fn abandon(&self, id: u64) -> Result<(), SessionError> {
         let path = self.path(id);
         // Lock-first: if another process holds the session, refuse.
@@ -327,16 +335,17 @@ impl SessionStore {
             p.push(".lock");
             std::path::PathBuf::from(p)
         };
-        for p in [&path, &lock_path] {
+        // Sibling first, then the session file — both under the held lock
+        // (see the doc: the file's unlink fences the next creator).
+        for p in [&lock_path, &path] {
             match std::fs::remove_file(p) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    // The unlink is the no-orphan rule's last step; an
-                    // I/O fault here strands residue the caller cannot
-                    // see (the route discards this error — the mount
-                    // failure it follows is the loud one). Name it on
-                    // stderr so the residue is never silent.
+                    // The unlink is the no-orphan rule's last step; an I/O
+                    // fault strands residue the caller cannot see (the route
+                    // discards this error — the mount failure it follows is
+                    // the loud one). Name it so the residue is never silent.
                     eprintln!(
                         "warning: abandoning session {id}: {} (residue left at {})",
                         e,
