@@ -785,7 +785,14 @@ fn failed_fresh_mount_abandons_the_mint() {
         Some(&dir),
     );
     let opened = open_session(&DefaultComposer, &doc, None, None, None);
-    assert!(opened.is_err(), "the missing script refuses the mount");
+    assert!(matches!(opened, Err(_)), "the missing script refuses the mount");
+    // The reference composer's classification hands the *unconsumed
+    // writer* back, and `unwind_created` abandons through it — the
+    // writer-shaped arm removes both the file and its lock sibling, so
+    // the leftover pair below is its observable. The writer arm's own
+    // seam is `failed_fork_mount_leaves_no_orphan`, which drives the
+    // same `unwind_created` path on the fork route.
+    drop(opened);
     let leftovers: Vec<String> = std::fs::read_dir(&dir)
         .unwrap()
         .flatten()

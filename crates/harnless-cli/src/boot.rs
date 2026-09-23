@@ -127,7 +127,15 @@ pub(crate) fn classify_failed_cell(
     Option<harnless_storage_jsonl::SessionWriter>,
     Result<(), harnless_storage_jsonl::SessionError>,
 ) {
-    let writer = cell.lock().expect("seed lock").take();
+    // Poison-tolerant: the classification is the last line of the
+    // no-orphan rule and runs on unwind paths (the panic guard's Drop),
+    // where a panic that held the cell's lock must not turn into a
+    // panic-inside-Drop abort that strands the flock and orphans the
+    // file. The take succeeds either way.
+    let writer = cell
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
     match writer {
         Some(writer) if created_by_mount => (None, writer.abandon()),
         other => (other, Ok(())),
@@ -613,8 +621,8 @@ impl MirroringLog {
     /// The id of the session file this mirror writes — stable for the
     /// mirror's life, readable after [`Self::close`]. The panic-path
     /// unwind uses this to name the session file a consumed writer owns.
-    pub(crate) fn held_id(&self) -> Option<u64> {
-        Some(self.id)
+    pub(crate) fn held_id(&self) -> u64 {
+        self.id
     }
 
     /// The mirror function installed on the mounted log. A mirror failure is

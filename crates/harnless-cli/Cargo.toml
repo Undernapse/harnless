@@ -27,8 +27,12 @@ path = "src/main.rs"
 [features]
 # Test-only seams (the durability seam's direct-spine window). Enabled by
 # default so `cargo test` (and CI's plain `cargo test --workspace`) builds
-# the seam suite; a production binary build simply carries one dead
-# pub fn. Never enabled by dependents that use default-features = false.
+# the seam suite without a feature flag. The cost is real: the release
+# binary compiles the seam helpers and `mount_seeded_body`'s hook dispatch
+# (a thread-local lock + Arc clone per mount, inert — nothing in the
+# binary can arm the hook). Making the feature non-default would instead
+# ship the seam tests as silently skipped (`required-features` below),
+# which is the worse failure for a suite whose contract is CI-green.
 default = ["test-cfg"]
 test-cfg = []
 
