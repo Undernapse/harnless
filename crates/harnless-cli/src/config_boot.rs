@@ -1093,7 +1093,7 @@ impl ConfigComposer {
     /// Mount a composition and capture its spine as a reusable handle.
     ///
     /// The seed threads through to the spine row's mount (#67 §5).
-    pub(crate) fn mount_spine_for(
+    pub fn mount_spine_for(
         &self,
         doc: &ConfigDoc,
         wiring: ToolsWiring,
@@ -1271,7 +1271,15 @@ impl BootComposer for ConfigComposer {
             .take()
             .expect("seed slot fresh");
         match self.mount_seeded_inner(doc, seed_for_mount) {
-            Ok(mounted) => Ok(mounted),
+            Ok(mounted) => {
+                // The composition is live and owned by its `Mounted`;
+                // clear the unwind slot so a *later* mount's failure can
+                // never dispose this healthy spine.
+                LAST_MOUNTED_SPINE.with(|s| {
+                    *s.lock().expect("probe lock") = std::sync::Weak::new();
+                });
+                Ok(mounted)
+            }
             Err(err) => {
                 // A failure *after* the spine mounted must tear the whole
                 // composition down — every row resource in the spine's

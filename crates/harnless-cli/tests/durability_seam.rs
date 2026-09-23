@@ -894,3 +894,135 @@ fn super_support_open(
 ) -> Result<harnless_cli::session::SessionMount, harnless_cli::CliError> {
     harnless_cli::session::open_session(composer, doc, Some(707), None, None)
 }
+
+#[test]
+fn toolless_seeded_mount_keeps_one_writer_owner() {
+    // The guard's disarm rule on the tool-less Ok path: a seeded mount
+    // whose profile declares no tools must leave the writer with exactly
+    // one owner (the mirror). If the guard rolled it back into the seed
+    // cell on the Ok return, the *next* mount's failure classification
+    // would find a writer there — and a created-file seed would abandon a
+    // file a live mirror is still appending to. Observable shape: mount
+    // fresh (no tools), drive a turn, drop it, then resume the same id —
+    // the resume must see the first turn's records, which only holds if
+    // the first mount's mirror owned the writer alone and wrote them.
+    let dir = temp_store("toollessowner");
+    let corpus = support::write_corpus("toollessowner", &[text_recording("hello")]);
+    let doc = support::seam_profile_store("toollessowner", Some(&corpus), &[], Some(&dir));
+    let store = SessionStore::new(&dir);
+
+    let first = open_session(&DefaultComposer, &doc, None, None, None).expect("fresh mounts");
+    let id = first.id;
+    drive_turn(&first.mounted, "hi").expect("turn runs");
+    drop(first);
+    // The turn's records are in the file: the mirror wrote them (one owner,
+    // no rollback stole the writer).
+    let stored = store.load(id).expect("loads").expect("session exists");
+    assert!(stored.records.len() >= 2, "the turn persisted");
+
+    // A second fresh mount that fails *after* minting (unreadable script)
+    // must abandon its own mint — and must not touch the first session.
+    let bad = support::seam_profile_store(
+        "toollessowner",
+        Some(std::path::Path::new("/nonexistent/missing-script.json")),
+        &[],
+        Some(&dir),
+    );
+    // The double-owner shape the disarm rule forbids: the failed mount's
+    // `MountSeed::clone` inherits the *shared* writer cell, and a guard
+    // that never disarmed leaves the first mount's live writer in it. The
+    // mint retry then sees a full cell, and the created-by-mount failure
+    // arm abandons the writer — unlinking the first session's file under
+    // its live mirror. The first session must survive its sibling's
+    // failed mount.
+    let opened = open_session(&DefaultComposer, &bad, None, None, None);
+    assert!(opened.is_err(), "the missing script refuses the mount");
+    let ids: Vec<u64> = store.list().iter().map(|m| m.id).collect();
+    assert_eq!(ids, vec![id], "only the first session survives");
+    // And it stays loadable: the mirror's file was never unlinked.
+    let stored = store.load(id).expect("loads").expect("session survives");
+    assert!(
+        stored.records.len() >= 2,
+        "the first session's records survive"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn config_route_pre_spine_failure_never_disposes_a_live_sibling() {
+    // LAST_MOUNTED_SPINE's staleness rule: a *successful* seeded mount
+    // clears the slot, so a later mount that fails *before* composing its
+    // own spine cannot upgrade a stale handle and dispose the healthy
+    // composition. Shape: mount a seeded spine directly (live, holding
+    // the session lock through its mirror); a second seeded mount fails
+    // *before* its own spine composes (the source is locked, so the fork
+    // route refuses at `read_locked`); the first composition's lock must
+    // survive. With a stale slot, the wrapper's failure arm disposes the
+    // healthy spine and the lock goes with it.
+    use harnless_cli::boot::{BootComposer as _, MountSeed};
+    let dir = config_store_dir("stalespine");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = SessionStore::new(&dir);
+    let source = 808u64;
+    std::fs::write(store.session_path(source), file_fixture_lines()).unwrap();
+
+    let cfg = std::env::temp_dir().join(format!("hrls-cfg-stalespine-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cfg);
+    std::fs::create_dir_all(cfg.join("profiles")).unwrap();
+    std::fs::create_dir_all(cfg.join("bundles")).unwrap();
+    let corpus = support::write_corpus("stalespine", &[text_recording("(idle)")]);
+    std::fs::write(
+        cfg.join("profiles").join("p.yml"),
+        format!(
+            "name: p\nrows:\n- id: spine\n  plugin: spine\n- id: model\n  plugin: llm-replay\n  config:\n    kind: replay\n    provider: scripted\n    script: {}\n- id: store\n  plugin: storage-jsonl\n  config:\n    dir: {}\n",
+            corpus.display(),
+            dir.display()
+        ),
+    )
+    .unwrap();
+    let composer = harnless_cli::config_boot::ConfigComposer::new(
+        std::sync::Arc::new(harnless_cli::config_boot::LayeredStore::new(Some(cfg))),
+        harnless_cli::config_boot::config::subst::Subst::new(),
+    );
+    let doc = composer.compose("p", None).expect("profile composes");
+
+    // A live seeded mount through the wrapper: the composition holds the
+    // session lock. The wrapper records the spine in LAST_MOUNTED_SPINE
+    // and clears the slot on success.
+    let stored = store.load(source).expect("loads").expect("session exists");
+    let writer = store.open_existing(source).expect("writer");
+    let seed = MountSeed {
+        session: harnless_seams::SessionId(source),
+        records: Some(stored.records),
+        id_seed: 0,
+        writer: std::sync::Arc::new(std::sync::Mutex::new(Some(writer))),
+        created_by_mount: false,
+    };
+    let mounted = match composer.mount_seeded(&doc, seed) {
+        Ok(mounted) => mounted,
+        Err(failure) => panic!("the seeded mount must succeed: {}", failure.err.code),
+    };
+
+    // A second seeded mount fails *pre-spine*: the fork route's source
+    // read meets the live lock and refuses before any target exists.
+    let opened = harnless_cli::session::open_session(&composer, &doc, None, Some(source), None);
+    let err = match opened {
+        Ok(_) => panic!("a locked source must refuse the fork"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code, "session-locked");
+
+    // The healthy composition still holds the lock — the failed mount
+    // disposed nothing.
+    let probe = FileLock::hold(&dir, source);
+    match probe {
+        Ok(_) => panic!("the failed fork must not release the live mount's lock"),
+        Err(e) => assert_eq!(e.code, "session-locked"),
+    }
+    drop(mounted);
+    FileLock::hold(&dir, source)
+        .ok()
+        .expect("lock free after the mount drops");
+    let _ = std::fs::remove_dir_all(&dir);
+}

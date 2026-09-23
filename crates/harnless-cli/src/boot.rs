@@ -700,6 +700,20 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
                 }
             }
         }
+        // Once the mirror is published, the rollback is the mirror close:
+        // the writer lives inside the mirror, not the guard, and every
+        // later exit (Err or panic) must release it — `close` is idempotent
+        // (a take-and-drop), so mount_spine's map_err arm may run it again.
+        struct MirrorGuard {
+            mirror: Option<Arc<MirroringLog>>,
+        }
+        impl Drop for MirrorGuard {
+            fn drop(&mut self) {
+                if let Some(mirror) = self.mirror.take() {
+                    mirror.close();
+                }
+            }
+        }
         let writer = self.seed.take_writer();
         let mut guard = WriterGuard {
             seed: &self.seed,
@@ -714,14 +728,23 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
             None => (log, None),
         };
         *self.mounted_mirror.lock().expect("mirror out lock") = mirror.clone();
-        // The guard stays armed until `apply` returns Ok: every Err *and
-        // every panic* after this point rolls the writer back into the
-        // shared cell (the guard's Drop runs before any unwind handler),
-        // and mount_spine's failure arm closes the mirror it published.
-        // Disarming here would strand the lock on a panic path that no
-        // `?` handler reaches.
+        // From the mirror's publication until the composition exists, every
+        // exit — Err or panic — must close the mirror: the writer lives
+        // inside it, and a stranded mirror strands the flock for the
+        // process's life. The guard's Drop is the panic path's release;
+        // mount_spine's map_err arm runs the same idempotent close on the
+        // Err path.
+        let mut mirror_guard = MirrorGuard {
+            mirror: mirror.clone(),
+        };
         Spine::new(self.seed.session).apply_with_log(ctx, log)?;
         let ToolsWiring::AutoAllow { declared } = &self.wiring else {
+            // The tool-less composition is complete: the mirror's writer
+            // rides with it and `Mounted::drop` owns the release. Disarm
+            // both rollbacks — a guard that rolls back after this point
+            // would double-own the fd and the flock.
+            drop(mirror_guard.mirror.take());
+            drop(guard);
             return Ok(());
         };
         let tools = ctx
@@ -782,7 +805,8 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
         ctx.remove::<harnless_agent::loop_::AgentLoop>();
         ctx.provide_shared(&fiber, Arc::new(loop_))?;
         // The composition exists now: the mirror's writer rides with it,
-        // and `Mounted::drop` owns the release. Disarm the rollback.
+        // and `Mounted::drop` owns the release. Disarm both rollbacks.
+        drop(mirror_guard.mirror.take());
         drop(guard);
         Ok(())
     }
