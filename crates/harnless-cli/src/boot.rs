@@ -94,6 +94,7 @@ pub trait BootComposer: Send + Sync + 'static {
             MountFailure {
                 err,
                 unconsumed_writer: None,
+                abandon_outcome: Ok(()),
             }
         })
     }
@@ -101,19 +102,21 @@ pub trait BootComposer: Send + Sync + 'static {
 
 /// Classify a failed mount's seed: a writer the mount never consumed
 /// rides back to the caller — unless the file is one this boot created,
-/// in which case it is abandoned here (unlock + unlink, no orphan).
-/// A seed whose writer slot is empty had its writer taken by a mount that
-/// then failed *after* taking it; that failure arm already closed it.
+/// in which case it is abandoned here (unlock + unlink, no orphan) and
+/// the caller gets the abandon's own outcome — a refusal or I/O fault is
+/// never swallowed here. A seed whose writer slot is empty had its writer
+/// taken by a mount that then failed *after* taking it; that failure arm
+/// already closed it.
 pub(crate) fn classify_failed_seed(
     seed: &MountSeed,
-) -> Option<harnless_storage_jsonl::SessionWriter> {
+) -> (
+    Option<harnless_storage_jsonl::SessionWriter>,
+    Result<(), harnless_storage_jsonl::SessionError>,
+) {
     let writer = seed.writer.lock().expect("seed lock").take();
     match writer {
-        Some(writer) if seed.created_by_mount => {
-            let _ = writer.abandon();
-            None
-        }
-        other => other,
+        Some(writer) if seed.created_by_mount => (None, writer.abandon()),
+        other => (other, Ok(())),
     }
 }
 
@@ -121,11 +124,15 @@ pub(crate) fn classify_failed_seed(
 /// config route keeps the seed behind a lock until the mount consumes it).
 pub(crate) fn classify_failed_slot(
     slot: &std::sync::Arc<std::sync::Mutex<Option<MountSeed>>>,
-) -> Option<harnless_storage_jsonl::SessionWriter> {
+) -> (
+    Option<harnless_storage_jsonl::SessionWriter>,
+    Result<(), harnless_storage_jsonl::SessionError>,
+) {
     let mut guard = slot.lock().expect("seed slot lock");
     match guard.as_mut() {
         Some(seed) => classify_failed_seed(seed),
-        None => None, // the mount consumed it: a failure arm already ran
+        // The mount consumed it: a failure arm already ran.
+        None => (None, Ok(())),
     }
 }
 
@@ -141,27 +148,38 @@ pub struct MountFailure {
     pub err: CliError,
     /// The writer the seed still holds, if the mount never reached it.
     pub unconsumed_writer: Option<harnless_storage_jsonl::SessionWriter>,
+    /// The outcome of the classification's own abandon (a created file the
+    /// mount never consumed). `Ok` when nothing was abandoned here; an
+    /// `Err` names a refusal or I/O fault the caller must surface — the
+    /// orphan is never silent.
+    pub abandon_outcome: Result<(), harnless_storage_jsonl::SessionError>,
 }
 
 impl MountFailure {
-    /// A named failure with no writer to hand back (the mount consumed it,
-    /// or the route never had one).
+    /// A named failure with the classification's writer and abandon outcome.
     pub(crate) fn carried(
         err: CliError,
-        unconsumed_writer: Option<harnless_storage_jsonl::SessionWriter>,
+        classified: (
+            Option<harnless_storage_jsonl::SessionWriter>,
+            Result<(), harnless_storage_jsonl::SessionError>,
+        ),
     ) -> Self {
+        let (unconsumed_writer, abandon_outcome) = classified;
         Self {
             err,
             unconsumed_writer,
+            abandon_outcome,
         }
     }
 
     /// Build a failure that recovers whatever the seed's shared writer
-    /// slot still holds.
+    /// slot still holds. The slot's writer rides back unconsumed, so no
+    /// abandon happened here.
     fn from_cli(code: &'static str, message: impl Into<String>, seed: MountSeed) -> Self {
         Self {
             err: CliError::new(code, message),
             unconsumed_writer: seed.writer.lock().expect("seed lock").take(),
+            abandon_outcome: Ok(()),
         }
     }
 }

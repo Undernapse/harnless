@@ -170,21 +170,7 @@ impl FileLock {
                     format!("opening lock file {}: {e}", path.display()),
                 )
             })?;
-        let would_block = |e: std::io::Error| {
-            if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                SessionError::new(
-                    "session-locked",
-                    format!(
-                        "session {id} is locked by process {}",
-                        read_holder(&path)
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| "?".to_string())
-                    ),
-                )
-            } else {
-                SessionError::new("io-error", format!("locking session {id}: {e}"))
-            }
-        };
+        let would_block = |e: std::io::Error| lock_error(id, &path, e);
         let rc = if nonblocking {
             // SAFETY: `file` is a valid open descriptor for the duration.
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
@@ -220,9 +206,9 @@ pub(crate) fn lock_sibling(target: &Path) -> PathBuf {
 }
 
 /// Remove the two files an abandoned session owns, in `order`. A missing
-/// file or sibling is success; an I/O fault names itself on stderr (the
-/// route discards this error — the mount failure it follows is the loud
-/// one) so the residue is never silent.
+/// file or sibling is success; an I/O fault names itself on stderr — the
+/// residue is never silent, whichever caller (or discarding caller)
+/// receives the typed error.
 fn remove_pair(id: u64, order: [&Path; 2]) -> Result<(), SessionError> {
     for p in order {
         match std::fs::remove_file(p) {
@@ -242,6 +228,25 @@ fn remove_pair(id: u64, order: [&Path; 2]) -> Result<(), SessionError> {
         }
     }
     Ok(())
+}
+
+/// The one lock-failure error shape: a would-block is `session-locked`
+/// naming the id and the holder pid; anything else is `io-error`. Shared
+/// by [`FileLock::acquire`] and [`SessionStore::abandon`]'s probe.
+fn lock_error(id: u64, lock_path: &Path, e: std::io::Error) -> SessionError {
+    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        SessionError::new(
+            "session-locked",
+            format!(
+                "session {id} is locked by process {}",
+                read_holder(lock_path)
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            ),
+        )
+    } else {
+        SessionError::new("io-error", format!("locking session {id}: {e}"))
+    }
 }
 
 pub fn read_holder(lock_path: &Path) -> Option<u32> {
@@ -373,22 +378,7 @@ impl SessionStore {
             // SAFETY: `probe` is a live owned file; the flock is released
             // when it drops — after both unlinks below.
             if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                let e = std::io::Error::last_os_error();
-                if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
-                    return Err(SessionError::new(
-                        "io-error",
-                        format!("locking session {id}: {e}"),
-                    ));
-                }
-                return Err(SessionError::new(
-                    "session-locked",
-                    format!(
-                        "session {id} is locked by process {}",
-                        read_holder(&lock_path)
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| "?".to_string())
-                    ),
-                ));
+                return Err(lock_error(id, &lock_path, std::io::Error::last_os_error()));
             }
         }
         // Sibling first, then the session file — both under the held lock

@@ -109,11 +109,11 @@ pub fn open_session(
             let (id, writer) = mint_with(|id| store.create_new(id))?;
             let mounted = match mount_seeded(composer, doc, id, None, Some(writer), true) {
                 Ok(mounted) => mounted,
-                Err((err, writer)) => {
+                Err((err, writer, abandon)) => {
                     // The mint created the file; the composition that would
                     // own it never mounted. Leave no orphan behind (see
                     // `unwind_created`).
-                    unwind_created(&store, id, writer);
+                    unwind_created(&store, id, writer, abandon);
                     return Err(err);
                 }
             };
@@ -143,10 +143,12 @@ pub fn open_session(
                 false,
             ) {
                 Ok(mounted) => mounted,
-                Err((err, writer)) => {
+                Err((err, writer, _abandon)) => {
                     // The session file predates this process; only a torn
                     // repair (or none) happened. Drop the writer — the lock
                     // goes with it — and leave the bytes for the next open.
+                    // (A resume's seed is never created-by-mount, so
+                    // `_abandon` is always Ok here.)
                     drop(writer);
                     return Err(err);
                 }
@@ -184,13 +186,13 @@ pub fn open_session(
                 true,
             ) {
                 Ok(mounted) => mounted,
-                Err((err, writer)) => {
+                Err((err, writer, abandon)) => {
                     // The target file is this route's own creation; a mount
                     // that fails after `create_fork` must leave no orphan
                     // (#67 §5's rule, extended to the mount-failure window)
                     // — otherwise `sessions list` renders a fork that never
                     // ran, and the user can resume it.
-                    unwind_created(&store, target, writer);
+                    unwind_created(&store, target, writer, abandon);
                     return Err(err);
                 }
             };
@@ -201,6 +203,14 @@ pub fn open_session(
         }
     }
 }
+
+/// A failed seeded mount: the named error, the writer the mount never
+/// consumed (if any), and the classification's own abandon outcome.
+type MountFailed = (
+    CliError,
+    Option<harnless_storage_jsonl::SessionWriter>,
+    Result<(), harnless_storage_jsonl::SessionError>,
+);
 
 /// Mount `doc` with the session seed: the store's records (resume/fork) or
 /// none (fresh), the id floor, and the mirroring writer.
@@ -220,7 +230,7 @@ fn mount_seeded(
     seed: Option<(Vec<harnless_agent::events::CommittedRecord>, u64)>,
     writer: Option<harnless_storage_jsonl::SessionWriter>,
     created_by_mount: bool,
-) -> Result<Mounted, (CliError, Option<harnless_storage_jsonl::SessionWriter>)> {
+) -> Result<Mounted, MountFailed> {
     let (records, id_seed) = match seed {
         Some((records, max)) => (Some(records), max),
         None => (None, 0),
@@ -234,21 +244,31 @@ fn mount_seeded(
     };
     match composer.mount_seeded(doc, seed) {
         Ok(mounted) => Ok(mounted),
-        Err(failure) => Err((failure.err, failure.unconsumed_writer)),
+        Err(failure) => Err((
+            failure.err,
+            failure.unconsumed_writer,
+            failure.abandon_outcome,
+        )),
     }
 }
 
-/// Leave no orphan behind a failed created-by-mount mount: abandon the
-/// file via its writer when the mount never consumed it, or by id when a
-/// post-mirror failure arm already closed the writer (`abandon` re-takes
-/// the lock first and refuses rather than unlink under a live writer).
-/// A refusal or I/O fault names the residue on stderr — the orphan must
-/// never be silent: `sessions list` will still render it, and the mount
-/// error the caller returns says nothing about the file.
-fn unwind_created(store: &SessionStore, id: u64, writer: Option<SessionWriter>) {
-    let result = match writer {
-        Some(writer) => writer.abandon(),
-        None => store.abandon(id),
+fn unwind_created(
+    store: &SessionStore,
+    id: u64,
+    writer: Option<SessionWriter>,
+    classified: Result<(), harnless_storage_jsonl::SessionError>,
+) {
+    // The composer's own classification may already have abandoned the
+    // created file (the reference composer's path); its outcome arrives in
+    // `classified`. Otherwise this route abandons: via the writer when the
+    // mount never consumed it, or by id when a post-mirror failure arm
+    // already closed it.
+    let result = match classified {
+        Ok(()) => match writer {
+            Some(writer) => writer.abandon(),
+            None => store.abandon(id),
+        },
+        Err(e) => Err(e),
     };
     if let Err(e) = result {
         eprintln!(
