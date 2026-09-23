@@ -184,7 +184,14 @@ impl MountFailure {
     fn from_cli(code: &'static str, message: impl Into<String>, seed: MountSeed) -> Self {
         Self {
             err: CliError::new(code, message),
-            unconsumed_writer: seed.writer.lock().expect("seed lock").take(),
+            // Poison-tolerant like every other lock on a mount-failure
+            // path: a panic that held the cell must not become a second
+            // panic here, on the path that reports the first.
+            unconsumed_writer: seed
+                .writer
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take(),
             abandon_outcome: Ok(()),
         }
     }
@@ -265,10 +272,10 @@ impl Drop for Mounted {
         // session lock goes with the composition no matter which service
         // handles (`Arc<SessionLog>`, `Arc<AgentLoop>`) outlive it — a
         // surviving handle's next append fails loudly, never silently.
-        // Disposing the registry's fibers first keeps the fiber's LIFO
-        // services (the loop's log clone) from dropping after the writer
-        // is gone; `Fiber::dispose` is idempotent, so a spine that already
-        // unwound via `_spine` is unaffected.
+        // Disposing the registry's fibers first is defensive ordering:
+        // no service reacts to the writer vanishing, and the mirror
+        // closure alone releases the lock. `Fiber::dispose` is idempotent,
+        // so a spine that already unwound via `_spine` is unaffected.
         if let Some(mirror) = self.mirror.take() {
             for fiber in self._registry.fibers() {
                 fiber.dispose();

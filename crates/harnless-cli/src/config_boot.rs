@@ -610,11 +610,11 @@ thread_local! {
         const { std::sync::Mutex::new(std::sync::Weak::new()) };
     /// The panic-path unwind slot: a cell the `mount_seeded` wrapper
     /// arms *before* the spine composes (the composition's own row loop
-    /// is fallible, and a panic inside it must find the half-published
-    /// mirror's flock in the registry slot). A panic past the arm runs
-    /// the guard's Drop — the same dispose the wrapper's Err arm performs
-    /// — and then the classification: a session file this boot created
-    /// abandons, never orphans (#67 §5).
+    /// is fallible; a panic inside it is released by `SpineWired::apply`'s
+    /// in-frame writer/mirror guards during unwind). A panic past the arm
+    /// runs the guard's Drop — the same dispose the wrapper's Err arm
+    /// performs — and then the classification: a session file this boot
+    /// created abandons, never orphans (#67 §5).
     static SPINE_UNWIND: std::sync::Mutex<UnwindSlot> =
         std::sync::Mutex::new(UnwindSlot::default());
 }
@@ -1673,9 +1673,9 @@ impl ConfigComposer {
         let spine = if !fresh {
             // The unwind slot's spine handle arms once the spine exists:
             // `unwind_after_failure` needs the `SpineMount`, and a panic
-            // *inside* the composition is owned by the row loop's own
-            // rollback (the plugin's WriterGuard/MirrorGuard release the
-            // mirror through the registry-pinned plugin even on unwind).
+            // *inside* the composition is released by `SpineWired::apply`'s
+            // in-frame writer/mirror guards as its own frame unwinds —
+            // nothing the registry holds releases the mirror.
             //
             // The composition returning Ok consumes the writer into the
             // mirror (or there was none): the mirror path owns a created

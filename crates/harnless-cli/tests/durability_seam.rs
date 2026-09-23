@@ -956,20 +956,19 @@ fn toolless_seeded_mount_keeps_one_writer_owner() {
 }
 
 #[test]
-fn panic_after_spine_mount_disposes_the_composition_and_releases_the_lock() {
-    // SPINE_UNWIND's rule: the wrapper's Err arm is not the only unwind
-    // path. A panic *after* the spine composed (the registry pins the
-    // plugin, so the body's `Arc<SpineMount>` drop never disposes) must
-    // still tear the composition down and release the session lock —
-    // the round-two defect's shape, on the panic path.
+fn panic_after_direct_spine_mount_releases_the_lock() {
+    // The composition's own rollback rule: a panic *after* the spine
+    // composed must still release the session lock. The registry pins
+    // the plugin, so a plain `Arc<SpineMount>` drop is not enough — the
+    // mirror's release is carried by `SpineWired::apply`'s in-frame
+    // writer/mirror guards, which run as apply's frame unwinds.
     //
-    // The panic is injected at the seam the guard exists for: a
-    // `BootComposer` whose `mount_seeded` *is* the wrapper — it mounts a
-    // real seeded spine (taking the session lock through the mirror) and
-    // then panics at the fallible step after the spine, exactly where
-    // `config_route_failed_resume_mount_releases_the_lock` pins the model
-    // step's Err path. The guard's Drop must run the same dispose the Err
-    // arm runs.
+    // This seam pins those in-frame guards, not `SpineUnwindGuard`: the
+    // `mount_seeded` override below replaces the production wrapper
+    // entirely, so the wrapper's guard is never armed on this path. The
+    // guard's own dispose + classification is pinned by the sibling seam
+    // `panic_after_spine_mount_abandons_a_created_file`, which drives the
+    // panic *through* the production wrapper.
     use harnless_cli::boot::{BootComposer, MountSeed};
     let dir = config_store_dir("panicunwind");
     let _ = std::fs::remove_dir_all(&dir);
@@ -998,15 +997,14 @@ fn panic_after_spine_mount_disposes_the_composition_and_releases_the_lock() {
     );
     let doc = composer.compose("p", None).expect("profile composes");
 
-    // The seam: the panic stands in for the wrapper body's post-spine
-    // fallible step (the model step
+    // The seam: the panic stands in for the model step
     // `config_route_failed_resume_mount_releases_the_lock` pins on its
-    // Err path). It is injected at the composer's own seam: a
+    // Err path. It is injected at the composer's own seam: a
     // `BootComposer` adapter that mounts a real seeded spine through the
     // production machinery — the spine composes, the session lock is
     // taken through the mirror — and then panics at the post-spine step.
-    // The unwind must dispose what mounted and release the flock; the
-    // round-two defect's shape, on the panic path.
+    // The unwind must release the flock; the round-two defect's shape,
+    // on the panic path.
     struct PanicAtModelStep {
         inner: harnless_cli::config_boot::ConfigComposer,
     }
@@ -1077,13 +1075,12 @@ fn panic_after_spine_mount_disposes_the_composition_and_releases_the_lock() {
     }))
     .expect_err("the seam's post-spine step panics");
     drop(outcome);
-
-    // The guard's Drop disposed the live spine and closed its mirror:
-    // the flock is free for the next open. Without the guard, the
-    // registry-pinned spine keeps the mirror's writer — and the flock —
-    // for the process's life, and this probe stays `session-locked`.
+    // The unwind released the mirror's writer: the flock is free for the
+    // next open. Without apply's in-frame guards, the registry-pinned
+    // plugin would keep the mirror's writer — and the flock — for the
+    // process's life, and this probe stays `session-locked`.
     FileLock::hold(&dir, source)
-        .expect("the panic path must dispose the composition and release the lock");
+        .expect("the panic path must release the mirror's writer and the lock");
     assert!(
         store.load(source).expect("load").is_some(),
         "a resume's file is never abandoned"
@@ -1100,8 +1097,10 @@ fn panic_after_spine_mount_abandons_a_created_file() {
     // the round-twelve defect's shape: the guard disposed the composition
     // and released the lock, but the classification ran only on the Err
     // path, so the panic left a resumable phantom plus lock residue.
-    // Same seam as `panic_after_spine_mount_disposes_the_composition_and_releases_the_lock`,
-    // with a created file instead of a resume.
+    // Unlike the direct-spine seam above, this one drives the panic
+    // *through* the production wrapper (via
+    // `mount_seeded_panicking_after_spine_for_test`), so it is the seam
+    // that pins `SpineUnwindGuard`'s dispose + classification.
     use harnless_cli::boot::{BootComposer, MountSeed};
     let dir = config_store_dir("panicorphan");
     let _ = std::fs::remove_dir_all(&dir);
