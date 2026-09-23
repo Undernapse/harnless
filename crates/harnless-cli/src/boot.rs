@@ -792,6 +792,7 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
             // both rollbacks — a guard that rolls back after this point
             // would double-own the fd and the flock.
             drop(mirror_guard.mirror.take());
+            guard.writer = None;
             drop(guard);
             return Ok(());
         };
@@ -855,6 +856,7 @@ impl harnless_runtime::plugin::Plugin for SpineWired {
         // The composition exists now: the mirror's writer rides with it,
         // and `Mounted::drop` owns the release. Disarm both rollbacks.
         drop(mirror_guard.mirror.take());
+        guard.writer = None;
         drop(guard);
         Ok(())
     }

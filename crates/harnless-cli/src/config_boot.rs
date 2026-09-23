@@ -658,6 +658,13 @@ impl Drop for SpineUnwindGuard {
             cell,
             created_by_mount,
         } = SPINE_UNWIND.with(|g| std::mem::take(&mut *g.lock().expect("unwind lock")));
+        // The strong spine handle, from *this* slot only: the wrapper
+        // arms `slot.spine` and `LAST_MOUNTED_SPINE` at the same instant,
+        // so the slot is the spine this mount composed. Falling back to
+        // `LAST_MOUNTED_SPINE` here would let a stale handle from an
+        // earlier mount's window dispose a composition this call never
+        // owned — the shape the pre-spine-sibling seam forbids.
+        let spine_live = spine.upgrade();
         // The writer's home *before* any close decides the route:
         // - still in the shared cell (the mount never consumed it, or
         //   rolled it back): classify through the cell;
@@ -675,13 +682,6 @@ impl Drop for SpineUnwindGuard {
                     .is_some()
             })
             .unwrap_or(false);
-        // The strong spine handle, from *this* slot only: the wrapper
-        // arms `slot.spine` and `LAST_MOUNTED_SPINE` at the same instant,
-        // so the slot is the spine this mount composed. Falling back to
-        // `LAST_MOUNTED_SPINE` here would let a stale handle from an
-        // earlier mount's window dispose a composition this call never
-        // owned — the shape the pre-spine-sibling seam forbids.
-        let spine_live = spine.upgrade();
         let mirror = spine_live.as_ref().and_then(|s| s.mirror.clone());
         let mirror_id = if !still_in_cell && created_by_mount {
             mirror.as_ref().map(|m| m.held_id())
@@ -1364,16 +1364,18 @@ pub fn mount_seeded_panicking_after_spine_for_test(
             slot.spine = std::sync::Arc::downgrade(&spine);
             slot.cell = Some(cell.clone());
         });
-        // The seam's strong handle rides `ManuallyDrop` across the panic:
-        // the guard's Drop must observe the post-mount state through the
-        // slot's weak handle, exactly as the production body's window
-        // does (there the composition is owned by the `Mounted` that
-        // never gets built). The guard takes the *same* handle and runs
-        // its drop glue explicitly, so the seam's copy is the only one
-        // that can outlive the unwind — and it is disarmed here, so the
-        // composition actually dies with the unwind instead of leaking
-        // a pinned registry entry the tests could mistake for the
-        // dispose.
+        // The seam's strong handle rides `ManuallyDrop` across the panic
+        // on purpose: the guard's Drop must observe the post-mount state
+        // through the slot's weak handle, exactly as the production
+        // body's window does (there the composition is owned by the
+        // `Mounted` that never gets built). It is the one strong ref
+        // that outlives the unwind *by design* — the guard's own
+        // `into_inner` is a decrement against it, so `SpineMount::drop`
+        // never runs and the disposed `SpineMount` allocation leaks for
+        // the test process's life. The teardown that matters is not the
+        // allocation: `unwind_after_failure` ran the guard dispose, the
+        // registry unmount, and the mirror close, so the flock is free
+        // and no registry entry pins anything.
         let _spine = std::mem::ManuallyDrop::new(spine);
         panic!("the model step panicked after the spine mounted");
     };
@@ -1668,15 +1670,13 @@ impl ConfigComposer {
             // mirror through the registry-pinned plugin even on unwind).
             //
             // The composition returning Ok consumes the writer into the
-            // mirror (or there was none): clear the slot's cell half so a
-            // later panic never touches this mount's writer — the mirror
-            // path owns a created file from here. A composition that
-            // failed *inside* its own row loop keeps the cell armed: if
-            // the spine row never consumed the writer it rode back with
-            // the dropped seed, and only the guard's classification can
-            // abandon a created file then. (A failure after the row
-            // consumed the writer left the cell empty; the
-            // classification is inert.)
+            // mirror (or there was none): the mirror path owns a created
+            // file from here. A composition that failed *inside* its own
+            // row loop keeps the cell armed: if the spine row never
+            // consumed the writer it rode back with the dropped seed, and
+            // only the guard's classification can abandon a created file
+            // then. (A failure after the row consumed the writer left the
+            // cell empty; the classification is inert.)
             //
             // Same-thread contract: the slot is a `thread_local`, and the
             // wrapper's failure arm reads it back on the *calling*
