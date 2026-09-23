@@ -608,47 +608,124 @@ thread_local! {
     /// lock for the process's life.
     static LAST_MOUNTED_SPINE: std::sync::Mutex<std::sync::Weak<SpineMount>> =
         const { std::sync::Mutex::new(std::sync::Weak::new()) };
-    /// The same spine behind an RAII handle: a panic between the spine's
-    /// composition and the wrapper's return disposes it on unwind, the
-    /// way the wrapper's Err arm disposes it on a named failure. The
-    /// wrapper disarms the handle at both exits.
-    static SPINE_UNWIND: std::sync::Mutex<std::sync::Weak<SpineMount>> =
-        const { std::sync::Mutex::new(std::sync::Weak::new()) };
+    /// The panic-path unwind slot: a cell the `mount_seeded` wrapper
+    /// arms *before* the spine composes (the composition's own row loop
+    /// is fallible, and a panic inside it must find the half-published
+    /// mirror's flock in the registry slot). A panic past the arm runs
+    /// the guard's Drop — the same dispose the wrapper's Err arm performs
+    /// — and then the classification: a session file this boot created
+    /// abandons, never orphans (#67 §5).
+    static SPINE_UNWIND: std::sync::Mutex<UnwindSlot> =
+        std::sync::Mutex::new(UnwindSlot::default());
 }
 
-/// Arms the panic-path unwind for a freshly-composed seeded spine; the
-/// `mount_seeded` wrapper disarms it once the body returns (either way).
+/// The panic-path unwind slot's payload: the weak spine handle plus the
+/// seed's writer cell and `created_by_mount` flag. The cell classifies a
+/// created file when the panic lands *before* the spine's mount consumed
+/// it; once the mount consumed the writer, the flag stays set and the
+/// guard's Drop classifies through the spine's mirror instead.
+#[derive(Default)]
+struct UnwindSlot {
+    spine: std::sync::Weak<SpineMount>,
+    cell: Option<std::sync::Arc<std::sync::Mutex<Option<harnless_storage_jsonl::SessionWriter>>>>,
+    created_by_mount: bool,
+}
+
+/// Arms the panic-path unwind for a seeded mount. The body takes the
+/// spine handle out of the slot when it records a composed spine (the
+/// composition's own exits own any unwind inside it); the wrapper's Ok
+/// exit clears the whole slot, so a *later* mount's failure can never
+/// dispose or classify this mount's healthy spine.
 struct SpineUnwindGuard;
 
 impl SpineUnwindGuard {
     /// Take the wrapper's unwind handle for the spine the body just
     /// composed, so the wrapper's exits own the dispose.
     fn disarm() {
-        SPINE_UNWIND.with(|g| *g.lock().expect("unwind lock") = std::sync::Weak::new());
+        SPINE_UNWIND.with(|g| *g.lock().expect("unwind lock") = UnwindSlot::default());
     }
+
 }
 
 impl Drop for SpineUnwindGuard {
     fn drop(&mut self) {
         // Panic path: dispose the live composition (guard + fiber) and
-        // close its mirror, releasing the session lock. The handle is
-        // taken *inside* `ManuallyDrop`: a taken `Arc<SpineMount>` whose
-        // scope ends normally would run `SpineMount::drop` a second time
-        // — on the wrapper's Ok exit that resurrects the healthy spine
-        // and disposes it while its `Mounted` still serves. Only the
-        // unwind's Drop path gets `ManuallyDrop`'s drop glue.
-        let spine = SPINE_UNWIND.with(|g| {
-            let mut slot = g.lock().expect("unwind lock");
-            let spine = slot.upgrade();
-            *slot = std::sync::Weak::new();
-            spine
-        });
-        if let Some(spine) = spine {
+        // close its mirror, releasing the session lock, then classify the
+        // seed's cell — a file this boot created abandons here, never as
+        // a phantom the panic leaves behind. The handle is taken *inside*
+        // `ManuallyDrop`: a taken `Arc<SpineMount>` whose scope ends
+        // normally would run `SpineMount::drop` a second time — on the
+        // wrapper's Ok exit that resurrects the healthy spine and disposes
+        // it while its `Mounted` still serves. Only the unwind's Drop path
+        // gets `ManuallyDrop`'s drop glue.
+        let UnwindSlot {
+            spine,
+            cell,
+            created_by_mount,
+        } = SPINE_UNWIND.with(|g| std::mem::take(&mut *g.lock().expect("unwind lock")));
+        // The writer's home *before* any close decides the route:
+        // - still in the shared cell (the mount never consumed it, or
+        //   rolled it back): classify through the cell;
+        // - consumed into the mirror: the mirror's held id names the
+        //   created file. The id is captured at the mirror's construction,
+        //   so it survives the close and the dispose below.
+        let still_in_cell = cell
+            .as_ref()
+            .map(|c| c.lock().expect("seed cell").is_some())
+            .unwrap_or(false);
+        // The strong spine handle: the seam's leaked handle and the
+        // wrapper's slot keep the spine alive across the unwind, so the
+        // mirror's id and the store's dir are still readable after the
+        // dispose.
+        let spine_live = spine
+            .upgrade()
+            .or_else(|| LAST_MOUNTED_SPINE.with(|s| s.lock().expect("probe lock").upgrade()));
+        let mirror = spine_live.as_ref().and_then(|s| s.mirror.clone());
+        let mirror_id = if !still_in_cell && created_by_mount {
+            mirror.as_ref().and_then(|m| m.held_id())
+        } else {
+            None
+        };
+        // The store dir the created file lives in, taken *before* the
+        // dispose: the abandon names the file by id, so it needs the dir.
+        let store_dir = spine_live
+            .as_ref()
+            .and_then(|s| s.store.as_ref())
+            .map(|st| st.dir().to_path_buf());
+        if let Some(spine) = spine_live {
             // `ManuallyDrop`'s holder keeps the Arc from running
             // `SpineMount::drop` when this scope ends: only the unwind's
-            // Drop path gets drop glue here.
+            // Drop path gets drop glue here. The dispose closes the
+            // mirror, releasing the flock — every handle to the mirror
+            // goes through this one spine, so no writer outlives the
+            // abandon below and re-creates the lock sibling.
             let held = std::mem::ManuallyDrop::new(spine);
             held.unwind_after_failure();
+        }
+        // The classification. The panic unwinds without an error value
+        // to return, so a failed abandon is reported, never swallowed —
+        // the same shape `unwind_created` prints.
+        let outcome = if let Some(cell) = cell.as_ref().filter(|_| still_in_cell) {
+            crate::boot::classify_failed_cell(cell, created_by_mount).1
+        } else if let Some(id) = mirror_id {
+            // The mount consumed the writer into the mirror and the
+            // dispose above closed it: the file is this boot's orphan
+            // with no writer left to name it. Abandon by id — the by-id
+            // shape fences a concurrent opener with the lock probe and
+            // is success on a missing file/sibling.
+            match store_dir.as_ref() {
+                Some(dir) => harnless_storage_jsonl::SessionStore::new(dir).abandon(id),
+                // No store row means no file this mount could have named.
+                None => Ok(()),
+            }
+        } else {
+            Ok(())
+        };
+        if let Err(e) = outcome {
+            eprintln!(
+                "warning: the session file created by this run could not be abandoned: {}: {}",
+                e.code, e.message
+            );
         }
     }
 }
@@ -1245,6 +1322,88 @@ impl ConfigComposer {
     }
 }
 
+/// The seam's window onto the panic path *through the production
+/// wrapper*: the wrapper's `mount_seeded` entry arms the panic guard and
+/// records the seed's cell; its body then dispatches to the installed
+/// [`SEAM_HOOK`], which mounts the real seeded spine and panics at the
+/// post-spine step with the composition pinned by the registry (the
+/// shape the guard's dispose must reach). The panic unwinds past this
+/// call; the test drives it under `catch_unwind`.
+#[cfg(any(test, feature = "test-cfg"))]
+pub fn mount_seeded_panicking_after_spine_for_test(
+    composer: &std::sync::Arc<ConfigComposer>,
+    doc: &crate::profile::ProfileDoc,
+    seed: crate::boot::MountSeed,
+    wiring: ToolsWiring,
+) -> Result<crate::boot::Mounted, crate::boot::MountFailure> {
+    let inner = composer.clone();
+    let cell = seed.writer.clone();
+    let hook = move |doc: &crate::profile::ProfileDoc, seed: crate::boot::MountSeed| {
+        let config_doc = inner
+            .compose_config(&doc.name, &[])
+            .expect("the plan re-composes");
+        let spine = std::sync::Arc::new(
+            inner
+                .mount_spine_for(&config_doc, wiring.clone(), seed)
+                .expect("the seeded spine mounts"),
+        );
+        // Leak the seam's spine handle: the guard's Drop must observe the
+        // post-mount state through the slot's weak handle, exactly as the
+        // production body's window does (there the composition is owned by
+        // the `Mounted` that never gets built).
+        let _spine = std::mem::ManuallyDrop::new(spine);
+        // The seam stands in for the wrapper body's *post-mount* window:
+        // record the spine and re-arm the cell exactly as the real body
+        // does, so the guard's Drop sees the production post-spine state.
+        LAST_MOUNTED_SPINE
+            .with(|s| *s.lock().expect("probe lock") = std::sync::Arc::downgrade(&_spine));
+        SPINE_UNWIND.with(|g| {
+            let mut slot = g.lock().expect("unwind lock");
+            slot.spine = std::sync::Arc::downgrade(&_spine);
+            slot.cell = Some(cell.clone());
+        });
+        panic!("the model step panicked after the spine mounted");
+    };
+    let prev = SEAM_HOOK.with(|h| {
+        h.lock()
+            .expect("seam hook")
+            .replace(std::sync::Arc::new(hook) as SeamHook)
+            .map(|_| ())
+    });
+    assert!(prev.is_none(), "one seam per thread");
+    // Restore the hook on every exit — including the panic unwind, which
+    // runs this guard's Drop.
+    let _restore = SeamHookGuard;
+    // The production wrapper's entry arms the panic guard and records the
+    // seed's cell *before* its body runs, and the body dispatches back
+    // through the seam — so the panic unwinds past the armed guard, the
+    // exact window the panic-path unwind is tested against.
+    composer.mount_seeded(doc, seed)
+}
+
+/// Restores the thread's seam hook on unwind (the seam's panic path).
+struct SeamHookGuard;
+
+impl Drop for SeamHookGuard {
+    fn drop(&mut self) {
+        SEAM_HOOK.with(|h| *h.lock().expect("seam hook") = None);
+    }
+}
+
+/// The thread's installed panic seam (test-cfg only): `None` outside a
+/// seam test. The wrapper's body dispatches here when armed. The hook is
+/// an `Arc` closure so the body can call it without taking ownership
+/// (the helper's restore guard owns the teardown).
+#[cfg(any(test, feature = "test-cfg"))]
+pub(crate) type SeamHook =
+    std::sync::Arc<dyn Fn(&crate::profile::ProfileDoc, crate::boot::MountSeed) + Send>;
+
+#[cfg(any(test, feature = "test-cfg"))]
+thread_local! {
+    pub(crate) static SEAM_HOOK: std::sync::Mutex<Option<SeamHook>> =
+        std::sync::Mutex::new(None);
+}
+
 /// A mounted spine's unwind handle, held as a guard resource.
 ///
 /// Dropping a [`Registry`] does not dispose its mounted fibers, so the
@@ -1338,6 +1497,9 @@ impl BootComposer for ConfigComposer {
         doc: &ProfileDoc,
         seed: crate::boot::MountSeed,
     ) -> Result<Mounted, crate::boot::MountFailure> {
+        // The trait's fallible-body hook is this composer's real
+        // composition; the wrapper below owns the guard and the
+        // classification.
         // The seed's writer cell is *shared* with the body: the wrapper
         // keeps its own `Arc` clone of the cell, so a failure before the
         // spine row mounts — when the body drops its seed copy — still
@@ -1346,13 +1508,17 @@ impl BootComposer for ConfigComposer {
         // writer; see `MountFailure`).
         let created_by_mount = seed.created_by_mount;
         let cell = seed.writer.clone();
-        // The panic-path unwind: armed by the body when its spine
-        // composes, disarmed here at both exits. A panic past this point
-        // runs the guard's Drop — the same dispose the Err arm performs.
+        // The panic-path unwind: the guard's Drop disposes the spine the
+        // body recorded and classifies this seed's cell — a created file
+        // abandons on the panic path exactly as on the Err path below.
+        SPINE_UNWIND.with(|g| {
+            let mut slot = g.lock().expect("unwind lock");
+            slot.cell = Some(cell.clone());
+            slot.created_by_mount = created_by_mount;
+        });
         let _unwind = SpineUnwindGuard;
-        match self.mount_seeded_inner(doc, seed) {
+        match self.mount_seeded_body(doc, seed) {
             Ok(mounted) => {
-                // The composition is live and owned by its `Mounted`;
                 // clear the unwind slots so a *later* mount's failure can
                 // never dispose this healthy spine.
                 LAST_MOUNTED_SPINE.with(|s| {
@@ -1399,21 +1565,20 @@ impl ConfigComposer {
     /// The body of [`BootComposer::mount_seeded`], spelled against plain
     /// `CliError`s; the trait impl wraps a failure with the seed's
     /// unconsumed writer (see `MountFailure`).
-    fn mount_seeded_inner(
+    fn mount_seeded_body(
         &self,
         doc: &ProfileDoc,
         seed: crate::boot::MountSeed,
     ) -> Result<Mounted, CliError> {
-        // A session-seeded mount (#67 §5) is its *own* composition: a
-        // resume's mirroring log and seeded ids cannot share a spine with a
-        // fresh or other-session mount (one spine, one log). It therefore
-        // bypasses the warm-spine cache entirely and never populates it.
-        // The id allocator's scope is deliberately per-session (#68 §2): a
-        // fresh session's ids legitimately start at 1 even when another
-        // session file already holds 1..n — ids are message identity within
-        // one log, and the store's `max + 1` floor keeps them distinct
-        // *within* the session that continues here.
-        let fresh = seed.is_empty();
+        // The test seam's panic path: when a seam test installs a hook,
+        // the body dispatches to it (the seam mounts the real spine and
+        // panics at the post-spine step) instead of composing. Production
+        // never arms a hook; the dispatch is inert there.
+        #[cfg(any(test, feature = "test-cfg"))]
+        if let Some(hook) = SEAM_HOOK.with(|h| h.lock().expect("seam hook").clone()) {
+            hook(doc, seed);
+            unreachable!("the seam hook panics");
+        }
         // The plan's wiring is computed from the plan alone — the same
         // projection `plan()` publishes — before any lock is taken.
         let wiring = self.tools_wiring(doc)?;
@@ -1455,14 +1620,6 @@ impl ConfigComposer {
             {
                 entry
             }
-            // A stale or foreign entry re-composes the plan's own name from
-            // the stored layers — without the overlays the lost composition
-            // applied. The divergence is loud, never silent: the wiring
-            // check below refuses a tool-declaring plan over a tool-less
-            // composition, and the model check swaps in the plan's own
-            // adapter whenever the rows' differs. A composition that fails
-            // here fails the mount — a profile that cannot compose cannot
-            // boot either.
             _ => {
                 let out = self.composer.compose(&doc.name, &[]).map_err(cli_error)?;
                 *self.last_warnings.lock() = out.warnings.clone();
@@ -1474,11 +1631,55 @@ impl ConfigComposer {
                 }
             }
         };
+        // A session-seeded mount (#67 §5) is its *own* composition: a
+        // resume's mirroring log and seeded ids cannot share a spine with a
+        // fresh or other-session mount (one spine, one log). It therefore
+        // bypasses the warm-spine cache entirely and never populates it.
+        // The id allocator's scope is deliberately per-session (#68 §2): a
+        // fresh session's ids legitimately start at 1 even when another
+        // session file already holds 1..n — ids are message identity within
+        // one log, and the store's `max + 1` floor keeps them distinct
+        // *within* the session that continues here.
+        let fresh = seed.is_empty();
         // A seeded mount is its own composition (#67 §5): its log mirrors
         // one session file and its ids floor at that session's max, so it
         // can never share the warm spine — and it never populates the cache.
         let spine = if !fresh {
+            // The unwind slot's spine handle arms once the spine exists:
+            // `unwind_after_failure` needs the `SpineMount`, and a panic
+            // *inside* the composition is owned by the row loop's own
+            // rollback (the plugin's WriterGuard/MirrorGuard release the
+            // mirror through the registry-pinned plugin even on unwind).
+            //
+            // The composition returning Ok consumes the writer into the
+            // mirror (or there was none): clear the slot's cell half so a
+            // later panic never touches this mount's writer — the mirror
+            // path owns a created file from here. A composition that
+            // failed *inside* its own row loop keeps the cell armed: if
+            // the spine row never consumed the writer it rode back with
+            // the dropped seed, and only the guard's classification can
+            // abandon a created file then. (A failure after the row
+            // consumed the writer left the cell empty; the
+            // classification is inert.)
+            //
+            // Same-thread contract: the slot is a `thread_local`, and the
+            // wrapper's failure arm reads it back on the *calling*
+            // thread. `mount_seeded` must therefore run start-to-finish
+            // on one thread (true for the binary's route and every caller
+            // in tree); a cross-thread entry would make the dispose a
+            // silent no-op and strand the session lock.
             let spine = Arc::new(self.mount_spine_for(&entry.doc, wiring, seed)?);
+            // The composition returned Ok: the spine row consumed the
+            // writer into the mirror (or there was none). The shared
+            // cell is empty now, so the guard's classification is inert
+            // from here — the mirror (closed by the dispose or the
+            // plugin's unwind guards) owns the writer.
+            // The cell's writer moved into the mirror during the
+            // composition; keep the *cell* (the same Arc the wrapper
+            // holds) and let the guard's Drop read the consumed state
+            // through it. Dropping the slot's handle here would leave
+            // the guard blind to the mirror path's created file.
+
             // Record the freshly-composed seeded spine *now*, before any
             // later fallible step: the registry pins the plugin (and
             // through it the seed's writer cell), so the body's Arc drop
@@ -1488,21 +1689,14 @@ impl ConfigComposer {
             // is owned by live `Mounted` siblings and is never recorded:
             // disposing it would close a writer a sibling still needs.
             //
-            // Same-thread contract: the slot is a `thread_local`, and the
-            // wrapper's failure arm reads it back on the *calling* thread.
-            // `mount_seeded` must therefore run start-to-finish on one
-            // thread (true for the binary's route and every caller in
-            // tree); a cross-thread entry would make the dispose a silent
-            // no-op and strand the session lock.
+            // The wrapper's Err arm disposes first through
+            // `LAST_MOUNTED_SPINE`; the guard's Drop re-runs the
+            // idempotent dispose, so no exit leaks the lock.
             LAST_MOUNTED_SPINE
                 .with(|s| *s.lock().expect("probe lock") = std::sync::Arc::downgrade(&spine));
-            // Arm the wrapper's panic-path unwind (see `SpineUnwindGuard`):
-            // a panic between here and the wrapper's return disposes the
-            // live composition the way the wrapper's Err arm does. The
-            // wrapper disarms at both exits, so a clean or named-failure
-            // finish never double-disposes.
-            SPINE_UNWIND
-                .with(|g| *g.lock().expect("unwind lock") = std::sync::Arc::downgrade(&spine));
+            SPINE_UNWIND.with(|g| {
+                g.lock().expect("unwind lock").spine = std::sync::Arc::downgrade(&spine)
+            });
             spine
         } else {
             match entry.spine.as_ref().and_then(std::sync::Weak::upgrade) {

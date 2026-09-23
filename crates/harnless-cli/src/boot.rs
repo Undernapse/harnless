@@ -593,14 +593,28 @@ pub(crate) fn mount_spine(
 /// on append (`writer closed`) instead of keeping the lock alive.
 pub(crate) struct MirroringLog {
     writer: std::sync::Mutex<Option<harnless_storage_jsonl::SessionWriter>>,
+    /// The session file this mirror writes, captured when the writer was
+    /// taken. `held_id` survives [`Self::close`] — after the close the
+    /// writer is gone and this is the only place the id lives, which is
+    /// exactly when the panic-path classification needs it.
+    id: u64,
 }
 
 impl MirroringLog {
     /// A mirror that writes each committed record to `writer`.
     pub fn new(writer: harnless_storage_jsonl::SessionWriter) -> Self {
+        let id = writer.id();
         Self {
             writer: std::sync::Mutex::new(Some(writer)),
+            id,
         }
+    }
+
+    /// The id of the session file this mirror writes — stable for the
+    /// mirror's life, readable after [`Self::close`]. The panic-path
+    /// unwind uses this to name the session file a consumed writer owns.
+    pub(crate) fn held_id(&self) -> Option<u64> {
+        Some(self.id)
     }
 
     /// The mirror function installed on the mounted log. A mirror failure is
