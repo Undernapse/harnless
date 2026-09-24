@@ -208,8 +208,9 @@ pub(crate) fn lock_sibling(target: &Path) -> PathBuf {
 /// Remove the two files an abandoned session owns, in `order`. A missing
 /// file or sibling is success; an I/O fault names itself in the typed
 /// error, which every caller surfaces (the route's `unwind_created`, the
-/// panic guard's Drop) — the residue is never silent, and the warning is
-/// printed once, by the caller that owns the context.
+/// panic guard's Drop, the CLI's `session-not-found`-style error arms) —
+/// the residue is never silent, and the warning is printed once, by the
+/// caller that owns the context.
 fn remove_pair(id: u64, order: [&Path; 2]) -> Result<(), SessionError> {
     for p in order {
         match std::fs::remove_file(p) {
