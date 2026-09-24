@@ -53,6 +53,19 @@ pub type Mirror = dyn Fn(&CommittedRecord) -> Result<(), String> + Send + Sync;
 /// Boxed [`Mirror`] — the shape a boot hands to [`SessionLog::with_mirror`].
 pub type MirrorFn = Box<Mirror>;
 
+/// Why [`SessionLog::append_with`] refused an append: the caller's mirror
+/// said no, or the event is not lossless-JSON (a caller bug — the closed
+/// core vocabulary is lossless by construction). Kept distinct so a caller
+/// can never read a lossy refusal as a durable commit.
+#[derive(Debug)]
+pub enum AppendError<T> {
+    /// The mirror refused the record; the log is unchanged.
+    Mirror(T),
+    /// The event does not survive a JSON round-trip; the mirror never saw
+    /// it and the log is unchanged.
+    Lossy,
+}
+
 impl SessionLog {
     /// Create an empty log for `session_id`.
     pub fn new(session_id: SessionId) -> Self {
@@ -88,21 +101,29 @@ impl SessionLog {
     pub fn append(&self, event: SessionEvent) -> bool {
         match &self.mirror {
             Some(mirror) => self.append_with(event, |record| mirror(record)).is_ok(),
-            None => {
-                if !is_lossless_json(&event) {
-                    return false;
-                }
-                let mut records = self.inner.lock();
-                let position = records.len();
-                let time_ms = now_ms();
-                records.push(CommittedRecord {
-                    position,
-                    time_ms,
-                    event,
-                });
-                true
-            }
+            None => self.commit(event),
         }
+    }
+
+    /// Commit `event` with no mirror: the lossless-JSON check plus the
+    /// position/time assignment under the log's lock. The shared tail of
+    /// [`Self::append`]'s sessionless arm and [`Self::append_with`], so the
+    /// lossy refusal never takes the mirror path in either direction — a
+    /// mirrored append either crosses the mirror and commits, or refuses
+    /// with the log unchanged.
+    fn commit(&self, event: SessionEvent) -> bool {
+        if !is_lossless_json(&event) {
+            return false;
+        }
+        let mut records = self.inner.lock();
+        let position = records.len();
+        let time_ms = now_ms();
+        records.push(CommittedRecord {
+            position,
+            time_ms,
+            event,
+        });
+        true
     }
 
     /// Reconstruct a log from stored committed records (#67 §1).
@@ -172,11 +193,12 @@ impl SessionLog {
         &self,
         event: SessionEvent,
         mirror: impl FnOnce(&CommittedRecord) -> Result<(), T>,
-    ) -> Result<(), T> {
+    ) -> Result<(), AppendError<T>> {
         if !is_lossless_json(&event) {
             // The closed vocabulary is lossless; a lossy event is a caller
-            // bug, surfaced the same way `append` surfaces it (no change).
-            return Ok(());
+            // bug. Refused, never Ok-without-mirroring: a mirrored caller
+            // can never mistake a lossy refusal for a durable commit.
+            return Err(AppendError::Lossy);
         }
         let mut records = self.inner.lock();
         let record = CommittedRecord {
@@ -184,7 +206,7 @@ impl SessionLog {
             time_ms: now_ms(),
             event,
         };
-        mirror(&record)?;
+        mirror(&record).map_err(AppendError::Mirror)?;
         records.push(record);
         Ok(())
     }
@@ -314,6 +336,29 @@ mod tests {
         let ok = log.append(SessionEvent::UserMessage(msg));
         assert!(ok);
         assert_eq!(log.len(), before + 1);
+    }
+
+    #[test]
+    fn append_with_never_reports_ok_without_mirroring() {
+        // The mirror is the durability contract: an append_with that
+        // returns Ok MUST have crossed the mirror. A lossy event refuses
+        // with Lossy (never Ok-without-mirroring), and a mirror refusal
+        // surfaces as Mirror — the log stays unchanged in both arms.
+        let log = SessionLog::new(SessionId(7));
+        let mirrored = std::sync::atomic::AtomicUsize::new(0);
+        let ok = log.append_with(SessionEvent::TurnOpen, |_r| {
+            mirrored.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<(), String>(())
+        });
+        assert!(ok.is_ok());
+        assert_eq!(mirrored.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(log.len(), 1);
+        let refused = log.append_with(SessionEvent::TurnOpen, |_| Err("disk gone".to_string()));
+        assert!(matches!(
+            &refused,
+            Err(AppendError::Mirror(e)) if e == "disk gone"
+        ));
+        assert_eq!(log.len(), 1, "a mirror refusal leaves the log unchanged");
     }
 
     #[test]

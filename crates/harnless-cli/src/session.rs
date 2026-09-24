@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use harnless_seams::SessionId;
-use harnless_storage_jsonl::{Header, SessionError, SessionMeta, SessionStore};
+use harnless_storage_jsonl::{Header, SessionError, SessionMeta, SessionStore, SessionWriter};
 
 use crate::boot::{BootComposer, MountSeed, Mounted};
 use crate::CliError;
@@ -107,7 +107,16 @@ pub fn open_session(
         (None, None) => {
             let store = store_handle(doc, store_dir)?;
             let (id, writer) = mint_with(|id| store.create_new(id))?;
-            let mounted = mount_seeded(composer, doc, id, None, Some(writer))?;
+            let mounted = match mount_seeded(composer, doc, id, None, Some(writer), true) {
+                Ok(mounted) => mounted,
+                Err((err, writer, abandon)) => {
+                    // The mint created the file; the composition that would
+                    // own it never mounted. Leave no orphan behind (see
+                    // `unwind_created`).
+                    unwind_created(&store, id, writer, abandon);
+                    return Err(err);
+                }
+            };
             Ok(SessionMount { mounted, id })
         }
         (Some(id), None) => {
@@ -123,8 +132,27 @@ pub fn open_session(
             })?;
             let writer = store.open_existing(id).map_err(session_cli_error)?;
             let max = harnless_agent::session::max_record_id(&stored.records);
-            let mounted =
-                mount_seeded(composer, doc, id, Some((stored.records, max)), Some(writer))?;
+            // A resume's file predates this process: a failed mount must
+            // never abandon it.
+            let mounted = match mount_seeded(
+                composer,
+                doc,
+                id,
+                Some((stored.records, max)),
+                Some(writer),
+                false,
+            ) {
+                Ok(mounted) => mounted,
+                Err((err, writer, _abandon)) => {
+                    // The session file predates this process; only a torn
+                    // repair (or none) happened. Drop the writer — the lock
+                    // goes with it — and leave the bytes for the next open.
+                    // (A resume's seed is never created-by-mount, so
+                    // `_abandon` is always Ok here.)
+                    drop(writer);
+                    return Err(err);
+                }
+            };
             Ok(SessionMount { mounted, id })
         }
         (None, Some(source)) => {
@@ -149,13 +177,25 @@ pub fn open_session(
                 .load(target)
                 .map_err(session_cli_error)?
                 .expect("fork target was just created");
-            let mounted = mount_seeded(
+            let mounted = match mount_seeded(
                 composer,
                 doc,
                 target,
                 Some((stored.records, max)),
                 Some(writer),
-            )?;
+                true,
+            ) {
+                Ok(mounted) => mounted,
+                Err((err, writer, abandon)) => {
+                    // The target file is this route's own creation; a mount
+                    // that fails after `create_fork` must leave no orphan
+                    // (#67 §5's rule, extended to the mount-failure window)
+                    // — otherwise `sessions list` renders a fork that never
+                    // ran, and the user can resume it.
+                    unwind_created(&store, target, writer, abandon);
+                    return Err(err);
+                }
+            };
             Ok(SessionMount {
                 mounted,
                 id: target,
@@ -164,28 +204,78 @@ pub fn open_session(
     }
 }
 
+/// A failed seeded mount: the named error, the writer the mount never
+/// consumed (if any), and the classification's own abandon outcome.
+type MountFailed = (
+    CliError,
+    Option<harnless_storage_jsonl::SessionWriter>,
+    Result<(), harnless_storage_jsonl::SessionError>,
+);
+
 /// Mount `doc` with the session seed: the store's records (resume/fork) or
 /// none (fresh), the id floor, and the mirroring writer.
+///
+/// `created_by_mount` says whether the writer's file is *this route's*
+/// creation (a mint or a fork target) or a pre-existing resume file. A
+/// mount that fails without ever consuming the writer abandons a created
+/// file (unlock + unlink, no orphan — #67 §5's rule at the mount-failure
+/// window) and hands a pre-existing file's writer back untouched, so the
+/// caller's only remaining decision is the named error. A mount that
+/// fails *after* the spine took the writer has already closed it (every
+/// post-apply failure arm releases the session lock).
 fn mount_seeded(
     composer: &dyn BootComposer,
     doc: &crate::profile::ProfileDoc,
     id: u64,
     seed: Option<(Vec<harnless_agent::events::CommittedRecord>, u64)>,
     writer: Option<harnless_storage_jsonl::SessionWriter>,
-) -> Result<Mounted, CliError> {
+    created_by_mount: bool,
+) -> Result<Mounted, MountFailed> {
     let (records, id_seed) = match seed {
         Some((records, max)) => (Some(records), max),
         None => (None, 0),
     };
-    composer.mount_seeded(
-        doc,
-        MountSeed {
-            session: SessionId(id),
-            records,
-            id_seed,
-            writer: Mutex::new(writer),
+    let seed = MountSeed {
+        session: SessionId(id),
+        records,
+        id_seed,
+        writer: std::sync::Arc::new(Mutex::new(writer)),
+        created_by_mount,
+    };
+    match composer.mount_seeded(doc, seed) {
+        Ok(mounted) => Ok(mounted),
+        Err(failure) => Err((
+            failure.err,
+            failure.unconsumed_writer,
+            failure.abandon_outcome,
+        )),
+    }
+}
+
+fn unwind_created(
+    store: &SessionStore,
+    id: u64,
+    writer: Option<SessionWriter>,
+    classified: Result<(), harnless_storage_jsonl::SessionError>,
+) {
+    // The composer's own classification may already have abandoned the
+    // created file (the reference composer's path); its outcome arrives in
+    // `classified`. Otherwise this route abandons: via the writer when the
+    // mount never consumed it, or by id when a post-mirror failure arm
+    // already closed it.
+    let result = match classified {
+        Ok(()) => match writer {
+            Some(writer) => writer.abandon(),
+            None => store.abandon(id),
         },
-    )
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        eprintln!(
+            "warning: session {id} was created by this run and could not be abandoned ({}): {}",
+            e.code, e.message
+        );
+    }
 }
 
 /// The store handle for this plan: the row's `dir` (with `${home}` expanded

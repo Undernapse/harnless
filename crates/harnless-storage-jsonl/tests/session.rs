@@ -146,6 +146,77 @@ fn lock_held_second_open_refuses_and_compaction_refuses() {
 }
 
 #[test]
+fn abandon_refuses_under_a_held_lock_and_removes_both_files_after() {
+    // Lock-first rule: `abandon` takes the flock *before* any unlink and
+    // holds it through both. An opener of the lock sibling is a live
+    // holder — the abandon must refuse (`session-locked`) and touch
+    // nothing. Without the lock-first step the unlink runs through the
+    // held lock, and the next creator's fresh sibling is a different
+    // inode: two holders of one session.
+    let dir = fixture("abandon");
+    let store = SessionStore::new(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("11.jsonl"), "").unwrap();
+    let lock_path = dir.join("11.jsonl.lock");
+    std::fs::write(&lock_path, "").unwrap();
+    let probe = FileLock::hold(&dir, 11).expect("probe takes the lock");
+    let err = store.abandon(11).unwrap_err();
+    assert_eq!(err.code, "session-locked");
+    assert!(dir.join("11.jsonl").exists(), "refused abandon keeps file");
+    assert!(lock_path.exists(), "refused abandon keeps sibling");
+    drop(probe);
+    store.abandon(11).expect("abandon after release");
+    assert!(!dir.join("11.jsonl").exists());
+    assert!(!lock_path.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn abandon_refuses_an_orphaned_sibling_holder_and_manufactures_nothing() {
+    // Two faces of the lock-first rule. (a) A holder that opened the
+    // sibling while the session file was already unlinked (the old
+    // unlink order's window) is still a live holder: the abandon must
+    // refuse, not delete through the flock. (b) A session with no
+    // sibling at all (the failed-`create_new` residue shape) abandons
+    // cleanly — the lock probe opens the sibling WITHOUT `create`, so
+    // the abandon never manufactures the file it is meant to remove.
+    let dir = fixture("abandon2");
+    let store = SessionStore::new(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("5.jsonl"), "").unwrap();
+    let holder = FileLock::hold(&dir, 5).expect("holder takes the sibling lock");
+    std::fs::remove_file(dir.join("5.jsonl")).unwrap(); // the old order's window
+    let err = store.abandon(5).unwrap_err();
+    assert_eq!(
+        err.code, "session-locked",
+        "must fence the orphaned-sibling holder"
+    );
+    assert!(
+        dir.join("5.jsonl.lock").exists(),
+        "refused abandon keeps sibling"
+    );
+    drop(holder);
+    store.abandon(5).expect("abandon after release");
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(leftovers.is_empty(), "abandon left residue: {leftovers:?}");
+    // (b) no sibling: success, and nothing created.
+    std::fs::write(dir.join("6.jsonl"), "").unwrap();
+    store.abandon(6).expect("abandon without sibling succeeds");
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "abandon manufactured residue: {leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn torn_tail_loads_tolerantly_and_first_append_truncates() {
     let dir = fixture("torn");
     let store = SessionStore::new(&dir);

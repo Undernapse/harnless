@@ -158,9 +158,7 @@ impl FileLock {
     /// Acquire the lock on `<target>.lock`, writing the holder pid after
     /// acquisition. A would-block is `Locked` naming the id and holder pid.
     fn acquire(target: &Path, id: u64, nonblocking: bool) -> Result<Self, SessionError> {
-        let mut path = target.as_os_str().to_os_string();
-        path.push(".lock");
-        let path = PathBuf::from(path);
+        let path = lock_sibling(target);
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -172,21 +170,7 @@ impl FileLock {
                     format!("opening lock file {}: {e}", path.display()),
                 )
             })?;
-        let would_block = |e: std::io::Error| {
-            if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                SessionError::new(
-                    "session-locked",
-                    format!(
-                        "session {id} is locked by process {}",
-                        read_holder(&path)
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| "?".to_string())
-                    ),
-                )
-            } else {
-                SessionError::new("io-error", format!("locking session {id}: {e}"))
-            }
-        };
+        let would_block = |e: std::io::Error| lock_error(id, &path, e);
         let rc = if nonblocking {
             // SAFETY: `file` is a valid open descriptor for the duration.
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
@@ -210,6 +194,55 @@ impl FileLock {
         let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
         let _ = file.flush();
         Ok(Self { _file: file })
+    }
+}
+
+/// The lock sibling of a target file: `<target>.lock`. The one place the
+/// suffix is spelled; every lock path derives from here.
+pub(crate) fn lock_sibling(target: &Path) -> PathBuf {
+    let mut p = target.as_os_str().to_os_string();
+    p.push(".lock");
+    PathBuf::from(p)
+}
+
+/// Remove the two files an abandoned session owns, in `order`. A missing
+/// file or sibling is success; an I/O fault names itself in the typed
+/// error, which every caller surfaces (the route's `unwind_created`, the
+/// panic guard's Drop, the CLI's `session-not-found`-style error arms) —
+/// the residue is never silent, and the warning is printed once, by the
+/// caller that owns the context.
+fn remove_pair(id: u64, order: [&Path; 2]) -> Result<(), SessionError> {
+    for p in order {
+        match std::fs::remove_file(p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(SessionError::new(
+                    "io-error",
+                    format!("abandoning session {id}: {e} (residue at {})", p.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The one lock-failure error shape: a would-block is `session-locked`
+/// naming the id and the holder pid; anything else is `io-error`. Shared
+/// by [`FileLock::acquire`] and [`SessionStore::abandon`]'s probe.
+fn lock_error(id: u64, lock_path: &Path, e: std::io::Error) -> SessionError {
+    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        SessionError::new(
+            "session-locked",
+            format!(
+                "session {id} is locked by process {}",
+                read_holder(lock_path)
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            ),
+        )
+    } else {
+        SessionError::new("io-error", format!("locking session {id}: {e}"))
     }
 }
 
@@ -308,6 +341,52 @@ impl SessionStore {
         }
     }
 
+    /// Abandon a session file this process created but never wrote through:
+    /// unlink the file and its lock sibling. The caller holds no writer (a
+    /// mount that took the writer and then failed closed it — the file is
+    /// still this boot's orphan), so this is the by-id shape of
+    /// [`SessionWriter::abandon`].
+    ///
+    /// The flock is taken (non-blocking) *before* both unlinks and held
+    /// through them: the writer's close released it, so a concurrent open
+    /// may already own the file — a held lock refuses the abandon
+    /// (`session-locked`) rather than unlinking under a live writer. The
+    /// guard must NOT be released between the unlinks: an opener that
+    /// acquires the old (unlinked) sibling's inode in that window locks an
+    /// inode nobody else can name, while the next creator's fresh sibling
+    /// is a different inode — two holders of one session. A fresh creator
+    /// is fenced by the `O_EXCL` file itself, so the session file's unlink
+    /// is the last step: once it goes, the next `create_new` builds a
+    /// wholly new file *and* sibling pair. A missing file or sibling is
+    /// success.
+    pub fn abandon(&self, id: u64) -> Result<(), SessionError> {
+        let path = self.path(id);
+        // Lock-first: if another process holds the session, refuse. The
+        // probe must NOT create the sibling: an abandon whose session has
+        // no sibling has no holder to fence, and manufacturing the file
+        // here would leave residue the no-orphan rule forbids.
+        let lock_path = lock_sibling(&path);
+        // Opening WITHOUT `create`: no sibling means no holder to fence.
+        let probe = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .ok();
+        if let Some(probe) = probe.as_ref() {
+            // SAFETY: `probe` is a live owned file; the flock is released
+            // when it drops — after both unlinks below.
+            if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(lock_error(id, &lock_path, std::io::Error::last_os_error()));
+            }
+        }
+        // Sibling first, then the session file — both under the held lock
+        // (see the doc: the file's unlink fences the next creator). The
+        // probe (if any) outlives the unlinks: it drops after the call's
+        // last statement.
+        let result = remove_pair(id, [lock_path.as_path(), path.as_path()]);
+        drop(probe);
+        result
+    }
+
     /// Create a brand-new session file: `O_EXCL` on the session file (an
     /// existing file is never silently appended-to by a mint), then the
     /// advisory lock. An existing file or a held lock is `session-locked` /
@@ -342,6 +421,7 @@ impl SessionStore {
             file,
             _lock: lock,
             id,
+            dir: self.dir.clone(),
         })
     }
 
@@ -387,6 +467,7 @@ impl SessionStore {
             file,
             _lock: lock,
             id,
+            dir: self.dir.clone(),
         })
     }
 
@@ -732,6 +813,7 @@ pub struct SessionWriter {
     file: File,
     _lock: FileLock,
     id: u64,
+    dir: PathBuf,
 }
 
 impl std::fmt::Debug for SessionWriter {
@@ -746,6 +828,31 @@ impl SessionWriter {
     /// The session id this writer appends to.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Abandon this session: release the lock, then remove the session file
+    /// and its lock sibling. The writer holds the only lock on the id, so
+    /// no concurrent writer can lose appends to the unlink. A caller that
+    /// created a session file and then failed before any composition owned
+    /// it uses this to leave no orphan — #67 §5's "a refused fork leaves no
+    /// orphan" extended to the mount-failure window.
+    pub fn abandon(self) -> Result<(), SessionError> {
+        let Self {
+            file,
+            _lock,
+            id,
+            dir,
+        } = self;
+        drop(file);
+        drop(_lock);
+        let path = dir.join(format!("{id}.jsonl"));
+        // Same tolerance as [`SessionStore::abandon`]: a missing lock
+        // sibling is success. The lock file is shared state — a failed
+        // `create_new` (lock acquisition after the O_EXCL create) can
+        // leave the session file with no sibling, and the abandon that
+        // cleans the phantom must not abort on its absence.
+        let lock_path = lock_sibling(&path);
+        remove_pair(id, [path.as_path(), lock_path.as_path()])
     }
 
     /// Append one committed record: a single `write_all(line + "\n")`,

@@ -727,3 +727,640 @@ fn failed_seeded_mount_releases_the_lock() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn failed_fork_mount_leaves_no_orphan() {
+    // #67 §5's no-orphan rule at the mount-failure window: `create_fork`
+    // writes the target before the composition mounts, so a mount that
+    // fails after it (here: an unreadable replay script) must abandon the
+    // target — otherwise `sessions list` renders a fork that never ran.
+    let dir = temp_store("forkorphan");
+    let store = SessionStore::new(&dir);
+    let source = 606u64;
+    std::fs::write(store.session_path(source), file_fixture_lines()).unwrap();
+
+    let doc = support::seam_profile_store(
+        "forkorphan",
+        Some(std::path::Path::new("/nonexistent/missing-script.json")),
+        &[],
+        Some(&dir),
+    );
+    let opened = open_session(&DefaultComposer, &doc, None, Some(source), None);
+    let err = match opened {
+        Ok(_) => panic!("a missing script must refuse the fork mount"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code, "bad-script");
+    // The store holds exactly the source: no target file, no lock sibling.
+    let ids: Vec<u64> = store.list().iter().map(|m| m.id).collect();
+    assert_eq!(ids, vec![source], "the failed fork left no orphan");
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    // The lock sibling is shared state, not an orphan: `read_locked` (the
+    // fork route's source read) creates it, and it is inert once no
+    // process holds the flock — the next open reuses it. The orphan the
+    // rule forbids is the *session file* (and a created fork target's
+    // pair); the source's lock residue is not one.
+    assert_eq!(
+        leftovers,
+        vec![format!("{source}.jsonl"), format!("{source}.jsonl.lock")],
+        "only the source remains (its lock sibling is inert shared state)"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn failed_fresh_mount_abandons_the_mint() {
+    // The fresh route's mint creates the file before the mount; a failed
+    // mount must leave neither a zero-byte phantom nor a lock sibling.
+    let dir = temp_store("freshorphan");
+
+    let doc = support::seam_profile_store(
+        "freshorphan",
+        Some(std::path::Path::new("/nonexistent/missing-script.json")),
+        &[],
+        Some(&dir),
+    );
+    let opened = open_session(&DefaultComposer, &doc, None, None, None);
+    assert!(matches!(opened, Err(_)), "the missing script refuses the mount");
+    // The reference composer's classification hands the *unconsumed
+    // writer* back, and `unwind_created` abandons through it — the
+    // writer-shaped arm removes both the file and its lock sibling, so
+    // the leftover pair below is its observable. The writer arm's own
+    // seam is `failed_fork_mount_leaves_no_orphan`, which drives the
+    // same `unwind_created` path on the fork route.
+    drop(opened);
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the abandoned mint left {leftovers:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The ConfigComposer (the binary's composition root) route: a seeded mount
+// that fails *after* its spine mounted must unwind the live composition —
+// the registry pins the spine plugin, so the body's Arc drop alone never
+// runs `SpineMount::dispose`, and a live mirror would strand the session
+// lock for the process's life.
+// ---------------------------------------------------------------------------
+
+fn config_store_dir(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("hrls-cfgstore-{tag}-{}", std::process::id()))
+}
+
+fn config_composer_with_store(
+    tag: &str,
+    store_dir: &std::path::Path,
+) -> harnless_cli::config_boot::ConfigComposer {
+    let cfg = std::env::temp_dir().join(format!("hrls-cfg-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cfg);
+    std::fs::create_dir_all(cfg.join("profiles")).unwrap();
+    std::fs::create_dir_all(cfg.join("bundles")).unwrap();
+    // A composed profile whose model row names a corpus that does not
+    // exist: the spine mounts (taking the session lock through the seed's
+    // writer), and `build_adapter` is the failure *after* it — the exact
+    // window the DefaultComposer seam tests pin, on the production route.
+    std::fs::write(
+        cfg.join("profiles").join("p.yml"),
+        format!(
+            "name: p\nrows:\n- id: spine\n  plugin: spine\n- id: model\n  plugin: llm-replay\n  config:\n    kind: replay\n    provider: scripted\n    script: /nonexistent/missing-script.json\n- id: store\n  plugin: storage-jsonl\n  config:\n    dir: {}\n",
+            store_dir.display()
+        ),
+    )
+    .unwrap();
+    harnless_cli::config_boot::ConfigComposer::new(
+        std::sync::Arc::new(harnless_cli::config_boot::LayeredStore::new(Some(cfg))),
+        harnless_cli::config_boot::config::subst::Subst::new(),
+    )
+}
+
+#[test]
+fn config_route_failed_resume_mount_releases_the_lock() {
+    let dir = config_store_dir("resumelock");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = SessionStore::new(&dir);
+    let source = 707u64;
+    std::fs::write(store.session_path(source), file_fixture_lines()).unwrap();
+
+    let composer = config_composer_with_store("resumelock", &dir);
+    // `compose` is the trait method (the binary's route); the trait is in
+    // scope only for this call.
+    use harnless_cli::boot::BootComposer as _;
+    let doc = composer.compose("p", None).expect("profile composes");
+    let opened = super_support_open(&composer, &doc);
+    let err = match opened {
+        Ok(_) => panic!("a missing script must refuse the resume mount"),
+        Err(err) => err,
+    };
+    // The mount reaches the model's script through `build_adapter`; the
+    // named code is the one the adapter's loader gives an unreadable
+    // corpus (the same code the DefaultComposer seam pins).
+    assert!(
+        matches!(err.code, "bad-script" | "plugin-build-failed"),
+        "the mount must refuse at the model, not the lock: {}",
+        err.code
+    );
+
+    // The lock is gone: a fresh open of the same session gets past the
+    // lock and fails at the model again — the point is that taking the
+    // lock is possible at all. The first attempt's `open_existing` repaired
+    // the fixture's torn tail under its lock, so the second attempt loads
+    // cleanly and reaches the model too.
+    let again = super_support_open(&composer, &doc);
+    match again {
+        Ok(_) => panic!("the second mount must fail the same way"),
+        Err(err) => assert!(
+            matches!(err.code, "bad-script" | "plugin-build-failed"),
+            "the second attempt must reach the model too, not the lock: {}",
+            err.code
+        ),
+    }
+    // And the file is untouched: a resume never abandons its session.
+    let ids: Vec<u64> = store.list().iter().map(|m| m.id).collect();
+    assert_eq!(
+        ids,
+        vec![source],
+        "the resume's file survives the failed mount"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn super_support_open(
+    composer: &harnless_cli::config_boot::ConfigComposer,
+    doc: &harnless_cli::profile::ProfileDoc,
+) -> Result<harnless_cli::session::SessionMount, harnless_cli::CliError> {
+    harnless_cli::session::open_session(composer, doc, Some(707), None, None)
+}
+
+#[test]
+fn toolless_seeded_mount_keeps_one_writer_owner() {
+    // The guard's disarm rule on the tool-less Ok path: a seeded mount
+    // whose profile declares no tools must leave the writer with exactly
+    // one owner (the mirror). If the guard rolled it back into the seed
+    // cell on the Ok return, the *next* mount's failure classification
+    // would find a writer there — and a created-file seed would abandon a
+    // file a live mirror is still appending to. Observable shape: mount
+    // fresh (no tools), drive a turn, drop it, then resume the same id —
+    // the resume must see the first turn's records, which only holds if
+    // the first mount's mirror owned the writer alone and wrote them.
+    let dir = temp_store("toollessowner");
+    let corpus = support::write_corpus("toollessowner", &[text_recording("hello")]);
+    let doc = support::seam_profile_store("toollessowner", Some(&corpus), &[], Some(&dir));
+    let store = SessionStore::new(&dir);
+
+    let first = open_session(&DefaultComposer, &doc, None, None, None).expect("fresh mounts");
+    let id = first.id;
+    drive_turn(&first.mounted, "hi").expect("turn runs");
+    drop(first);
+    // The turn's records are in the file: the mirror wrote them (one owner,
+    // no rollback stole the writer).
+    let stored = store.load(id).expect("loads").expect("session exists");
+    assert!(stored.records.len() >= 2, "the turn persisted");
+
+    // A second fresh mount that fails *after* minting (unreadable script)
+    // must abandon its own mint — and must not touch the first session.
+    let bad = support::seam_profile_store(
+        "toollessowner",
+        Some(std::path::Path::new("/nonexistent/missing-script.json")),
+        &[],
+        Some(&dir),
+    );
+    // The double-owner shape the disarm rule forbids: the failed mount's
+    // `MountSeed::clone` inherits the *shared* writer cell, and a guard
+    // that never disarmed leaves the first mount's live writer in it. The
+    // mint retry then sees a full cell, and the created-by-mount failure
+    // arm abandons the writer — unlinking the first session's file under
+    // its live mirror. The first session must survive its sibling's
+    // failed mount.
+    let opened = open_session(&DefaultComposer, &bad, None, None, None);
+    assert!(opened.is_err(), "the missing script refuses the mount");
+    let ids: Vec<u64> = store.list().iter().map(|m| m.id).collect();
+    assert_eq!(ids, vec![id], "only the first session survives");
+    // And it stays loadable: the mirror's file was never unlinked.
+    let stored = store.load(id).expect("loads").expect("session survives");
+    assert!(
+        stored.records.len() >= 2,
+        "the first session's records survive"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn panic_after_direct_spine_mount_releases_the_lock() {
+    // The composition's own rollback rule: a panic *after* the spine
+    // composed must still release the session lock. The registry pins
+    // the plugin, so a plain `Arc<SpineMount>` drop is not enough — the
+    // mirror's release is carried by `SpineWired::apply`'s in-frame
+    // writer/mirror guards, which run as apply's frame unwinds.
+    //
+    // This seam pins those in-frame guards, not `SpineUnwindGuard`: the
+    // `mount_seeded` override below replaces the production wrapper
+    // entirely, so the wrapper's guard is never armed on this path. The
+    // guard's own dispose + classification is pinned by the sibling seam
+    // `panic_after_spine_mount_abandons_a_created_file`, which drives the
+    // panic *through* the production wrapper.
+    use harnless_cli::boot::{BootComposer, MountSeed};
+    let dir = config_store_dir("panicunwind");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = SessionStore::new(&dir);
+    let source = 4061u64;
+    std::fs::write(store.session_path(source), file_fixture_lines()).unwrap();
+
+    let cfg = config_store_dir("panicunwind-cfg");
+    let _ = std::fs::remove_dir_all(&cfg);
+    std::fs::create_dir_all(cfg.join("profiles")).unwrap();
+    std::fs::create_dir_all(cfg.join("bundles")).unwrap();
+    let corpus = support::write_corpus("panicunwind", &[text_recording("(idle)")]);
+    std::fs::write(
+        cfg.join("profiles").join("p.yml"),
+        format!(
+            "name: p\nrows:\n- id: spine\n  plugin: spine\n- id: model\n  plugin: llm-replay\n  config:\n    kind: replay\n    provider: scripted\n    script: {}\n- id: store\n  plugin: storage-jsonl\n  config:\n    dir: {}\n",
+            corpus.display(),
+            dir.display()
+        ),
+    )
+    .unwrap();
+    let composer = harnless_cli::config_boot::ConfigComposer::new(
+        std::sync::Arc::new(harnless_cli::config_boot::LayeredStore::new(Some(cfg))),
+        harnless_cli::config_boot::config::subst::Subst::new(),
+    );
+    let doc = composer.compose("p", None).expect("profile composes");
+
+    // The seam: the panic stands in for the model step
+    // `config_route_failed_resume_mount_releases_the_lock` pins on its
+    // Err path. It is injected at the composer's own seam: a
+    // `BootComposer` adapter that mounts a real seeded spine through the
+    // production machinery — the spine composes, the session lock is
+    // taken through the mirror — and then panics at the post-spine step.
+    // The unwind must release the flock; the round-two defect's shape,
+    // on the panic path.
+    struct PanicAtModelStep {
+        inner: harnless_cli::config_boot::ConfigComposer,
+    }
+    impl BootComposer for PanicAtModelStep {
+        fn profiles(&self) -> Vec<String> {
+            self.inner.profiles()
+        }
+        fn compose(
+            &self,
+            name: &str,
+            patch: Option<&str>,
+        ) -> Result<harnless_cli::profile::ProfileDoc, harnless_cli::CliError> {
+            self.inner.compose(name, patch)
+        }
+        fn dump(&self, doc: &harnless_cli::profile::ProfileDoc) -> String {
+            self.inner.dump(doc)
+        }
+        fn mount(
+            &self,
+            doc: &harnless_cli::profile::ProfileDoc,
+        ) -> Result<harnless_cli::boot::Mounted, harnless_cli::CliError> {
+            self.inner.mount(doc)
+        }
+        fn mount_seeded(
+            &self,
+            doc: &harnless_cli::profile::ProfileDoc,
+            seed: MountSeed,
+        ) -> Result<harnless_cli::boot::Mounted, harnless_cli::boot::MountFailure> {
+            // The production row-mount machinery composes the spine and
+            // takes the session lock through the mirror; the panic is the
+            // fallible step *after* the spine. The seeded spine mounts
+            // through `mount_spine_for` — the same call the production
+            // wrapper's body makes — so the live composition the unwind
+            // must tear down is real.
+            let config_doc = self
+                .inner
+                .compose_config(&doc.name, &[])
+                .expect("the plan re-composes");
+            let wiring = match &doc.tools[..] {
+                [] => harnless_cli::boot::ToolsWiring::None,
+                declared => harnless_cli::boot::ToolsWiring::AutoAllow {
+                    declared: declared.to_vec(),
+                },
+            };
+            // The `mount_spine_for` contract's release shape: a plain
+            // bound local, whose drop runs as the panic unwinds.
+            let _spine = self
+                .inner
+                .mount_spine_for_for_test(&config_doc, wiring, seed)
+                .expect("the seeded spine mounts");
+            panic!("the model step panicked after the spine mounted");
+        }
+    }
+
+    let stored = store.load(source).expect("loads").expect("session exists");
+    let writer = store.open_existing(source).expect("writer");
+    let seed = MountSeed {
+        session: harnless_seams::SessionId(source),
+        records: Some(stored.records),
+        id_seed: 0,
+        writer: std::sync::Arc::new(std::sync::Mutex::new(Some(writer))),
+        created_by_mount: false,
+    };
+    let wrapper = PanicAtModelStep { inner: composer };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match wrapper.mount_seeded(&doc, seed) {
+            Ok(_) => unreachable!("the seam panics"),
+            Err(failure) => panic!("the seam must panic, not fail: {}", failure.err.code),
+        }
+    }))
+    .expect_err("the seam's post-spine step panics");
+    drop(outcome);
+    // The unwind released the mirror's writer: the flock is free for the
+    // next open. Without apply's in-frame guards, the registry-pinned
+    // plugin would keep the mirror's writer — and the flock — for the
+    // process's life, and this probe stays `session-locked`.
+    FileLock::hold(&dir, source)
+        .expect("the panic path must release the mirror's writer and the lock");
+    assert!(
+        store.load(source).expect("load").is_some(),
+        "a resume's file is never abandoned"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(config_store_dir("panicunwind-cfg"));
+}
+
+#[test]
+fn panic_after_spine_mount_abandons_a_created_file() {
+    // The guard's classification rule: the panic unwind is not only the
+    // spine dispose. A mint/fork route (`created_by_mount == true`) whose
+    // post-spine step panics must abandon the file this boot created —
+    // the round-twelve defect's shape: the guard disposed the composition
+    // and released the lock, but the classification ran only on the Err
+    // path, so the panic left a resumable phantom plus lock residue.
+    // Unlike the direct-spine seam above, this one drives the panic
+    // *through* the production wrapper (via
+    // `mount_seeded_panicking_after_spine_for_test`), so it is the seam
+    // that pins `SpineUnwindGuard`'s dispose + classification.
+    use harnless_cli::boot::{BootComposer, MountSeed};
+    let dir = config_store_dir("panicorphan");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = SessionStore::new(&dir);
+
+    let cfg = config_store_dir("panicorphan-cfg");
+    let _ = std::fs::remove_dir_all(&cfg);
+    std::fs::create_dir_all(cfg.join("profiles")).unwrap();
+    std::fs::create_dir_all(cfg.join("bundles")).unwrap();
+    let corpus = support::write_corpus("panicorphan", &[text_recording("(idle)")]);
+    std::fs::write(
+        cfg.join("profiles").join("p.yml"),
+        format!(
+            "name: p\nrows:\n- id: spine\n  plugin: spine\n- id: model\n  plugin: llm-replay\n  config:\n    kind: replay\n    provider: scripted\n    script: {}\n- id: store\n  plugin: storage-jsonl\n  config:\n    dir: {}\n",
+            corpus.display(),
+            dir.display()
+        ),
+    )
+    .unwrap();
+    let composer = std::sync::Arc::new(harnless_cli::config_boot::ConfigComposer::new(
+        std::sync::Arc::new(harnless_cli::config_boot::LayeredStore::new(Some(cfg.clone()))),
+        harnless_cli::config_boot::config::subst::Subst::new(),
+    ));
+    let doc = composer.compose("p", None).expect("profile composes");
+
+    struct PanicAtModelStep {
+        inner: std::sync::Arc<harnless_cli::config_boot::ConfigComposer>,
+    }
+    impl BootComposer for PanicAtModelStep {
+        fn profiles(&self) -> Vec<String> {
+            self.inner.profiles()
+        }
+        fn compose(
+            &self,
+            name: &str,
+            patch: Option<&str>,
+        ) -> Result<harnless_cli::profile::ProfileDoc, harnless_cli::CliError> {
+            self.inner.compose(name, patch)
+        }
+        fn dump(&self, doc: &harnless_cli::profile::ProfileDoc) -> String {
+            self.inner.dump(doc)
+        }
+        fn mount(
+            &self,
+            doc: &harnless_cli::profile::ProfileDoc,
+        ) -> Result<harnless_cli::boot::Mounted, harnless_cli::CliError> {
+            self.inner.mount(doc)
+        }
+        fn mount_seeded(
+            &self,
+            doc: &harnless_cli::profile::ProfileDoc,
+            seed: MountSeed,
+        ) -> Result<harnless_cli::boot::Mounted, harnless_cli::boot::MountFailure> {
+            // The seam's panic stands in for the body's fallible step
+            // *after* the spine mounted (the model step). The crate's
+            // helper drives it through the production wrapper's entry —
+            // the wrapper arms the panic guard and records the seed's
+            // cell before the body runs, so the panic unwinds past the
+            // armed guard (the shape the guard's dispose must reach).
+            harnless_cli::config_boot::mount_seeded_panicking_after_spine_for_test(
+                &self.inner,
+                doc,
+                seed,
+                harnless_cli::boot::ToolsWiring::None,
+            )
+        }
+    }
+
+    // A created file (the mint shape), not a resume: the panic must leave
+    // nothing behind.
+    let (id, writer) = mint_with(|id| store.create_new(id)).expect("mint");
+    let seed = MountSeed {
+        session: harnless_seams::SessionId(id),
+        records: Some(vec![]),
+        id_seed: 0,
+        writer: std::sync::Arc::new(std::sync::Mutex::new(Some(writer))),
+        created_by_mount: true,
+    };
+    let wrapper = PanicAtModelStep { inner: composer };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match wrapper.mount_seeded(&doc, seed) {
+            Ok(_) => unreachable!("the seam panics"),
+            Err(failure) => panic!("the seam must panic, not fail: {}", failure.err.code),
+        }
+    }))
+    .expect_err("the seam's post-spine step panics");
+    drop(outcome);
+
+    // The guard's Drop disposed the composition (lock free) *and*
+    // classified the cell: the created file abandoned, no phantom.
+    // The leftovers are listed *before* the lock probe: `FileLock::hold`
+    // creates the lock sibling it probes with, so a probe-first order
+    // would manufacture the residue the assertion forbids.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the panic path orphaned the created file: {leftovers:?}"
+    );
+    FileLock::hold(&dir, id)
+        .expect("the panic path must dispose the composition and release the lock");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn config_route_pre_spine_failure_never_disposes_a_live_sibling() {
+    // LAST_MOUNTED_SPINE's staleness rule: a *successful* seeded mount
+    // clears the slot, so a later mount that fails *before* composing its
+    // own spine cannot upgrade a stale handle and dispose the healthy
+    // composition. Shape: mount a seeded spine directly (live, holding
+    // the session lock through its mirror); a second seeded mount fails
+    // *before* its own spine composes (the source is locked, so the fork
+    // route refuses at `read_locked`); the first composition's lock must
+    // survive. With a stale slot, the wrapper's failure arm disposes the
+    // healthy spine and the lock goes with it.
+    use harnless_cli::boot::{BootComposer as _, MountSeed};
+    let dir = config_store_dir("stalespine");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = SessionStore::new(&dir);
+    let source = 808u64;
+    std::fs::write(store.session_path(source), file_fixture_lines()).unwrap();
+
+    let cfg = std::env::temp_dir().join(format!("hrls-cfg-stalespine-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cfg);
+    std::fs::create_dir_all(cfg.join("profiles")).unwrap();
+    std::fs::create_dir_all(cfg.join("bundles")).unwrap();
+    let corpus = support::write_corpus("stalespine", &[text_recording("(idle)")]);
+    std::fs::write(
+        cfg.join("profiles").join("p.yml"),
+        format!(
+            "name: p\nrows:\n- id: spine\n  plugin: spine\n- id: model\n  plugin: llm-replay\n  config:\n    kind: replay\n    provider: scripted\n    script: {}\n- id: store\n  plugin: storage-jsonl\n  config:\n    dir: {}\n",
+            corpus.display(),
+            dir.display()
+        ),
+    )
+    .unwrap();
+    let composer = harnless_cli::config_boot::ConfigComposer::new(
+        std::sync::Arc::new(harnless_cli::config_boot::LayeredStore::new(Some(cfg))),
+        harnless_cli::config_boot::config::subst::Subst::new(),
+    );
+    let doc = composer.compose("p", None).expect("profile composes");
+
+    // A live seeded mount through the wrapper: the composition holds the
+    // session lock. The wrapper records the spine in LAST_MOUNTED_SPINE
+    // and clears the slot on success.
+    let stored = store.load(source).expect("loads").expect("session exists");
+    let writer = store.open_existing(source).expect("writer");
+    let seed = MountSeed {
+        session: harnless_seams::SessionId(source),
+        records: Some(stored.records),
+        id_seed: 0,
+        writer: std::sync::Arc::new(std::sync::Mutex::new(Some(writer))),
+        created_by_mount: false,
+    };
+    let mounted = match composer.mount_seeded(&doc, seed) {
+        Ok(mounted) => mounted,
+        Err(failure) => panic!("the seeded mount must succeed: {}", failure.err.code),
+    };
+
+    // A second seeded mount fails *pre-spine*: the fork route's source
+    // read meets the live lock and refuses before any target exists.
+    let opened = harnless_cli::session::open_session(&composer, &doc, None, Some(source), None);
+    let err = match opened {
+        Ok(_) => panic!("a locked source must refuse the fork"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code, "session-locked");
+
+    // The healthy composition still holds the lock — the failed mount
+    // disposed nothing.
+    let probe = FileLock::hold(&dir, source);
+    match probe {
+        Ok(_) => panic!("the failed fork must not release the live mount's lock"),
+        Err(e) => assert_eq!(e.code, "session-locked"),
+    }
+    drop(mounted);
+    FileLock::hold(&dir, source)
+        .ok()
+        .expect("lock free after the mount drops");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn config_route_pre_spine_failure_abandons_the_created_file() {
+    // The wrapper's shared-cell rule: the seed's writer cell outlives the
+    // body's seed copy, so a mount that fails BEFORE the spine row mounts
+    // still classifies the unconsumed writer and abandons the file this
+    // boot created. Shape: a profile with a store row but no spine row —
+    // the seed can never reach a spine, so `mount_spine_for` refuses
+    // pre-spine. The created file and its lock sibling must both be gone
+    // when the mount fails (the round-ten defect: the wrapper took the
+    // seed out of its own slot, the body's `?` dropped the writer, and
+    // the route's by-id abandon left the orphan).
+    use harnless_cli::boot::{BootComposer as _, MountSeed};
+    let dir = config_store_dir("presine");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = SessionStore::new(&dir);
+
+    let cfg = config_store_dir("presine-cfg");
+    let _ = std::fs::remove_dir_all(&cfg);
+    std::fs::create_dir_all(cfg.join("profiles")).unwrap();
+    std::fs::write(
+        cfg.join("profiles").join("p.yml"),
+        format!(
+            "name: p\nrows:\n- id: store\n  plugin: storage-jsonl\n  config:\n    dir: {}\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    let composer = harnless_cli::config_boot::ConfigComposer::new(
+        std::sync::Arc::new(harnless_cli::config_boot::LayeredStore::new(Some(
+            cfg.clone(),
+        ))),
+        harnless_cli::config_boot::config::subst::Subst::new(),
+    );
+    let doc = composer.compose("p", None).expect("profile composes");
+
+    let (id, writer) = mint_with(|id| store.create_new(id)).expect("mint");
+    let seed = MountSeed {
+        session: harnless_seams::SessionId(id),
+        records: Some(vec![]),
+        id_seed: 0,
+        writer: std::sync::Arc::new(std::sync::Mutex::new(Some(writer))),
+        created_by_mount: true,
+    };
+    let failure = match composer.mount_seeded(&doc, seed) {
+        Ok(_) => panic!("a seeded mount with no spine row must refuse"),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.err.code, "mount-failed");
+    // The config route's classification abandons a created file *at the
+    // mount failure* (the cell's writer never rides out here): the outcome
+    // is Ok, the writer slot is empty, and the file is gone before the
+    // error returns. The pre-fix shape lost the cell, fell to the route's
+    // by-id abandon, and left the file plus its lock sibling.
+    assert!(
+        failure.unconsumed_writer.is_none(),
+        "the classification owns the created file's writer"
+    );
+    assert!(
+        failure.abandon_outcome.is_ok(),
+        "{:?}",
+        failure.abandon_outcome
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "pre-spine failure orphaned: {leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&cfg);
+}
