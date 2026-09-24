@@ -206,23 +206,19 @@ pub(crate) fn lock_sibling(target: &Path) -> PathBuf {
 }
 
 /// Remove the two files an abandoned session owns, in `order`. A missing
-/// file or sibling is success; an I/O fault names itself on stderr — the
-/// residue is never silent, whichever caller (or discarding caller)
-/// receives the typed error.
+/// file or sibling is success; an I/O fault names itself in the typed
+/// error, which every caller surfaces (the route's `unwind_created`, the
+/// panic guard's Drop) — the residue is never silent, and the warning is
+/// printed once, by the caller that owns the context.
 fn remove_pair(id: u64, order: [&Path; 2]) -> Result<(), SessionError> {
     for p in order {
         match std::fs::remove_file(p) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                eprintln!(
-                    "warning: abandoning session {id}: {} (residue left at {})",
-                    e,
-                    p.display()
-                );
                 return Err(SessionError::new(
                     "io-error",
-                    format!("abandoning session {id}: {e}"),
+                    format!("abandoning session {id}: {e} (residue at {})", p.display()),
                 ));
             }
         }

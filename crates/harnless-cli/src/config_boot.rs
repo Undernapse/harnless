@@ -631,11 +631,11 @@ struct UnwindSlot {
     created_by_mount: bool,
 }
 
-/// Arms the panic-path unwind for a seeded mount. The body takes the
-/// spine handle out of the slot when it records a composed spine (the
-/// composition's own exits own any unwind inside it); the wrapper's Ok
-/// exit clears the whole slot, so a *later* mount's failure can never
-/// dispose or classify this mount's healthy spine.
+/// Arms the panic-path unwind for a seeded mount. The body records the
+/// composed spine's weak handle in the slot (the composition's own exits
+/// own any unwind inside it); the wrapper's Ok exit clears the whole
+/// slot, so a *later* mount's failure can never dispose or classify this
+/// mount's healthy spine.
 struct SpineUnwindGuard;
 
 impl SpineUnwindGuard {
@@ -695,17 +695,17 @@ impl Drop for SpineUnwindGuard {
             })
             .unwrap_or(false);
         // The mirror handle and the store dir, from *this* slot's sources
-        // only. When the slot's weak has already died — the window
-        // between the composition's Ok and the slot's spine record, where
-        // the Arc's count can hit zero while the registry-pinned plugin
-        // still holds the mirror's writer — the cell's writer is the
-        // fallback: `WriterGuard::drop` rolls a never-consumed writer back
-        // into the cell during the unwind, and its `abandon` names both
-        // the id and the dir. `still_in_cell` was read before the
-        // rollback ran, so a rolled-back writer lands in the
-        // `!still_in_cell` branch here. A dead weak with an empty cell has
-        // no source left here, and the wrapper's Err arm (or the
-        // process's exit) owns that release.
+        // only. The dead-weak branch (`spine.upgrade()` already `None`)
+        // is the window between the composition's Ok and the slot's spine
+        // record — in the current body there is no fallible step between
+        // them, so it is defence-in-depth, not a live route: a future
+        // step added there must not strand a rolled-back writer. The
+        // fallback takes the cell's writer (rolled back by
+        // `WriterGuard::drop` during the unwind) and abandons through it
+        // directly. `still_in_cell` was read before the rollback ran, so
+        // a rolled-back writer lands in the `!still_in_cell` branch here.
+        // A dead weak with an empty cell has no source left here, and the
+        // wrapper's Err arm (or the process's exit) owns that release.
         let spine_mirror = spine_live.as_ref().and_then(|s| s.mirror.clone());
         let fallback_writer = if spine_live.is_none() && !still_in_cell && created_by_mount {
             cell.as_ref().and_then(|c| {
