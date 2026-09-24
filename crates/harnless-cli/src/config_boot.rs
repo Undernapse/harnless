@@ -643,7 +643,12 @@ impl SpineUnwindGuard {
     /// neither the spine nor the cell may be disposed or classified by
     /// a later mount's failure.
     fn disarm() {
-        SPINE_UNWIND.with(|g| *g.lock().expect("unwind lock") = UnwindSlot::default());
+        // Poison-tolerant like every other lock on an unwind path: the
+        // slot is read/written from Drop and from the wrapper's exits,
+        // and a panic that held it must not abort here.
+        SPINE_UNWIND.with(|g| {
+            *g.lock().unwrap_or_else(|poison| poison.into_inner()) = UnwindSlot::default()
+        });
     }
 
 }
@@ -654,11 +659,17 @@ impl Drop for SpineUnwindGuard {
         // close its mirror, releasing the session lock, then classify the
         // seed's cell — a file this boot created abandons here, never as
         // a phantom the panic leaves behind.
+        // Poison-tolerant like every other lock on an unwind path: a
+        // panic that held the slot must not become a panic-inside-Drop
+        // abort here — the abort would strand the flock this Drop exists
+        // to release.
         let UnwindSlot {
             spine,
             cell,
             created_by_mount,
-        } = SPINE_UNWIND.with(|g| std::mem::take(&mut *g.lock().expect("unwind lock")));
+        } = SPINE_UNWIND.with(|g| {
+            std::mem::take(&mut *g.lock().unwrap_or_else(|poison| poison.into_inner()))
+        });
         // The strong spine handle, from *this* slot only: the wrapper
         // arms `slot.spine` and `LAST_MOUNTED_SPINE` at the same instant,
         // so the slot is the spine this mount composed. Falling back to
@@ -1238,8 +1249,13 @@ impl ConfigComposer {
     /// returned `SpineMount` alone never runs its `Drop` — the session
     /// mirror's flock would outlive the mount. Callers that compose a
     /// spine outside the `mount_seeded` wrapper (the seam tests) must
-    /// hold the `Arc<SpineMount>` until the fallible step completes, or
-    /// dispose explicitly. The wrapper is the tested production route.
+    /// *release* their `Arc<SpineMount>` as the fallible step unwinds
+    /// (a plain bound local — its drop runs during unwinding), or
+    /// dispose explicitly. A handle deliberately kept alive across the
+    /// panic (`ManuallyDrop`) is exactly the shape that strands the
+    /// lock; the wrapper-routed seam holds one only because
+    /// `SpineUnwindGuard`'s Drop disposes through the slot. The wrapper
+    /// is the tested production route.
     pub(crate) fn mount_spine_for(
         &self,
         doc: &ConfigDoc,
@@ -1366,7 +1382,7 @@ pub fn mount_seeded_panicking_after_spine_for_test(
         LAST_MOUNTED_SPINE
             .with(|s| *s.lock().expect("probe lock") = std::sync::Arc::downgrade(&spine));
         SPINE_UNWIND.with(|g| {
-            let mut slot = g.lock().expect("unwind lock");
+            let mut slot = g.lock().unwrap_or_else(|poison| poison.into_inner());
             slot.spine = std::sync::Arc::downgrade(&spine);
             slot.cell = Some(cell.clone());
         });
@@ -1538,7 +1554,7 @@ impl BootComposer for ConfigComposer {
         // `LAST_MOUNTED_SPINE` stays the body's own handle for the Err
         // arm's dispose, never a fallback the guard consults.
         SPINE_UNWIND.with(|g| {
-            let mut slot = g.lock().expect("unwind lock");
+            let mut slot = g.lock().unwrap_or_else(|poison| poison.into_inner());
             *slot = UnwindSlot {
                 spine: std::sync::Weak::new(),
                 cell: Some(cell.clone()),
@@ -1720,7 +1736,8 @@ impl ConfigComposer {
             LAST_MOUNTED_SPINE
                 .with(|s| *s.lock().expect("probe lock") = std::sync::Arc::downgrade(&spine));
             SPINE_UNWIND.with(|g| {
-                g.lock().expect("unwind lock").spine = std::sync::Arc::downgrade(&spine)
+                g.lock().unwrap_or_else(|poison| poison.into_inner()).spine =
+                    std::sync::Arc::downgrade(&spine)
             });
             spine
         } else {
