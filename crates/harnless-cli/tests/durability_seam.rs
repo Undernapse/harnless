@@ -1049,6 +1049,8 @@ fn panic_after_direct_spine_mount_releases_the_lock() {
                     declared: declared.to_vec(),
                 },
             };
+            // The `mount_spine_for` contract's release shape: a plain
+            // bound local, whose drop runs as the panic unwinds.
             let _spine = self
                 .inner
                 .mount_spine_for_for_test(&config_doc, wiring, seed)

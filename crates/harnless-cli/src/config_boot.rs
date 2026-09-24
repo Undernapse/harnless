@@ -694,9 +694,30 @@ impl Drop for SpineUnwindGuard {
                     .is_some()
             })
             .unwrap_or(false);
-        let mirror = spine_live.as_ref().and_then(|s| s.mirror.clone());
-        let mirror_id = if !still_in_cell && created_by_mount {
-            mirror.as_ref().map(|m| m.held_id())
+        // The mirror handle and the store dir, from *this* slot's sources
+        // only. When the slot's weak has already died — the window
+        // between the composition's Ok and the slot's spine record, where
+        // the Arc's count can hit zero while the registry-pinned plugin
+        // still holds the mirror's writer — the cell's writer is the
+        // fallback: `WriterGuard::drop` rolls a never-consumed writer back
+        // into the cell during the unwind, and its `abandon` names both
+        // the id and the dir. `still_in_cell` was read before the
+        // rollback ran, so a rolled-back writer lands in the
+        // `!still_in_cell` branch here. A dead weak with an empty cell has
+        // no source left here, and the wrapper's Err arm (or the
+        // process's exit) owns that release.
+        let spine_mirror = spine_live.as_ref().and_then(|s| s.mirror.clone());
+        let fallback_writer = if spine_live.is_none() && !still_in_cell && created_by_mount {
+            cell.as_ref().and_then(|c| {
+                c.lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take()
+            })
+        } else {
+            None
+        };
+        let mirror_id = if spine_live.is_some() && !still_in_cell && created_by_mount {
+            spine_mirror.as_ref().map(|m| m.held_id())
         } else {
             None
         };
@@ -725,14 +746,22 @@ impl Drop for SpineUnwindGuard {
         // The classification. The panic unwinds without an error value
         // to return, so a failed abandon is reported, never swallowed —
         // the same shape `unwind_created` prints.
+        // The dead-weak fallback's writer abandons its own file directly:
+        // `SessionWriter::abandon` releases the flock and removes the
+        // pair, which is exactly the created-file outcome. (A resume's
+        // writer never reaches here — `created_by_mount` gates the take.)
+        let fallback_outcome = fallback_writer
+            .map(|w| w.abandon())
+            .unwrap_or(Ok(()));
         let outcome = if let Some(cell) = cell.as_ref().filter(|_| still_in_cell) {
             crate::boot::classify_failed_cell(cell, created_by_mount).1
         } else if let Some(id) = mirror_id {
             // The mount consumed the writer into the mirror and the
-            // dispose above closed it: the file is this boot's orphan
-            // with no writer left to name it. Abandon by id — the by-id
-            // shape fences a concurrent opener with the lock probe and
-            // is success on a missing file/sibling.
+            // dispose above closed it (or the dead-weak fallback abandoned
+            // through the rolled-back writer): the file is this boot's
+            // orphan with no writer left to name it. Abandon by id — the
+            // by-id shape fences a concurrent opener with the lock probe
+            // and is success on a missing file/sibling.
             match store_dir.as_ref() {
                 Some(dir) => harnless_storage_jsonl::SessionStore::new(dir).abandon(id),
                 // No store row means no file this mount could have named.
@@ -741,6 +770,7 @@ impl Drop for SpineUnwindGuard {
         } else {
             Ok(())
         };
+        let outcome = fallback_outcome.and(outcome);
         if let Err(e) = outcome {
             eprintln!(
                 "warning: the session file created by this run could not be abandoned: {}: {}",
@@ -1250,12 +1280,13 @@ impl ConfigComposer {
     /// mirror's flock would outlive the mount. Callers that compose a
     /// spine outside the `mount_seeded` wrapper (the seam tests) must
     /// *release* their `Arc<SpineMount>` as the fallible step unwinds
-    /// (a plain bound local — its drop runs during unwinding), or
-    /// dispose explicitly. A handle deliberately kept alive across the
-    /// panic (`ManuallyDrop`) is exactly the shape that strands the
-    /// lock; the wrapper-routed seam holds one only because
-    /// `SpineUnwindGuard`'s Drop disposes through the slot. The wrapper
-    /// is the tested production route.
+    /// (a plain bound local — its drop runs during unwinding, which is
+    /// what `panic_after_direct_spine_mount_releases_the_lock` relies
+    /// on), or dispose explicitly. A handle deliberately kept alive
+    /// across the panic (`ManuallyDrop`) strands the lock unless some
+    /// other unwind-time owner releases it: the wrapper-routed seam
+    /// holds one only because `SpineUnwindGuard`'s Drop disposes through
+    /// the slot. The wrapper is the tested production route.
     pub(crate) fn mount_spine_for(
         &self,
         doc: &ConfigDoc,
@@ -1618,7 +1649,11 @@ impl ConfigComposer {
         // The test seam's panic path: when a seam test installs a hook,
         // the body dispatches to it (the seam mounts the real spine and
         // panics at the post-spine step) instead of composing. Production
-        // never arms a hook; the dispatch is inert there.
+        // never arms a hook; the dispatch is inert there. The
+        // `unreachable!` below rests on an invariant the single installer
+        // enforces: `mount_seeded_panicking_after_spine_for_test` is the
+        // only hook ever installed, and it always panics. A future
+        // non-panicking hook must return a `CliError` from here instead.
         #[cfg(any(test, feature = "test-cfg"))]
         if let Some(hook) = SEAM_HOOK.with(|h| h.lock().expect("seam hook").clone()) {
             hook(doc, seed);
@@ -1697,10 +1732,11 @@ impl ConfigComposer {
             // mirror (or there was none): the mirror path owns a created
             // file from here. A composition that failed *inside* its own
             // row loop keeps the cell armed: if the spine row never
-            // consumed the writer it rode back with the dropped seed, and
-            // only the guard's classification can abandon a created file
-            // then. (A failure after the row consumed the writer left the
-            // cell empty; the classification is inert.)
+            // consumed the writer it rode back with the dropped seed. A
+            // row-loop `Err` is classified by the wrapper's Err arm; the
+            // guard's classification is the *panic* path's owner of the
+            // same rule. (A failure after the row consumed the writer
+            // left the cell empty; the classification is inert.)
             //
             // Same-thread contract: the slot is a `thread_local`, and the
             // wrapper's failure arm reads it back on the *calling*
@@ -1730,9 +1766,11 @@ impl ConfigComposer {
             // is owned by live `Mounted` siblings and is never recorded:
             // disposing it would close a writer a sibling still needs.
             //
-            // The wrapper's Err arm disposes first through
-            // `LAST_MOUNTED_SPINE`; the guard's Drop re-runs the
-            // idempotent dispose, so no exit leaks the lock.
+            // On the *panic* exit only (the Ok exit disarms the slot
+            // first): the wrapper's Err arm disposes through
+            // `LAST_MOUNTED_SPINE` and classifies inline, and the guard's
+            // Drop re-runs the idempotent dispose, so no exit leaks the
+            // lock.
             LAST_MOUNTED_SPINE
                 .with(|s| *s.lock().expect("probe lock") = std::sync::Arc::downgrade(&spine));
             SPINE_UNWIND.with(|g| {
