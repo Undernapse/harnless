@@ -674,6 +674,34 @@ fn rm_removes_an_orphaned_lock_sibling() {
 }
 
 #[test]
+fn rm_removes_a_read_only_lock_sibling() {
+    // The fence must not decide from its own access rights: `flock`
+    // needs no write access, so a 0444 sibling — residue a root process
+    // or an odd umask left behind — is ordinary removable residue, not
+    // an errno. A write-mode probe open would answer
+    // `io-error: Permission denied` for a target the verb can fence,
+    // stat, and unlink (unlink is a directory permission).
+    let home = temp_home();
+    let dir = make_sessions_dir(&home);
+    std::fs::write(dir.join("88.jsonl.lock"), b"stale\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        dir.join("88.jsonl.lock"),
+        std::fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    let out = hrls_at(&home, &["sessions", "rm", "88"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("session: removed 88"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(dir_snapshot(&dir).is_empty(), "the residue is gone");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn rm_sessionless_is_storage_not_mounted() {
     let home = temp_home();
     let cfg = home.join("cfg");

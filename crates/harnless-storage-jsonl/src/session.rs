@@ -372,17 +372,20 @@ impl SessionStore {
     /// success.
     ///
     /// `held` is a guard this caller already took via
-    /// [`SessionStore::probe_lock`]: its descriptor is reused for the
-    /// unlinks — same create-free open, same inode — so the fence never
-    /// opens between the caller's decision and this call. Passing the
-    /// guard *in* is required, not a style choice: flock is
-    /// per-open-file-description, so a guard merely alive in the
-    /// caller's frame is a second descriptor from this method's point
-    /// of view, and a fresh `LOCK_EX | LOCK_NB` here would answer
+    /// [`SessionStore::probe_lock`]: its descriptor is reused as the
+    /// fence for the unlinks — same create-free open, same inode — so
+    /// the fence never opens between the caller's decision and this
+    /// call. Handing the guard *in* is what makes the hold continuous:
+    /// flock is per-open-file-description, so a guard merely alive in
+    /// the caller's frame is a second descriptor from this method's
+    /// point of view, and a fresh `LOCK_EX | LOCK_NB` here would answer
     /// `session-locked` against the caller's own hold. `None` re-probes
-    /// from scratch, which is correct but leaves a window in which an
-    /// unrelated process's cleanup can unlink the pair first and this
-    /// call reports success on a deletion it did not perform.
+    /// from scratch, which fences every other lock-respecting process
+    /// but leaves the window open to whoever does *not* respect the
+    /// lock — unlink is a directory permission, so an in-process unwind
+    /// calling this with `None` on a fresh descriptor can still unlink
+    /// the pair first and have this call report success on a deletion
+    /// it did not perform.
     pub fn abandon(&self, id: u64, held: Option<FileLock>) -> Result<(), SessionError> {
         let path = self.path(id);
         // Lock-first: if another process holds the session, refuse. The
@@ -396,10 +399,10 @@ impl SessionStore {
         // fence.
         let probe: Option<File> = match held {
             Some(guard) => Some(guard.into_file()),
-            None => std::fs::OpenOptions::new()
-                .write(true)
-                .open(&lock_path)
-                .ok(),
+            // Read-only for the same reason as probe_lock: flock needs
+            // no write access, and a write open would answer an errno
+            // for mode residue before the fence is consulted.
+            None => std::fs::OpenOptions::new().read(true).open(&lock_path).ok(),
         };
         if let Some(probe) = probe.as_ref() {
             // SAFETY: `probe` is a live owned file; the flock is released
@@ -442,10 +445,13 @@ impl SessionStore {
     pub fn probe_lock(&self, id: u64) -> Result<Option<FileLock>, SessionError> {
         let path = self.path(id);
         let lock_path = lock_sibling(&path);
-        // Opening WITHOUT `create`: no sibling means no holder to fence, and
-        // a sibling that vanishes between here and the flock below was
-        // simply never ours to hold.
-        let file = match std::fs::OpenOptions::new().write(true).open(&lock_path) {
+        // Opening WITHOUT `create`, and READ-ONLY: no sibling means no
+        // holder to fence, and a sibling that vanishes between here and
+        // the flock below was simply never ours to hold. Read access is
+        // all `flock` needs — a write open would turn mode residue the
+        // verb could otherwise fence (a 0444 sibling) into an errno
+        // before the fence is even consulted.
+        let file = match std::fs::OpenOptions::new().read(true).open(&lock_path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
