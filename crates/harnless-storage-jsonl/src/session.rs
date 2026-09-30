@@ -203,8 +203,10 @@ impl FileLock {
 }
 
 /// The lock sibling of a target file: `<target>.lock`. The one place the
-/// suffix is spelled; every lock path derives from here.
-pub(crate) fn lock_sibling(target: &Path) -> PathBuf {
+/// suffix is spelled; every lock path derives from here. Public so the
+/// CLI's `sessions rm` can stat the sibling for the orphan-residue
+/// fall-through (#78 §2) without re-spelling the suffix.
+pub fn lock_sibling(target: &Path) -> PathBuf {
     let mut p = target.as_os_str().to_os_string();
     p.push(".lock");
     PathBuf::from(p)

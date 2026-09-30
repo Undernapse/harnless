@@ -649,6 +649,31 @@ fn rm_missing_id_is_session_not_found() {
 }
 
 #[test]
+fn rm_removes_an_orphaned_lock_sibling() {
+    // #78 §2's "residue deletable manually" at the verb surface: a crash
+    // between the O_EXCL create and the lock release leaves
+    // `<id>.jsonl.lock` with no session file — a shape `list()` never
+    // shows and nothing else ever names. The named id still removes it;
+    // an id with neither file stays `session-not-found`.
+    let home = temp_home();
+    let dir = make_sessions_dir(&home);
+    std::fs::write(dir.join("77.jsonl.lock"), b"stale\n").unwrap();
+    let out = hrls_at(&home, &["sessions", "rm", "77"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("session: removed 77"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(dir_snapshot(&dir).is_empty(), "the residue is gone");
+    // The same id with neither file: the refusal returns.
+    let out = hrls_at(&home, &["sessions", "rm", "77"], &[]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).starts_with("session-not-found:"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn rm_sessionless_is_storage_not_mounted() {
     let home = temp_home();
     let cfg = home.join("cfg");

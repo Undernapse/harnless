@@ -22,7 +22,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use harnless_seams::SessionId;
-use harnless_storage_jsonl::{Header, SessionError, SessionMeta, SessionStore, SessionWriter};
+use harnless_storage_jsonl::{
+    lock_sibling, Header, SessionError, SessionMeta, SessionStore, SessionWriter,
+};
 
 use crate::boot::{BootComposer, MountSeed, Mounted};
 use crate::CliError;
@@ -346,17 +348,25 @@ pub fn render_list(rows: &[SessionMeta]) -> String {
 /// Ids are deduped silently (one line one delete, #77 §1), then each
 /// deduped id is attempted in input order:
 ///
-/// * stat `<dir>/<id>.jsonl` first — a missing file (or an absent store
-///   dir: the same stat fails) is `session-not-found` naming the id. The
-///   store primitive stays idempotent; the CLI-level "you named something
-///   that is not there" refusal lives here (#77 §5).
+/// * stat `<dir>/<id>.jsonl` — a missing session file is
+///   `session-not-found` naming the id (an absent store dir falls out of
+///   the same stat; no mkdir ever). The store primitive stays
+///   idempotent; the CLI-level "you named something that is not there"
+///   refusal lives here (#77 §5). The one exception is the orphaned lock
+///   sibling — a crash between the `O_EXCL` create and the lock release
+///   leaves `<id>.jsonl.lock` with no session file, a shape `list()`
+///   never shows and nothing else ever names. #78 §2's "residue deletable
+///   manually" makes this verb the manual tool, so the stat falls
+///   through to `abandon` when the *sibling* exists: the residue removes
+///   by id, and a named id with neither file still answers
+///   `session-not-found`.
 /// * [`SessionStore::abandon`] does the deletion: its lock-first fence
 ///   answers a held session with `session-locked` verbatim (holder pid
 ///   included), and a corrupt, torn, or zero-byte file deletes like any
 ///   other — the unlink is content-blind (#77 §3/§4).
 ///
 /// Nothing here ever creates a directory, a lock sibling, or a partial
-/// pair: the stat never touches, `abandon`'s probe never creates, and a
+/// pair: the stats never touch, `abandon`'s probe never creates, and a
 /// refusal leaves both files byte-identical.
 pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), CliError>)> {
     let mut seen = std::collections::BTreeSet::new();
@@ -365,7 +375,11 @@ pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), Cli
         if !seen.insert(id) {
             continue;
         }
-        let result = if !store.session_path(id).exists() {
+        let path = store.session_path(id);
+        // The orphan-sibling fall-through (doc above): the session file's
+        // absence alone is not yet a refusal if the sibling says a
+        // session lived here.
+        let result = if !path.exists() && !lock_sibling(&path).exists() {
             Err(CliError::new(
                 "session-not-found",
                 format!("no session {id} in {}", store.dir().display()),

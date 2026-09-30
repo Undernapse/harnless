@@ -36,6 +36,6 @@ mod session;
 
 pub use provider::{BackendNameExt, JsonlDomain, JsonlStorage};
 pub use session::{
-    read_holder, FileLock, Header, LoadReport, SessionError, SessionMeta, SessionStore,
-    SessionWriter, StoredLog,
+    lock_sibling, read_holder, FileLock, Header, LoadReport, SessionError, SessionMeta,
+    SessionStore, SessionWriter, StoredLog,
 };
