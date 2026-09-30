@@ -691,6 +691,15 @@ fn rm_removes_a_read_only_lock_sibling() {
     )
     .unwrap();
     let out = hrls_at(&home, &["sessions", "rm", "88"], &[]);
+    // Restore write permission before any assertion: a regression that
+    // leaves the 0444 sibling behind panics below, and cleanup after a
+    // panic never runs — the restore has to precede the asserts for the
+    // temp dir to stay reclaimable on the failure path.
+    if let Ok(meta) = std::fs::metadata(dir.join("88.jsonl.lock")) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(dir.join("88.jsonl.lock"), perms).ok();
+    }
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(
         stderr(&out).contains("session: removed 88"),
@@ -698,14 +707,6 @@ fn rm_removes_a_read_only_lock_sibling() {
         stderr(&out)
     );
     assert!(dir_snapshot(&dir).is_empty(), "the residue is gone");
-    // Hermetic even on the failure path: if a regression ever leaves
-    // the 0444 sibling behind, restore write permission before cleanup
-    // so the temp dir is never leaked unreadable.
-    if let Ok(meta) = std::fs::metadata(dir.join("88.jsonl.lock")) {
-        let mut perms = meta.permissions();
-        perms.set_mode(0o644);
-        std::fs::set_permissions(dir.join("88.jsonl.lock"), perms).ok();
-    }
     let _ = std::fs::remove_dir_all(&home);
 }
 
