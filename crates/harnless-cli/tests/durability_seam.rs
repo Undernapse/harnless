@@ -1454,6 +1454,39 @@ fn remove_pair_is_idempotent() {
 }
 
 #[test]
+fn rm_fall_through_fences_a_same_process_holder() {
+    // The fence the orphan-sibling fall-through must never skip: flock is
+    // per-open-file-description, so a *bare stat* of the sibling cannot
+    // see a holder from this same process — a second open+flock succeeds
+    // while the first holder is live. `remove_ids` therefore decides
+    // under `probe_lock` (the same acquire every holder uses), and a
+    // live in-process holder must answer `session-locked` with the pair
+    // intact, not unlink under the holder's feet.
+    let dir = temp_store("rmfence");
+    let store = SessionStore::new(&dir);
+    let id = 4242u64;
+    let holder = FileLock::hold(&dir, id).expect("the test holds the lock");
+    // The crash shape: sibling held, no session file.
+    let results = remove_ids(&store, &[id]);
+    let (_, res) = &results[0];
+    let err = res.as_ref().err().expect("a held sibling fences the rm");
+    assert_eq!(err.code, "session-locked", "not not-found: {err}");
+    assert!(
+        dir_names(&dir) == vec![format!("{id}.jsonl.lock")],
+        "the held sibling survives the refused rm"
+    );
+    drop(holder);
+    // Once the holder is gone, the same verb removes the residue.
+    remove_ids(&store, &[id])
+        .into_iter()
+        .next()
+        .and_then(|(_, r)| r.ok())
+        .expect("the residue removes by id once free");
+    assert!(dir_names(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn partial_batch_residue_is_well_defined() {
     // The batch posture's store half (#77 §2): every id is attempted, and
     // the end state is exactly {locked pair} — no half-deleted pair, no

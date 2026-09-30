@@ -348,18 +348,22 @@ pub fn render_list(rows: &[SessionMeta]) -> String {
 /// Ids are deduped silently (one line one delete, #77 §1), then each
 /// deduped id is attempted in input order:
 ///
-/// * stat `<dir>/<id>.jsonl` — a missing session file is
-///   `session-not-found` naming the id (an absent store dir falls out of
-///   the same stat; no mkdir ever). The store primitive stays
+/// * [`SessionStore::probe_lock`] fences the id first — the same
+///   non-blocking flock `abandon` takes, so a held session answers
+///   `session-locked` verbatim (holder pid included) before anything is
+///   considered, and the decision never rests on a bare `exists()` stat
+///   that cannot see a holder.
+/// * With the fence clear, stat `<dir>/<id>.jsonl`: a missing session
+///   file is `session-not-found` naming the id (an absent store dir falls
+///   out of the same stat; no mkdir ever). The store primitive stays
 ///   idempotent; the CLI-level "you named something that is not there"
 ///   refusal lives here (#77 §5). The one exception is the orphaned lock
 ///   sibling — a crash between the `O_EXCL` create and the lock release
 ///   leaves `<id>.jsonl.lock` with no session file, a shape `list()`
 ///   never shows and nothing else ever names. #78 §2's "residue deletable
-///   manually" makes this verb the manual tool, so the stat falls
-///   through to `abandon` when the *sibling* exists: the residue removes
-///   by id, and a named id with neither file still answers
-///   `session-not-found`.
+///   manually" makes this verb the manual tool, so a free sibling alone
+///   still falls through to `abandon`: the residue removes by id, and a
+///   named id with neither file still answers `session-not-found`.
 /// * [`SessionStore::abandon`] does the deletion: its lock-first fence
 ///   answers a held session with `session-locked` verbatim (holder pid
 ///   included), and a corrupt, torn, or zero-byte file deletes like any
@@ -376,16 +380,29 @@ pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), Cli
             continue;
         }
         let path = store.session_path(id);
-        // The orphan-sibling fall-through (doc above): the session file's
-        // absence alone is not yet a refusal if the sibling says a
-        // session lived here.
-        let result = if !path.exists() && !lock_sibling(&path).exists() {
-            Err(CliError::new(
-                "session-not-found",
-                format!("no session {id} in {}", store.dir().display()),
-            ))
-        } else {
-            store.abandon(id).map_err(session_cli_error)
+        // The orphan-sibling fall-through (doc above), decided under the
+        // same fence `abandon` itself takes: a non-blocking flock on the
+        // sibling, never a bare `exists()` stat (a stat cannot see a
+        // holder, and flock is per-open-file-description — a
+        // same-process holder would sail past a stat into an unlink
+        // under a live writer). Held ⇒ the error rides back verbatim
+        // (`session-locked` naming the holder); free ⇒ drop the guard
+        // and `abandon` re-probes under its own held lock.
+        let result = match store.probe_lock(id) {
+            Err(err) => Err(session_cli_error(err)),
+            Ok(guard) => {
+                // The guard's release is the handoff: dropped before
+                // `abandon` re-acquires.
+                drop(guard);
+                if path.exists() || lock_sibling(&path).exists() {
+                    store.abandon(id).map_err(session_cli_error)
+                } else {
+                    Err(CliError::new(
+                        "session-not-found",
+                        format!("no session {id} in {}", store.dir().display()),
+                    ))
+                }
+            }
         };
         out.push((id, result));
     }

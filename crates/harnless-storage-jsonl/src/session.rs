@@ -162,7 +162,7 @@ impl FileLock {
 
     /// Acquire the lock on `<target>.lock`, writing the holder pid after
     /// acquisition. A would-block is `Locked` naming the id and holder pid.
-    fn acquire(target: &Path, id: u64, nonblocking: bool) -> Result<Self, SessionError> {
+    pub(crate) fn acquire(target: &Path, id: u64, nonblocking: bool) -> Result<Self, SessionError> {
         let path = lock_sibling(target);
         let file = OpenOptions::new()
             .create(true)
@@ -203,9 +203,7 @@ impl FileLock {
 }
 
 /// The lock sibling of a target file: `<target>.lock`. The one place the
-/// suffix is spelled; every lock path derives from here. Public so the
-/// CLI's `sessions rm` can stat the sibling for the orphan-residue
-/// fall-through (#78 §2) without re-spelling the suffix.
+/// suffix is spelled; every lock path derives from here.
 pub fn lock_sibling(target: &Path) -> PathBuf {
     let mut p = target.as_os_str().to_os_string();
     p.push(".lock");
@@ -392,6 +390,29 @@ impl SessionStore {
         let result = remove_pair(id, [lock_path.as_path(), path.as_path()]);
         drop(probe);
         result
+    }
+
+    /// Probe session `id`'s lock without touching any file: a
+    /// non-blocking `flock` on the existing sibling, via the same
+    /// [`FileLock::acquire`] every holder uses — same open, same
+    /// would-block mapping, same holder-pid record. `Ok(true)` means the
+    /// lock is now held by *this* call (release it by dropping the
+    /// returned guard); `Ok(false)` means there is no sibling to fence,
+    /// exactly as [`SessionStore::abandon`]'s open-without-create probe
+    /// treats it. A held lock is `session-locked` verbatim, an open fault
+    /// is `io-error` — never a fabricated answer.
+    ///
+    /// The CLI's `sessions rm` decides its orphan-sibling fall-through
+    /// under this fence, not a bare `exists()` stat: a stat cannot see a
+    /// holder, and flock is per-open-file-description, so even a
+    /// same-process holder would sail past a stat into an unlink under a
+    /// live writer.
+    pub fn probe_lock(&self, id: u64) -> Result<Option<FileLock>, SessionError> {
+        let path = self.path(id);
+        if !lock_sibling(&path).exists() {
+            return Ok(None);
+        }
+        FileLock::acquire(&path, id, true).map(Some)
     }
 
     /// Create a brand-new session file: `O_EXCL` on the session file (an
