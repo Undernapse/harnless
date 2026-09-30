@@ -650,7 +650,6 @@ impl SpineUnwindGuard {
             *g.lock().unwrap_or_else(|poison| poison.into_inner()) = UnwindSlot::default()
         });
     }
-
 }
 
 impl Drop for SpineUnwindGuard {
@@ -667,9 +666,8 @@ impl Drop for SpineUnwindGuard {
             spine,
             cell,
             created_by_mount,
-        } = SPINE_UNWIND.with(|g| {
-            std::mem::take(&mut *g.lock().unwrap_or_else(|poison| poison.into_inner()))
-        });
+        } = SPINE_UNWIND
+            .with(|g| std::mem::take(&mut *g.lock().unwrap_or_else(|poison| poison.into_inner())));
         // The strong spine handle, from *this* slot only: the wrapper
         // arms `slot.spine` and `LAST_MOUNTED_SPINE` at the same instant,
         // so the slot is the spine this mount composed. Falling back to
@@ -708,11 +706,8 @@ impl Drop for SpineUnwindGuard {
         // wrapper's Err arm (or the process's exit) owns that release.
         let spine_mirror = spine_live.as_ref().and_then(|s| s.mirror.clone());
         let fallback_writer = if spine_live.is_none() && !still_in_cell && created_by_mount {
-            cell.as_ref().and_then(|c| {
-                c.lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .take()
-            })
+            cell.as_ref()
+                .and_then(|c| c.lock().unwrap_or_else(|poison| poison.into_inner()).take())
         } else {
             None
         };
@@ -750,9 +745,7 @@ impl Drop for SpineUnwindGuard {
         // `SessionWriter::abandon` releases the flock and removes the
         // pair, which is exactly the created-file outcome. (A resume's
         // writer never reaches here — `created_by_mount` gates the take.)
-        let fallback_outcome = fallback_writer
-            .map(|w| w.abandon())
-            .unwrap_or(Ok(()));
+        let fallback_outcome = fallback_writer.map(|w| w.abandon()).unwrap_or(Ok(()));
         let outcome = if let Some(cell) = cell.as_ref().filter(|_| still_in_cell) {
             crate::boot::classify_failed_cell(cell, created_by_mount).1
         } else if let Some(id) = mirror_id {
@@ -763,7 +756,7 @@ impl Drop for SpineUnwindGuard {
             // by-id shape fences a concurrent opener with the lock probe
             // and is success on a missing file/sibling.
             match store_dir.as_ref() {
-                Some(dir) => harnless_storage_jsonl::SessionStore::new(dir).abandon(id),
+                Some(dir) => harnless_storage_jsonl::SessionStore::new(dir).abandon(id, None),
                 // No store row means no file this mount could have named.
                 None => Ok(()),
             }

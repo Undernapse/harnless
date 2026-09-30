@@ -153,6 +153,12 @@ pub struct FileLock {
 }
 
 impl FileLock {
+    /// The held descriptor, for a caller handing the guard to
+    /// [`SessionStore::abandon`] as its fence.
+    fn into_file(self) -> File {
+        self._file
+    }
+
     /// Hold session `id`'s lock from `dir` (`<dir>/<id>.jsonl.lock`) in this
     /// process. The seam fixture's lock-holder; releasing is dropping.
     pub fn hold(dir: &Path, id: u64) -> Result<Self, SessionError> {
@@ -364,21 +370,42 @@ impl SessionStore {
     /// is the last step: once it goes, the next `create_new` builds a
     /// wholly new file *and* sibling pair. A missing file or sibling is
     /// success.
-    pub fn abandon(&self, id: u64) -> Result<(), SessionError> {
+    ///
+    /// `held` is a guard this caller already took via
+    /// [`SessionStore::probe_lock`]: its descriptor is reused for the
+    /// unlinks — same create-free open, same inode — so the fence never
+    /// opens between the caller's decision and this call. Passing the
+    /// guard *in* is required, not a style choice: flock is
+    /// per-open-file-description, so a guard merely alive in the
+    /// caller's frame is a second descriptor from this method's point
+    /// of view, and a fresh `LOCK_EX | LOCK_NB` here would answer
+    /// `session-locked` against the caller's own hold. `None` re-probes
+    /// from scratch, which is correct but leaves a window in which an
+    /// unrelated process's cleanup can unlink the pair first and this
+    /// call reports success on a deletion it did not perform.
+    pub fn abandon(&self, id: u64, held: Option<FileLock>) -> Result<(), SessionError> {
         let path = self.path(id);
         // Lock-first: if another process holds the session, refuse. The
         // probe must NOT create the sibling: an abandon whose session has
         // no sibling has no holder to fence, and manufacturing the file
         // here would leave residue the no-orphan rule forbids.
         let lock_path = lock_sibling(&path);
-        // Opening WITHOUT `create`: no sibling means no holder to fence.
-        let probe = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&lock_path)
-            .ok();
+        // The caller's guard (if any) IS the fence — its descriptor was
+        // opened create-free by probe_lock and already holds the flock.
+        // Otherwise open WITHOUT `create`: no sibling means no holder to
+        // fence.
+        let probe: Option<File> = match held {
+            Some(guard) => Some(guard.into_file()),
+            None => std::fs::OpenOptions::new()
+                .write(true)
+                .open(&lock_path)
+                .ok(),
+        };
         if let Some(probe) = probe.as_ref() {
             // SAFETY: `probe` is a live owned file; the flock is released
-            // when it drops — after both unlinks below.
+            // when it drops — after both unlinks below. A guard the
+            // caller handed in already holds the lock; re-flocking its
+            // descriptor is a held-by-us no-op.
             if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 return Err(lock_error(id, &lock_path, std::io::Error::last_os_error()));
             }

@@ -268,7 +268,7 @@ fn unwind_created(
     let result = match classified {
         Ok(()) => match writer {
             Some(writer) => writer.abandon(),
-            None => store.abandon(id),
+            None => store.abandon(id, None),
         },
         Err(e) => Err(e),
     };
@@ -419,9 +419,18 @@ pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), Cli
         let result = match store.probe_lock(id) {
             Err(err) => Err(session_cli_error(err)),
             Ok(guard) => {
-                // Free (or absent): the guard — if any — is dropped
-                // before `abandon` re-acquires under its own fence.
-                drop(guard);
+                // The fence is continuous: `guard` is not dropped here
+                // but MOVED into `abandon` on the delete arm (every
+                // other arm ends without it, which is the release).
+                // flock is per-open-file-description, so a guard merely
+                // alive in this frame would read as someone else's hold
+                // to `abandon`'s own probe — handing it in keeps the
+                // window between decision and unlink shut, where a
+                // concurrent mount-failure cleanup (close-the-mirror,
+                // then remove_pair) could otherwise unlink the pair
+                // first and this rm report `removed` for a deletion it
+                // did not perform.
+                //
                 // Decided from the two stats, but only after the fence
                 // cleared. A sibling that appears *after* the fence
                 // belongs to a live creator (`create_new` creates the
@@ -443,19 +452,23 @@ pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), Cli
                 let sibling_there = sibling.try_exists();
                 match (file_there, sibling_there) {
                     // Anything present deletes — through `abandon`'s
-                    // own fence, which re-probes the lock (create-free)
-                    // and refuses a HELD session before unlinking
-                    // either file. That is the guarantee: a held
-                    // sibling never sees an unlink. What no check here
-                    // can promise is the reverse — a sibling the probe
+                    // own fence, which the held probe guard already
+                    // satisfies (same descriptor, held-by-us) and which
+                    // refuses a session HELD by anyone else before
+                    // unlinking either file. What no check here can
+                    // promise is the reverse — a sibling the probe
                     // could open may still be un-unlinkable (unlink is
                     // a permission on the *directory*, independent of
-                    // the file's own access bits), and `abandon`'s
-                    // order is sibling-then-file, so such a fault
-                    // refuses before the session file goes. Residue
-                    // after a fault is named in the io-error message.
+                    // the file's own access bits). `SessionStore::
+                    // abandon`'s order is sibling-then-file, so such a
+                    // fault refuses before the session file goes; the
+                    // mirror-shaped `SessionWriter::abandon` unlinks
+                    // file-first (it holds the flock outright — the
+                    // next creator is fenced by the lock, not the
+                    // file), so that path's fault residue is the
+                    // sibling, named in its io-error.
                     (Ok(true), _) | (Ok(false), Ok(true)) => {
-                        store.abandon(id).map_err(session_cli_error)
+                        store.abandon(id, guard).map_err(session_cli_error)
                     }
                     // Both answered absent: the kernel said ENOENT
                     // about both targets, which is exactly what

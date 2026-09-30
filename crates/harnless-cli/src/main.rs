@@ -144,10 +144,13 @@ fn parse_session_id(s: &str) -> Result<u64, String> {
 /// signal is its exit code alone: the per-id lines already printed every
 /// code verbatim, and a synthetic batch code would be the sixth code
 /// #71 §4 forbids — so dispatch's batch failure rides back as the
-/// empty-code sentinel, and this predicate is the one place that decides
-/// it prints nothing. (Pinned by `the_batch_sentinel_prints_nothing…`.)
+/// empty-code *and* empty-message sentinel, and this predicate is the
+/// one place that decides it prints nothing. Both halves must be empty:
+/// a code-less error that still carries a message prints it — silence
+/// is reserved for the batch case, never granted to any future
+/// malformed error. (Pinned by `the_batch_sentinel_prints_nothing…`.)
 fn prints_to_stderr(err: &CliError) -> bool {
-    !err.code.is_empty()
+    !(err.code.is_empty() && err.message.is_empty())
 }
 
 fn main() -> ExitCode {
@@ -189,6 +192,15 @@ mod tests {
                 "session 1 is locked by process 2"
             )),
             "a table code prints"
+        );
+        // Silence is the batch case specifically: an empty code with a
+        // message still prints — no error gets to exit 1 unexplained.
+        assert!(
+            prints_to_stderr(&CliError {
+                code: "",
+                message: "a code-less fault".into(),
+            }),
+            "an empty-code error with a message must print"
         );
     }
 }

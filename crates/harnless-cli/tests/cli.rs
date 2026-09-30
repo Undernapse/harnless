@@ -784,8 +784,12 @@ fn rm_bad_id_is_clap_usage_error() {
         let err = stderr(&out);
         assert!(err.contains("error:"), "clap's shape: {err}");
         assert!(
-            err.contains("invalid value") || err.contains("session ids are decimal numbers"),
-            "the parse failure names the value: {err}"
+            err.contains("session ids are decimal numbers"),
+            "parse_session_id's own wording must reach the usage error: {err}"
+        );
+        assert!(
+            err.contains(bad),
+            "the failure names the offending value: {err}"
         );
         assert_eq!(dir_snapshot(&dir), before, "zero filesystem touch");
     }
@@ -954,17 +958,20 @@ fn no_prune_guard() {
     assert_eq!(dir_snapshot(&dir), before, "list mutates nothing");
 
     // 4. `sessions rm <one target>` — every entry but the named target
-    //    is byte- and mtime-identical.
-    let out = hrls_at(&home, &["sessions", "rm", "32"], &[]);
+    //    is byte- and mtime-identical. The target is 33, which HAS a
+    //    planted sibling: the exclusion below must name both files, so
+    //    an rm that over-deleted an unnamed sibling could not hide
+    //    behind a target that never had one.
+    let out = hrls_at(&home, &["sessions", "rm", "33"], &[]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let after = dir_snapshot(&dir);
     assert_eq!(
         after,
         before
             .into_iter()
-            .filter(|(n, _, _)| n != "32.jsonl")
+            .filter(|(n, _, _)| n != "33.jsonl" && n != "33.jsonl.lock")
             .collect::<Vec<_>>(),
-        "rm removed exactly its named target"
+        "rm removed exactly its named target (and its pair sibling)"
     );
     let _ = std::fs::remove_dir_all(&home);
 }

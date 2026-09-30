@@ -1435,11 +1435,11 @@ fn remove_pair_is_idempotent() {
     let (id, writer) = mint_with(|id| store.create_new(id)).expect("mint");
     drop(writer);
     assert!(store.session_path(id).exists());
-    store.abandon(id).expect("abandon removes the pair");
+    store.abandon(id, None).expect("abandon removes the pair");
     assert!(dir_names(&dir).is_empty(), "the pair must be gone");
 
     // The same id again: success-on-missing, not an error.
-    store.abandon(id).expect("abandon is idempotent");
+    store.abandon(id, None).expect("abandon is idempotent");
 
     // A lock sibling with no session file: abandon answers Ok and the
     // probe itself never creates one (the bulk-friendly shape #76 found —
@@ -1447,7 +1447,9 @@ fn remove_pair_is_idempotent() {
     let holder = FileLock::hold(&dir, 999).expect("hold creates the sibling");
     drop(holder);
     assert_eq!(dir_names(&dir), vec!["999.jsonl.lock".to_string()]);
-    store.abandon(999).expect("a sibling alone is removable");
+    store
+        .abandon(999, None)
+        .expect("a sibling alone is removable");
     assert!(dir_names(&dir).is_empty(), "no residue manufactured");
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -1608,7 +1610,7 @@ fn zero_byte_phantom_is_removable() {
     assert_eq!(std::fs::metadata(store.session_path(id)).unwrap().len(), 0);
     assert!(store.list().is_empty(), "list skips the phantom");
 
-    store.abandon(id).expect("the phantom's pair removes");
+    store.abandon(id, None).expect("the phantom's pair removes");
     assert!(dir_names(&dir).is_empty(), "file and sibling both gone");
     std::fs::remove_dir_all(&dir).unwrap();
 }
