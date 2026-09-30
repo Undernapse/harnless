@@ -391,7 +391,11 @@ pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), Cli
     // — including a missing *component* — to `Ok(false)`, so a dir the
     // kernel refuses to answer (`Err`) poisons every read under it.
     // That fault is named once for the whole batch; an answered dir —
-    // present or absent — proceeds.
+    // present or absent — proceeds. The gate covers the dir's state at
+    // the batch's start; a dir that *becomes* unanswerable mid-batch
+    // (mode changed by another process) surfaces as the per-target
+    // `io-error` naming the stat fault below, which is the same
+    // honest posture — the fault gets named, never absence.
     if let Err(e) = store.dir().try_exists() {
         let msg = format!("checking session store {}: {e}", store.dir().display());
         let mut faulted = Vec::new();
@@ -468,6 +472,19 @@ pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), Cli
                     // file), so that path's fault residue is the
                     // sibling, named in its io-error.
                     (Ok(true), _) | (Ok(false), Ok(true)) => {
+                        // The guard moves in, so the fence is one
+                        // uninterrupted hold from probe to unlink —
+                        // against a *live holder*. It is not a claim
+                        // of exclusivity over the pair: unlink is a
+                        // permission on the directory, so an
+                        // in-process mount-failure unwind that reaches
+                        // `abandon(id, None)` on a fresh descriptor
+                        // can still race the unlink (its NotFound-
+                        // is-success arm then reports success on a
+                        // deletion this rm did not perform). Closing
+                        // that shape needs a different fence (O_EXCL
+                        // tombstone or rename-then-unlink), not a
+                        // longer flock.
                         store.abandon(id, guard).map_err(session_cli_error)
                     }
                     // Both answered absent: the kernel said ENOENT
