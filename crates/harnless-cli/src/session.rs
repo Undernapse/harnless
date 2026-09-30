@@ -354,10 +354,12 @@ pub fn render_list(rows: &[SessionMeta]) -> String {
 ///   considered, and the decision never rests on a bare `exists()` stat
 ///   that cannot see a holder.
 /// * With the fence clear, stat `<dir>/<id>.jsonl`: a missing session
-///   file is `session-not-found` naming the id (an absent store dir falls
-///   out of the same stat; no mkdir ever). The store primitive stays
-///   idempotent; the CLI-level "you named something that is not there"
-///   refusal lives here (#77 §5). The one exception is the orphaned lock
+///   file is `session-not-found` naming the id (an absent store dir
+///   falls out of the same per-id stat — the dir gate below refuses
+///   only a dir the kernel would not answer at all; no mkdir ever).
+///   The store primitive stays idempotent; the CLI-level "you named
+///   something that is not there" refusal lives here (#77 §5). The one
+///   exception is the orphaned lock
 ///   sibling — a crash between the `O_EXCL` create and the lock release
 ///   leaves `<id>.jsonl.lock` with no session file, a shape `list()`
 ///   never shows and nothing else ever names. #78 §2's "residue deletable
@@ -382,30 +384,15 @@ pub fn render_list(rows: &[SessionMeta]) -> String {
 /// With the dir answered — present or absent — the per-target stats
 /// carry the decision, and `session-not-found` means the kernel said
 /// `ENOENT` about the target.
-///
-/// [`DirState`] is [`remove_ids`]'s private three-way read of the store
-/// dir: present, absent, or faulted.
-#[derive(Debug)]
-enum DirState {
-    Present,
-    Absent,
-    Fault(std::io::Error),
-}
-
 pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), CliError>)> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     // The dir's own stat gates the batch: `try_exists` maps any ENOENT
     // — including a missing *component* — to `Ok(false)`, so a dir the
     // kernel refuses to answer (`Err`) poisons every read under it.
-    // That fault is named once for the whole batch; present/absent
-    // dirs answer normally.
-    let dir_state = match store.dir().try_exists() {
-        Ok(true) => DirState::Present,
-        Ok(false) => DirState::Absent,
-        Err(e) => DirState::Fault(e),
-    };
-    if let DirState::Fault(e) = &dir_state {
+    // That fault is named once for the whole batch; an answered dir —
+    // present or absent — proceeds.
+    if let Err(e) = store.dir().try_exists() {
         let msg = format!("checking session store {}: {e}", store.dir().display());
         let mut faulted = Vec::new();
         for &id in ids {
@@ -457,12 +444,16 @@ pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), Cli
                 match (file_there, sibling_there) {
                     // Anything present deletes — through `abandon`'s
                     // own fence, which re-probes the lock (create-free)
-                    // and refuses a held session before unlinking
-                    // either file. The half-delete shape — file
-                    // present, sibling present-but-unopenable — is
-                    // refused up front by `probe_lock` (an open fault
-                    // is Err above, never Ok(None)), so `abandon` never
-                    // runs with a sibling it cannot unlink.
+                    // and refuses a HELD session before unlinking
+                    // either file. That is the guarantee: a held
+                    // sibling never sees an unlink. What no check here
+                    // can promise is the reverse — a sibling the probe
+                    // could open may still be un-unlinkable (unlink is
+                    // a permission on the *directory*, independent of
+                    // the file's own access bits), and `abandon`'s
+                    // order is sibling-then-file, so such a fault
+                    // refuses before the session file goes. Residue
+                    // after a fault is named in the io-error message.
                     (Ok(true), _) | (Ok(false), Ok(true)) => {
                         store.abandon(id).map_err(session_cli_error)
                     }
