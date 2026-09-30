@@ -162,7 +162,7 @@ impl FileLock {
 
     /// Acquire the lock on `<target>.lock`, writing the holder pid after
     /// acquisition. A would-block is `Locked` naming the id and holder pid.
-    pub(crate) fn acquire(target: &Path, id: u64, nonblocking: bool) -> Result<Self, SessionError> {
+    fn acquire(target: &Path, id: u64, nonblocking: bool) -> Result<Self, SessionError> {
         let path = lock_sibling(target);
         let file = OpenOptions::new()
             .create(true)
@@ -393,26 +393,45 @@ impl SessionStore {
     }
 
     /// Probe session `id`'s lock without touching any file: a
-    /// non-blocking `flock` on the existing sibling, via the same
-    /// [`FileLock::acquire`] every holder uses — same open, same
-    /// would-block mapping, same holder-pid record. `Ok(true)` means the
-    /// lock is now held by *this* call (release it by dropping the
-    /// returned guard); `Ok(false)` means there is no sibling to fence,
-    /// exactly as [`SessionStore::abandon`]'s open-without-create probe
-    /// treats it. A held lock is `session-locked` verbatim, an open fault
-    /// is `io-error` — never a fabricated answer.
+    /// non-blocking `flock` on the existing sibling. `Ok(Some(guard))` means
+    /// the lock is now held by *this* call (release it by dropping the
+    /// guard); `Ok(None)` means there is no sibling to fence — the open is
+    /// WITHOUT `create`, exactly [`SessionStore::abandon`]'s probe shape, so
+    /// the probe never manufactures the file it was told not to touch. A
+    /// held lock is `session-locked` verbatim; a would-block on a sibling
+    /// that vanished mid-call still names the holder from the guard's own
+    /// record.
     ///
-    /// The CLI's `sessions rm` decides its orphan-sibling fall-through
-    /// under this fence, not a bare `exists()` stat: a stat cannot see a
-    /// holder, and flock is per-open-file-description, so even a
-    /// same-process holder would sail past a stat into an unlink under a
-    /// live writer.
+    /// The open is separate from the `flock` (not [`FileLock::acquire`],
+    /// which opens with `create`): a stat in front of a creating open is a
+    /// TOCTOU that manufactures residue, and a creating open is a TOCTOU in
+    /// the victim's arms.
+    ///
+    /// The CLI's `sessions rm` decides its orphan-sibling fall-through under
+    /// this fence, not a bare `exists()` stat: a stat cannot see a holder,
+    /// and flock is per-open-file-description, so even a same-process holder
+    /// would sail past a stat into an unlink under a live writer.
     pub fn probe_lock(&self, id: u64) -> Result<Option<FileLock>, SessionError> {
         let path = self.path(id);
-        if !lock_sibling(&path).exists() {
-            return Ok(None);
+        let lock_path = lock_sibling(&path);
+        // Opening WITHOUT `create`: no sibling means no holder to fence, and
+        // a sibling that vanishes between here and the flock below was
+        // simply never ours to hold.
+        let file = match std::fs::OpenOptions::new().write(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(SessionError::new(
+                    "io-error",
+                    format!("opening lock file {}: {e}", lock_path.display()),
+                ))
+            }
+        };
+        // SAFETY: `file` is a valid open descriptor for the duration.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(lock_error(id, &lock_path, std::io::Error::last_os_error()));
         }
-        FileLock::acquire(&path, id, true).map(Some)
+        Ok(Some(FileLock { _file: file }))
     }
 
     /// Create a brand-new session file: `O_EXCL` on the session file (an
