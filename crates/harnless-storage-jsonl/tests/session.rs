@@ -160,12 +160,12 @@ fn abandon_refuses_under_a_held_lock_and_removes_both_files_after() {
     let lock_path = dir.join("11.jsonl.lock");
     std::fs::write(&lock_path, "").unwrap();
     let probe = FileLock::hold(&dir, 11).expect("probe takes the lock");
-    let err = store.abandon(11).unwrap_err();
+    let err = store.abandon(11, None).unwrap_err();
     assert_eq!(err.code, "session-locked");
     assert!(dir.join("11.jsonl").exists(), "refused abandon keeps file");
     assert!(lock_path.exists(), "refused abandon keeps sibling");
     drop(probe);
-    store.abandon(11).expect("abandon after release");
+    store.abandon(11, None).expect("abandon after release");
     assert!(!dir.join("11.jsonl").exists());
     assert!(!lock_path.exists());
     let _ = std::fs::remove_dir_all(&dir);
@@ -186,7 +186,7 @@ fn abandon_refuses_an_orphaned_sibling_holder_and_manufactures_nothing() {
     std::fs::write(dir.join("5.jsonl"), "").unwrap();
     let holder = FileLock::hold(&dir, 5).expect("holder takes the sibling lock");
     std::fs::remove_file(dir.join("5.jsonl")).unwrap(); // the old order's window
-    let err = store.abandon(5).unwrap_err();
+    let err = store.abandon(5, None).unwrap_err();
     assert_eq!(
         err.code, "session-locked",
         "must fence the orphaned-sibling holder"
@@ -196,7 +196,7 @@ fn abandon_refuses_an_orphaned_sibling_holder_and_manufactures_nothing() {
         "refused abandon keeps sibling"
     );
     drop(holder);
-    store.abandon(5).expect("abandon after release");
+    store.abandon(5, None).expect("abandon after release");
     let leftovers: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().file_name())
@@ -204,7 +204,9 @@ fn abandon_refuses_an_orphaned_sibling_holder_and_manufactures_nothing() {
     assert!(leftovers.is_empty(), "abandon left residue: {leftovers:?}");
     // (b) no sibling: success, and nothing created.
     std::fs::write(dir.join("6.jsonl"), "").unwrap();
-    store.abandon(6).expect("abandon without sibling succeeds");
+    store
+        .abandon(6, None)
+        .expect("abandon without sibling succeeds");
     let leftovers: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().file_name())

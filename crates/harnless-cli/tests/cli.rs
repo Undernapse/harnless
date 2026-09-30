@@ -449,3 +449,829 @@ fn sessions_list_never_mutates_the_store() {
     assert_eq!(before.1, after.1, "list never touches the mtime");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ── The sessions lifecycle at the process boundary (#80's file-B contract) ──
+//
+// `sessions rm`, `sessions list --json`, and the never-prune guard — each
+// one a real `hrls` invocation against an isolated `HOME`. Locked targets
+// are the in-process `FileLock::hold` fixture (#72's two-process rule);
+// ordering is fixture utimes; the corpus is the built-in replay model.
+
+/// *Create* the fixture store dir under a temp `HOME` (the shipped default
+/// profile's store dir) and return its path. The name says mkdir: the
+/// purity-sensitive tests name their own creations.
+fn make_sessions_dir(home: &std::path::Path) -> std::path::PathBuf {
+    let dir = home.join(".harnless/sessions");
+    std::fs::create_dir_all(&dir).expect("fixture store dir");
+    dir
+}
+
+/// A committed-record line for a fixture file: `UserMessage` carrying
+/// `prompt` (the `firstPrompt` source). Serialized through the agent's own
+/// event types — the store's own encoder — so the tolerant reader parses
+/// it (`SessionEvent` is `#[serde(tag = "type")]`; hand-rolled JSON drifts).
+fn fixture_line(prompt: &str) -> String {
+    use harnless_agent::events::{CommittedRecord, ContentBlock, MessageRecord, SessionEvent};
+    use harnless_seams::MessageId;
+    let record = CommittedRecord {
+        position: 0,
+        time_ms: 1000,
+        event: SessionEvent::UserMessage(MessageRecord {
+            id: MessageId(1),
+            blocks: vec![ContentBlock::Text {
+                text: prompt.to_string(),
+            }],
+            provider: None,
+            model: None,
+        }),
+    };
+    serde_json::to_string(&record).expect("fixture record serializes")
+}
+
+/// Write a plain fixture session.
+fn write_session(dir: &std::path::Path, id: u64, prompt: &str) {
+    std::fs::write(
+        dir.join(format!("{id}.jsonl")),
+        format!("{}\n", fixture_line(prompt)),
+    )
+    .expect("write fixture session");
+}
+
+/// Write a fork fixture session (header line + one prompt record).
+fn write_fork(dir: &std::path::Path, id: u64, source: u64, prompt: &str) {
+    std::fs::write(
+        dir.join(format!("{id}.jsonl")),
+        format!(
+            "{{\"header\":{{\"forked_from\":\"{source}\"}}}}\n{}\n",
+            fixture_line(prompt)
+        ),
+    )
+    .expect("write fork fixture");
+}
+
+/// Fix a fixture file's mtime to an exact epoch second (#80's rule:
+/// ≥1s-spaced fixture utimes, never the wall clock, never a sleep).
+fn set_fixture_mtime(path: &std::path::Path, secs: u64) {
+    let times = std::fs::FileTimes::new()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for utime");
+    file.set_times(times).expect("set fixture mtime");
+}
+
+/// A full snapshot of a dir: name → (bytes, mtime-secs) for every entry,
+/// plus whether the dir exists at all. The never-prune guard's "unchanged"
+/// is byte- and mtime-exact, not just a name list.
+fn dir_snapshot(dir: &std::path::Path) -> Vec<(String, Vec<u8>, u64)> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut v: Vec<_> = std::fs::read_dir(dir)
+        .expect("read dir")
+        .map(|e| {
+            let e = e.expect("entry");
+            let path = e.path();
+            let bytes = std::fs::read(&path).expect("read entry");
+            let mtime = e
+                .metadata()
+                .expect("metadata")
+                .modified()
+                .expect("mtime")
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("posix mtime")
+                .as_secs();
+            (e.file_name().to_string_lossy().into_owned(), bytes, mtime)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn rm_removes_the_pair_and_list_forgets_it() {
+    let home = temp_home();
+    let id: u64 = mint(&home, "hello").parse().unwrap();
+    let dir = home.join(".harnless/sessions");
+    // The mint left a lock sibling behind (the crash-shape residue a rm
+    // must also clear): plant one so "the pair" is a real assertion.
+    std::fs::write(dir.join(format!("{id}.jsonl.lock")), b"stale\n").unwrap();
+    let out = hrls_at(&home, &["sessions", "rm", &id.to_string()], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains(&format!("session: removed {id}")),
+        "the success line names the id: {}",
+        stderr(&out)
+    );
+    assert_eq!(stdout(&out), "", "stdout stays answer-only");
+    assert!(
+        !dir.join(format!("{id}.jsonl")).exists(),
+        "the file is gone"
+    );
+    assert!(
+        !dir.join(format!("{id}.jsonl.lock")).exists(),
+        "the lock sibling is gone"
+    );
+    let out = hrls_at(&home, &["sessions", "list"], &[]);
+    assert!(out.status.success());
+    assert!(
+        !stdout(&out).contains(&id.to_string()),
+        "list no longer sees the id:\n{}",
+        stdout(&out)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn rm_held_lock_refuses_intact() {
+    let home = temp_home();
+    let id: u64 = mint(&home, "hello").parse().unwrap();
+    let dir = home.join(".harnless/sessions");
+    // The single-process lock-file fixture (#72's rule): the test's own
+    // flock refuses the child's abandon. The bytes are captured *after*
+    // `hold` — acquisition rewrites the sibling with the holder pid, so
+    // the post-hold bytes are the state the refused rm must leave
+    // byte-identical (a child that rewrote or unlinked the sibling
+    // fails the comparison; capturing pre-hold bytes would compare
+    // against a state the fixture itself had already replaced).
+    let holder = harnless_storage_jsonl::FileLock::hold(&dir, id).expect("test holds first");
+    let before = (
+        std::fs::read(dir.join(format!("{id}.jsonl"))).unwrap(),
+        std::fs::read(dir.join(format!("{id}.jsonl.lock"))).unwrap(),
+    );
+    let out = hrls_at(&home, &["sessions", "rm", &id.to_string()], &[]);
+    drop(holder);
+    assert!(!out.status.success(), "a locked rm exits nonzero");
+    assert!(
+        stderr(&out).starts_with(&format!(
+            "session-locked: session {id} is locked by process"
+        )),
+        "the reused code names the holder pid: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read(dir.join(format!("{id}.jsonl"))).unwrap(),
+        before.0,
+        "the session file is byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(dir.join(format!("{id}.jsonl.lock"))).unwrap(),
+        before.1,
+        "the lock sibling is byte-identical"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn rm_missing_id_is_session_not_found() {
+    let home = temp_home();
+    // Never-minted id, store dir absent: the same stat answers both.
+    let out = hrls_at(&home, &["sessions", "rm", "1"], &[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).starts_with("session-not-found:") && stderr(&out).contains("no session 1"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        !home.join(".harnless").exists(),
+        "rm never mkdirs the store it refused to find in"
+    );
+    // A present dir with no such file: same code, dir untouched.
+    let dir = make_sessions_dir(&home);
+    let out = hrls_at(&home, &["sessions", "rm", "42"], &[]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).starts_with("session-not-found:"));
+    assert!(dir.exists(), "the absent target never creates anything");
+    assert!(dir_snapshot(&dir).is_empty(), "and leaves no residue");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn rm_removes_an_orphaned_lock_sibling() {
+    // #78 §2's "residue deletable manually" at the verb surface: a crash
+    // between the O_EXCL create and the lock release leaves
+    // `<id>.jsonl.lock` with no session file — a shape `list()` never
+    // shows and nothing else ever names. The named id still removes it;
+    // an id with neither file stays `session-not-found`.
+    let home = temp_home();
+    let dir = make_sessions_dir(&home);
+    std::fs::write(dir.join("77.jsonl.lock"), b"stale\n").unwrap();
+    let out = hrls_at(&home, &["sessions", "rm", "77"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("session: removed 77"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(dir_snapshot(&dir).is_empty(), "the residue is gone");
+    // The same id with neither file: the refusal returns.
+    let out = hrls_at(&home, &["sessions", "rm", "77"], &[]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).starts_with("session-not-found:"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn rm_removes_a_read_only_lock_sibling() {
+    // The fence must not decide from its own access rights: `flock`
+    // needs no write access, so a 0444 sibling — residue a root process
+    // or an odd umask left behind — is ordinary removable residue, not
+    // an errno. A write-mode probe open would answer
+    // `io-error: Permission denied` for a target the verb can fence,
+    // stat, and unlink (unlink is a directory permission).
+    let home = temp_home();
+    let dir = make_sessions_dir(&home);
+    std::fs::write(dir.join("88.jsonl.lock"), b"stale\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        dir.join("88.jsonl.lock"),
+        std::fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    let out = hrls_at(&home, &["sessions", "rm", "88"], &[]);
+    // Restore write permission before any assertion: a regression that
+    // leaves the 0444 sibling behind panics below, and cleanup after a
+    // panic never runs — the restore has to precede the asserts for the
+    // temp dir to stay reclaimable on the failure path.
+    if let Ok(meta) = std::fs::metadata(dir.join("88.jsonl.lock")) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(dir.join("88.jsonl.lock"), perms).ok();
+    }
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("session: removed 88"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(dir_snapshot(&dir).is_empty(), "the residue is gone");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn rm_sessionless_is_storage_not_mounted() {
+    let home = temp_home();
+    let cfg = home.join("cfg");
+    std::fs::create_dir_all(cfg.join("profiles")).unwrap();
+    std::fs::write(
+        cfg.join("profiles/plain.yml"),
+        "name: plain\nbundles: [core]\n",
+    )
+    .unwrap();
+    let out = hrls_at(
+        &home,
+        &[
+            "--config",
+            cfg.to_str().unwrap(),
+            "--profile",
+            "plain",
+            "sessions",
+            "rm",
+            "1",
+        ],
+        &[],
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).starts_with("storage-not-mounted:"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        !home.join(".harnless").exists(),
+        "the refusal happens before any touch"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn rm_batch_skip_with_warning() {
+    let home = temp_home();
+    let dir = make_sessions_dir(&home);
+    let clean1 = 11u64;
+    let locked = 12u64;
+    let missing = 13u64;
+    let clean2 = 14u64;
+    write_session(&dir, clean1, "one");
+    write_session(&dir, locked, "held");
+    write_session(&dir, clean2, "two");
+    let holder = harnless_storage_jsonl::FileLock::hold(&dir, locked).expect("test holds first");
+
+    // [clean, locked, missing, clean, duplicate-of-first] (#80 test 10).
+    let out = hrls_at(
+        &home,
+        &[
+            "sessions",
+            "rm",
+            &clean1.to_string(),
+            &locked.to_string(),
+            &missing.to_string(),
+            &clean2.to_string(),
+            &clean1.to_string(),
+        ],
+        &[],
+    );
+    drop(holder);
+    assert!(!out.status.success(), "exit 1 iff any id failed");
+    let err = stderr(&out);
+    assert!(err.contains(&format!("session: removed {clean1}")), "{err}");
+    assert!(err.contains(&format!("session: removed {clean2}")), "{err}");
+    assert!(
+        err.contains(&format!(
+            "session-locked: session {locked} is locked by process"
+        )),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("session-not-found: no session {missing}")),
+        "{err}"
+    );
+    // The duplicate produced no second line and no spurious error: the
+    // success line appears exactly once.
+    assert_eq!(
+        err.lines()
+            .filter(|l| *l == format!("session: removed {clean1}"))
+            .count(),
+        1,
+        "the dup id is silent, one line one delete: {err}"
+    );
+    assert_eq!(stdout(&out), "", "stdout stays answer-only");
+    // Final dir state: the locked pair only.
+    assert_eq!(
+        dir_snapshot(&dir)
+            .iter()
+            .map(|(n, _, _)| n.clone())
+            .collect::<Vec<_>>(),
+        vec![format!("{locked}.jsonl"), format!("{locked}.jsonl.lock")],
+        "skip-with-warning leaves exactly the locked pair"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn rm_bad_id_is_clap_usage_error() {
+    let home = temp_home();
+    let dir = make_sessions_dir(&home);
+    let before = dir_snapshot(&dir);
+    for bad in ["abc", "18446744073709551616"] {
+        let out = hrls_at(&home, &["sessions", "rm", bad], &[]);
+        assert!(!out.status.success(), "{bad} must be a usage error");
+        let err = stderr(&out);
+        assert!(err.contains("error:"), "clap's shape: {err}");
+        assert!(
+            err.contains("session ids are decimal numbers"),
+            "parse_session_id's own wording must reach the usage error: {err}"
+        );
+        assert!(
+            err.contains(bad),
+            "the failure names the offending value: {err}"
+        );
+        assert_eq!(dir_snapshot(&dir), before, "zero filesystem touch");
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn rm_deletes_corrupt_and_zero_byte() {
+    let home = temp_home();
+    let dir = make_sessions_dir(&home);
+    // Corrupt mid-file: a good first line, then garbage (a first-line
+    // refusal is the torn/unparseable-head class, not the shown-corrupt
+    // class — #70 §3). Its mtime is fixed so the phantom (mtime 1000,
+    // below it) can never displace it in the mtime-desc table.
+    std::fs::write(
+        dir.join("21.jsonl"),
+        format!("{}\nnot json at all\n", fixture_line("readable first")),
+    )
+    .unwrap();
+    set_fixture_mtime(&dir.join("21.jsonl"), 2000);
+    // Zero-byte phantom: absent from `list` rows, removable by id.
+    std::fs::write(dir.join("22.jsonl"), b"").unwrap();
+    set_fixture_mtime(&dir.join("22.jsonl"), 1000);
+    let out = hrls_at(&home, &["sessions", "list"], &[]);
+    let table = stdout(&out);
+    assert!(table.contains("21"), "the corrupt file is listed: {table}");
+    assert!(
+        !table.contains("22"),
+        "the phantom is skipped by list: {table}"
+    );
+    let out = hrls_at(&home, &["sessions", "rm", "21", "22"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("session: removed 21"));
+    assert!(stderr(&out).contains("session: removed 22"));
+    assert!(dir_snapshot(&dir).is_empty(), "both pairs fully gone");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn rm_dedupes_silently() {
+    let home = temp_home();
+    let dir = make_sessions_dir(&home);
+    write_session(&dir, 42, "answer");
+    let out = hrls_at(&home, &["sessions", "rm", "42", "42"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(
+        stderr(&out)
+            .lines()
+            .filter(|l| *l == "session: removed 42")
+            .count(),
+        1,
+        "one line one delete: {}",
+        stderr(&out)
+    );
+    assert!(dir_snapshot(&dir).is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn no_prune_guard() {
+    // #78 §1's claim executed, not described: no invocation mutates what
+    // it wasn't told to touch. One guard test, four invocations.
+    let home = temp_home();
+    let dir = make_sessions_dir(&home);
+    write_session(&dir, 31, "normal");
+    // Mid-file corrupt: good first line, then garbage (#70 §3's shown-
+    // corrupt class, not the unparseable-head class).
+    std::fs::write(
+        dir.join("32.jsonl"),
+        format!("{}\ncorrupt line\n", fixture_line("readable first")),
+    )
+    .unwrap();
+    write_fork(&dir, 33, 31, "child");
+    // A stale crash-shape sibling beside 33: the guard's mtime-spacing
+    // must handle `<id>.jsonl.lock` names (the one-shot strip's whole
+    // point), and `list`/`rm` must leave it untouched until named.
+    std::fs::write(dir.join("33.jsonl.lock"), b"stale\n").unwrap();
+    // The planted names, captured at planting time: the guard's
+    // fixture/boot split is exact-name membership, never a prefix a
+    // minted id could one day share (the mint scheme's leading digits
+    // are clock-dependent — #57's zero-flake rule forbids the accident).
+    let planted: Vec<String> = dir_snapshot(&dir)
+        .iter()
+        .map(|(n, _, _)| n.clone())
+        .collect();
+    for f in dir_snapshot(&dir) {
+        // One-shot suffix strip: a chained trim_end_matches would also
+        // eat the `.jsonl` of `<id>.jsonl.lock`, spacing the sibling off
+        // a stem its name never carries.
+        let stem =
+            f.0.strip_suffix(".lock")
+                .unwrap_or(&f.0)
+                .trim_end_matches(".jsonl");
+        set_fixture_mtime(&dir.join(&f.0), 5000 + stem.parse::<u64>().unwrap_or(0));
+    }
+    // `fixture` keeps exactly the planted files; `boot` keeps everything
+    // else — the invocation's own mint (a named creation, never residue
+    // the guard forbids).
+    let fixture = |v: &[(String, Vec<u8>, u64)]| -> Vec<(String, Vec<u8>, u64)> {
+        v.iter()
+            .filter(|(n, _, _)| planted.contains(n))
+            .cloned()
+            .collect()
+    };
+    let boot = |v: &[(String, Vec<u8>, u64)]| -> Vec<(String, Vec<u8>, u64)> {
+        v.iter()
+            .filter(|(n, _, _)| !planted.contains(n))
+            .cloned()
+            .collect()
+    };
+
+    // 1. `run` (a full boot).
+    let before = dir_snapshot(&dir);
+    assert!(boot(&before).is_empty(), "baseline: no boot files yet");
+    let out = hrls_at(&home, &["run", "--", "hello"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let after = dir_snapshot(&dir);
+    assert_eq!(
+        fixture(&after),
+        fixture(&before),
+        "the boot pruned or touched nothing it did not name"
+    );
+    // The mint's own files are the boot's named creation; drop them for
+    // the next invocation's baseline.
+    for (name, _, _) in boot(&after) {
+        std::fs::remove_file(dir.join(&name)).ok();
+    }
+
+    // 2. `interactive` (piped exit).
+    let before = dir_snapshot(&dir);
+    assert!(
+        boot(&before).is_empty(),
+        "baseline clean after the run's mint"
+    );
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hrls"))
+        .args(["interactive"])
+        .env("HOME", &home)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hrls interactive");
+    child
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(b"exit\n")
+        .expect("write exit");
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let after = dir_snapshot(&dir);
+    assert_eq!(
+        fixture(&after),
+        fixture(&before),
+        "the REPL boot touched nothing it did not name"
+    );
+    // An interactive boot that drove no turn leaves a zero-byte phantom
+    // (the mint shape); clean it for the next baseline, same as above.
+    for (name, _, _) in boot(&after) {
+        std::fs::remove_file(dir.join(&name)).ok();
+    }
+
+    // 3. `sessions list` — the full snapshot must be untouched.
+    let before = dir_snapshot(&dir);
+    let out = hrls_at(&home, &["sessions", "list"], &[]);
+    assert!(out.status.success());
+    assert_eq!(dir_snapshot(&dir), before, "list mutates nothing");
+
+    // 4. `sessions rm <one target>` — every entry but the named target
+    //    is byte- and mtime-identical. The target is 33, which HAS a
+    //    planted sibling: the exclusion below must name both files, so
+    //    an rm that over-deleted an unnamed sibling could not hide
+    //    behind a target that never had one.
+    let out = hrls_at(&home, &["sessions", "rm", "33"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let after = dir_snapshot(&dir);
+    assert_eq!(
+        after,
+        before
+            .into_iter()
+            .filter(|(n, _, _)| n != "33.jsonl" && n != "33.jsonl.lock")
+            .collect::<Vec<_>>(),
+        "rm removed exactly its named target (and its pair sibling)"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn sessions_list_json_golden() {
+    let home = temp_home();
+    let dir = make_sessions_dir(&home);
+    // The rich fixture (#80 test 15): normal, fork, fork-of-fork, corrupt,
+    // zero-byte phantom, non-u64 stem. mtimes fixed ≥1s apart.
+    let long_prompt = "y".repeat(60);
+    write_session(&dir, 100, &long_prompt);
+    set_fixture_mtime(&dir.join("100.jsonl"), 1000);
+    write_fork(&dir, 101, 100, "branch");
+    set_fixture_mtime(&dir.join("101.jsonl"), 2000);
+    write_fork(&dir, 102, 101, "branch-of-branch");
+    set_fixture_mtime(&dir.join("102.jsonl"), 3000);
+    // Corrupt *mid-file*: a good first line, then garbage — a first-line
+    // refusal would be `torn_tail`/unparseable-line-one, not the shown-as
+    // corrupt case the table's `?` row pins (#70 §3's distinction).
+    std::fs::write(
+        dir.join("103.jsonl"),
+        format!("{}\ngarbage\n", fixture_line("readable first")),
+    )
+    .unwrap();
+    set_fixture_mtime(&dir.join("103.jsonl"), 4000);
+    std::fs::write(dir.join("104.jsonl"), b"").unwrap();
+    set_fixture_mtime(&dir.join("104.jsonl"), 5000);
+    std::fs::write(dir.join("notanid.jsonl"), fixture_line("stray")).unwrap();
+    set_fixture_mtime(&dir.join("notanid.jsonl"), 6000);
+
+    let out = hrls_at(&home, &["sessions", "list", "--json"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let v: Vec<serde_json::Value> =
+        serde_json::from_str(&stdout(&out)).expect("--json stdout is a JSON array");
+    // The phantom and the non-u64 stem are absent; mtime-desc order.
+    let ids: Vec<u64> = v.iter().map(|r| r["id"].as_u64().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec![103, 102, 101, 100],
+        "one row per real session, mtime-desc"
+    );
+
+    // Schema-exact assertions (the seam test's, at the spawn surface).
+    let mut corrupt_keys: Vec<_> = v[0]
+        .as_object()
+        .expect("row")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    corrupt_keys.sort();
+    assert_eq!(
+        corrupt_keys,
+        vec!["corrupt", "events", "firstPrompt", "id", "modified"],
+        "the corrupt row has no forkedFrom"
+    );
+    assert_eq!(
+        v[0]["events"],
+        serde_json::Value::Null,
+        "null exactly when corrupt"
+    );
+    assert_eq!(v[0]["firstPrompt"], serde_json::Value::Null);
+    assert_eq!(v[0]["corrupt"], serde_json::json!(true));
+    // The corrupt row above has no `forkedFrom`; the fork-of-fork row
+    // (102) carries it — absence and presence together pin the absent
+    // discipline.
+    assert!(
+        v[1].get("forkedFrom").is_some(),
+        "the fork row carries forkedFrom: {}",
+        v[1]
+    );
+    let mut fork_keys: Vec<_> = v[1]
+        .as_object()
+        .expect("row")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fork_keys.sort();
+    assert_eq!(
+        fork_keys,
+        vec![
+            "corrupt",
+            "events",
+            "firstPrompt",
+            "forkedFrom",
+            "id",
+            "modified"
+        ],
+        "the fork row's exact field set"
+    );
+    assert_eq!(
+        v[1]["forkedFrom"],
+        serde_json::json!(101u64),
+        "fork-of-fork names its parent"
+    );
+    assert_eq!(v[2]["forkedFrom"], serde_json::json!(100u64));
+    let mut plain_keys: Vec<_> = v[3]
+        .as_object()
+        .expect("row")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    plain_keys.sort();
+    assert_eq!(
+        plain_keys,
+        vec!["corrupt", "events", "firstPrompt", "id", "modified"],
+        "forkedFrom absent for non-forks"
+    );
+    assert_eq!(
+        v[3]["firstPrompt"],
+        serde_json::json!(long_prompt),
+        "full text, never the table's 40-char cut"
+    );
+    assert_eq!(
+        v[3]["modified"],
+        serde_json::json!(1000u64),
+        "epoch seconds"
+    );
+    assert_eq!(v[3]["events"], serde_json::json!(1));
+    assert_eq!(v[3]["corrupt"], serde_json::json!(false));
+
+    // Purity: no lock sibling created, no dir created beyond the fixture.
+    let names: Vec<String> = dir_snapshot(&dir)
+        .iter()
+        .map(|(n, _, _)| n.clone())
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.ends_with(".lock")),
+        "--json creates no lock sibling: {names:?}"
+    );
+
+    // Without `--json` the human table is byte-identical to today's shape:
+    // header, mtime-desc rows, `?`/`-` for the corrupt row, phantom skipped.
+    let out = hrls_at(&home, &["sessions", "list"], &[]);
+    assert!(out.status.success());
+    let table = stdout(&out);
+    assert!(table.starts_with("id\tmodified\tevents\tfirst prompt\n"));
+    let rows: Vec<&str> = table.lines().skip(1).collect();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.split('\t').next().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["103", "102", "101", "100"]
+    );
+    assert!(
+        rows[0].ends_with("\t?\t-"),
+        "corrupt row is `?`/`-`: {}",
+        rows[0]
+    );
+    // `[]` byte-exit on empty and absent dirs, exit 0.
+    let empty_home = temp_home();
+    make_sessions_dir(&empty_home);
+    let out = hrls_at(&empty_home, &["sessions", "list", "--json"], &[]);
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "[]\n");
+    let absent_home = temp_home();
+    let out = hrls_at(&absent_home, &["sessions", "list", "--json"], &[]);
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "[]\n");
+    assert!(
+        !absent_home.join(".harnless").exists(),
+        "--json never mkdirs the store"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&empty_home);
+    let _ = std::fs::remove_dir_all(&absent_home);
+}
+
+#[test]
+fn dangling_forked_from_is_exposed_raw() {
+    // #77 §6's silent posture + #79's expose-raw, end-to-end through both
+    // verbs: fork s2 from s1, rm s1, and s2's row still names s1 raw.
+    let home = temp_home();
+    let s1: u64 = mint(&home, "origin").parse().unwrap();
+    let out = hrls_at(
+        &home,
+        &["run", "--fork", &s1.to_string(), "--", "branch"],
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let s2: u64 = stderr(&out)
+        .lines()
+        .find(|l| l.starts_with("session: "))
+        .expect("fork prints the target id")["session: ".len()..]
+        .parse()
+        .unwrap();
+    let out = hrls_at(&home, &["sessions", "rm", &s1.to_string()], &[]);
+    assert!(
+        out.status.success(),
+        "a fork source is rm-able, silently: {}",
+        stderr(&out)
+    );
+    // No warning, no refusal on stderr beyond the success line (#77 §6).
+    assert_eq!(
+        stderr(&out).trim(),
+        format!("session: removed {s1}"),
+        "fork-source deletion is silent"
+    );
+    let out = hrls_at(&home, &["sessions", "list", "--json"], &[]);
+    assert!(out.status.success());
+    let v: Vec<serde_json::Value> =
+        serde_json::from_str(&stdout(&out)).expect("--json stdout is a JSON array");
+    let row = v
+        .iter()
+        .find(|r| r["id"] == serde_json::json!(s2))
+        .expect("the child is still listed");
+    assert_eq!(
+        row["forkedFrom"],
+        serde_json::json!(s1),
+        "the dangling source is exposed raw"
+    );
+    // No existence annotation exists in the row: the six-field shape only.
+    let mut keys: Vec<_> = row
+        .as_object()
+        .expect("row")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "corrupt",
+            "events",
+            "firstPrompt",
+            "forkedFrom",
+            "id",
+            "modified"
+        ],
+        "the row carries no resolution of the dangling source"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn sessions_list_json_sessionless() {
+    let home = temp_home();
+    let cfg = home.join("cfg");
+    std::fs::create_dir_all(cfg.join("profiles")).unwrap();
+    std::fs::write(
+        cfg.join("profiles/plain.yml"),
+        "name: plain\nbundles: [core]\n",
+    )
+    .unwrap();
+    let out = hrls_at(
+        &home,
+        &[
+            "--config",
+            cfg.to_str().unwrap(),
+            "--profile",
+            "plain",
+            "sessions",
+            "list",
+            "--json",
+        ],
+        &[],
+    );
+    assert!(!out.status.success());
+    assert_eq!(stdout(&out), "", "stdout stays answer-only");
+    assert!(
+        stderr(&out).starts_with("storage-not-mounted:"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

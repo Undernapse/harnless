@@ -7,8 +7,12 @@
 //!   (stdout stays "the answer text, then nothing else");
 //! * `hrls interactive --profile <name> [--resume <id> | --fork <id>]` —
 //!   REPL entry, same session route and banner;
-//! * `hrls sessions list` — the store's session table for the composed
-//!   plan's store dir;
+//! * `hrls sessions list [--json]` — the store's session table (or, with
+//!   `--json`, the machine-readable row array) for the composed plan's
+//!   store dir;
+//! * `hrls sessions rm <id>...` — delete named sessions (file + lock
+//!   sibling); every id is attempted, one stderr line per id, exit
+//!   nonzero iff any failed (#77);
 //! * `hrls --profile <name> --dump-config` — print the composed profile
 //!   document through the boot serializer (a pure offline operation: no
 //!   store dir is created, no lock is taken);
@@ -112,7 +116,21 @@ enum ProfileAction {
 #[derive(Subcommand, Debug)]
 enum SessionsAction {
     /// List sessions in the composed plan's store dir (#71 §3).
-    List,
+    /// `--json` prints the machine-readable bare array instead (#79).
+    List {
+        /// Emit the JSON row array on stdout instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete one or more sessions by id (#77): unlink each named
+    /// session's file and lock sibling. A locked session refuses
+    /// `session-locked`; every named id is attempted (skip-with-warning),
+    /// and the exit is nonzero iff any id failed.
+    Rm {
+        /// The session ids to delete (decimal numbers, one or more).
+        #[arg(value_parser = parse_session_id, required = true)]
+        ids: Vec<u64>,
+    },
 }
 
 /// Session ids are decimal `u64` (#71 §2) — the raw minted number, not
@@ -122,14 +140,69 @@ fn parse_session_id(s: &str) -> Result<u64, String> {
         .map_err(|_| format!("session ids are decimal numbers, not {s:?}"))
 }
 
+/// Whether `main` prints this error to stderr. The rm batch's failure
+/// signal is its exit code alone: the per-id lines already printed every
+/// code verbatim, and a synthetic batch code would be the sixth code
+/// #71 §4 forbids — so dispatch's batch failure rides back as the
+/// empty-code *and* empty-message sentinel, and this predicate is the
+/// one place that decides it prints nothing. Both halves must be empty:
+/// a code-less error that still carries a message prints it — silence
+/// is reserved for the batch case, never granted to any future
+/// malformed error. (Pinned by `the_batch_sentinel_prints_nothing…`.)
+fn prints_to_stderr(err: &CliError) -> bool {
+    !(err.code.is_empty() && err.message.is_empty())
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let code = match dispatch(&cli) {
-        Ok(()) => return ExitCode::SUCCESS,
-        Err(err) => err,
-    };
-    eprintln!("{code}");
-    ExitCode::FAILURE
+    match dispatch(&cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            if prints_to_stderr(&err) {
+                eprintln!("{err}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The rm batch's failure signal is the exit code alone (#71 §4's
+    /// table has exactly five codes; the batch adds no sixth). That
+    /// contract lives across two sites — dispatch's `Rm` arm constructs
+    /// the empty-code sentinel, `main` must never print it — so the
+    /// convention is pinned here, at the printer: the sentinel renders
+    /// as nothing, and every real code still renders `code: message`.
+    #[test]
+    fn the_batch_sentinel_prints_nothing_and_real_codes_print() {
+        use crate::{prints_to_stderr, CliError};
+        // The sentinel is silent; every table code still prints
+        // `code: message` (the shape every existing stderr golden pins).
+        assert!(
+            !prints_to_stderr(&CliError {
+                code: "",
+                message: String::new(),
+            }),
+            "the empty-code sentinel must print nothing"
+        );
+        assert!(
+            prints_to_stderr(&CliError::new(
+                "session-locked",
+                "session 1 is locked by process 2"
+            )),
+            "a table code prints"
+        );
+        // Silence is the batch case specifically: an empty code with a
+        // message still prints — no error gets to exit 1 unexplained.
+        assert!(
+            prints_to_stderr(&CliError {
+                code: "",
+                message: "a code-less fault".into(),
+            }),
+            "an empty-code error with a message must print"
+        );
+    }
 }
 
 /// Build the composer for this invocation.
@@ -209,12 +282,59 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Some(Command::Sessions { action }) => match action {
             // `sessions list` reads the composed plan's store dir — so
-            // `--profile`/`--patch` affect it (#71 §3). It never mounts.
-            SessionsAction::List => {
+            // `--profile`/`--patch` affect it (#71 §3). It never mounts,
+            // never locks, and never creates: `--json` rides the same
+            // pure route, only the renderer changes (#79 §4).
+            SessionsAction::List { json } => {
                 let doc = composer.compose(&cli.profile, patch)?;
                 report(&composer);
                 let store = harnless_cli::session::store_handle(&doc, None)?;
-                print!("{}", harnless_cli::session::render_list(&store.list()));
+                let rows = store.list();
+                if *json {
+                    println!("{}", harnless_cli::session::render_json(&rows));
+                } else {
+                    print!("{}", harnless_cli::session::render_list(&rows));
+                }
+                Ok(())
+            }
+            // `sessions rm` (#77): a thin shell over the store's abandon.
+            // Every deduped id is attempted; each outcome prints one
+            // stderr line — `session: removed <id>` on success, the
+            // five-code table verbatim on failure — and stdout stays
+            // answer-only. Exit 1 iff any id failed (#77 §2).
+            SessionsAction::Rm { ids } => {
+                let doc = composer.compose(&cli.profile, patch)?;
+                report(&composer);
+                // Sessionless plan: `storage-not-mounted` before any
+                // filesystem touch (#77 §5) — the same store_handle the
+                // list route uses.
+                let store = harnless_cli::session::store_handle(&doc, None)?;
+                let mut any_failed = false;
+                let results = harnless_cli::session::remove_ids(&store, ids);
+                for (id, result) in results {
+                    match result {
+                        Ok(()) => eprintln!("session: removed {id}"),
+                        Err(err) => {
+                            any_failed = true;
+                            eprintln!("{err}");
+                        }
+                    }
+                }
+                if any_failed {
+                    // The per-id lines above already carried every code
+                    // verbatim (#71 §4's table — no sixth code exists).
+                    // The batch's exit is the only extra signal: a bare
+                    // nonzero, never a synthetic code line. The sentinel
+                    // is silent *because* a line printed: `any_failed`
+                    // is set only inside the loop that just emitted the
+                    // error's `code: message` line, so an exit-1 batch
+                    // always has at least one stderr line — the silent
+                    // sentinel never abandons a failure unexplained.
+                    return Err(CliError {
+                        code: "",
+                        message: String::new(),
+                    });
+                }
                 Ok(())
             }
         },

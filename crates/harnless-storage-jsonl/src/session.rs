@@ -120,6 +120,11 @@ pub struct SessionMeta {
     pub first_prompt: Option<String>,
     /// Mid-file corruption: the file is shown, resume refuses.
     pub corrupt: bool,
+    /// The fork header's source id, carried raw (#79 §2): a field copy of
+    /// the header `list` already parses and discards — zero extra I/O.
+    /// `None` for a non-fork or a file whose header never parsed. A dangling
+    /// source is exposed as-is; nothing resolves or annotates it.
+    pub forked_from: Option<u64>,
 }
 
 /// A tolerant load result: the good prefix, plus whether a torn tail was
@@ -148,6 +153,12 @@ pub struct FileLock {
 }
 
 impl FileLock {
+    /// The held descriptor, for a caller handing the guard to
+    /// [`SessionStore::abandon`] as its fence.
+    fn into_file(self) -> File {
+        self._file
+    }
+
     /// Hold session `id`'s lock from `dir` (`<dir>/<id>.jsonl.lock`) in this
     /// process. The seam fixture's lock-holder; releasing is dropping.
     pub fn hold(dir: &Path, id: u64) -> Result<Self, SessionError> {
@@ -199,7 +210,7 @@ impl FileLock {
 
 /// The lock sibling of a target file: `<target>.lock`. The one place the
 /// suffix is spelled; every lock path derives from here.
-pub(crate) fn lock_sibling(target: &Path) -> PathBuf {
+pub fn lock_sibling(target: &Path) -> PathBuf {
     let mut p = target.as_os_str().to_os_string();
     p.push(".lock");
     PathBuf::from(p)
@@ -359,21 +370,45 @@ impl SessionStore {
     /// is the last step: once it goes, the next `create_new` builds a
     /// wholly new file *and* sibling pair. A missing file or sibling is
     /// success.
-    pub fn abandon(&self, id: u64) -> Result<(), SessionError> {
+    ///
+    /// `held` is a guard this caller already took via
+    /// [`SessionStore::probe_lock`]: its descriptor is reused as the
+    /// fence for the unlinks — same create-free open, same inode — so
+    /// the fence never opens between the caller's decision and this
+    /// call. Handing the guard *in* is what makes the hold continuous:
+    /// flock is per-open-file-description, so a guard merely alive in
+    /// the caller's frame is a second descriptor from this method's
+    /// point of view, and a fresh `LOCK_EX | LOCK_NB` here would answer
+    /// `session-locked` against the caller's own hold. `None` re-probes
+    /// from scratch, which fences every other lock-respecting process
+    /// but leaves the window open to whoever does *not* respect the
+    /// lock — unlink is a directory permission, so an in-process unwind
+    /// calling this with `None` on a fresh descriptor can still unlink
+    /// the pair first and have this call report success on a deletion
+    /// it did not perform.
+    pub fn abandon(&self, id: u64, held: Option<FileLock>) -> Result<(), SessionError> {
         let path = self.path(id);
         // Lock-first: if another process holds the session, refuse. The
         // probe must NOT create the sibling: an abandon whose session has
         // no sibling has no holder to fence, and manufacturing the file
         // here would leave residue the no-orphan rule forbids.
         let lock_path = lock_sibling(&path);
-        // Opening WITHOUT `create`: no sibling means no holder to fence.
-        let probe = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&lock_path)
-            .ok();
+        // The caller's guard (if any) IS the fence — its descriptor was
+        // opened create-free by probe_lock and already holds the flock.
+        // Otherwise open WITHOUT `create`: no sibling means no holder to
+        // fence.
+        let probe: Option<File> = match held {
+            Some(guard) => Some(guard.into_file()),
+            // Read-only for the same reason as probe_lock: flock needs
+            // no write access, and a write open would answer an errno
+            // for mode residue before the fence is consulted.
+            None => std::fs::OpenOptions::new().read(true).open(&lock_path).ok(),
+        };
         if let Some(probe) = probe.as_ref() {
             // SAFETY: `probe` is a live owned file; the flock is released
-            // when it drops — after both unlinks below.
+            // when it drops — after both unlinks below. A guard the
+            // caller handed in already holds the lock; re-flocking its
+            // descriptor is a held-by-us no-op.
             if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 return Err(lock_error(id, &lock_path, std::io::Error::last_os_error()));
             }
@@ -385,6 +420,52 @@ impl SessionStore {
         let result = remove_pair(id, [lock_path.as_path(), path.as_path()]);
         drop(probe);
         result
+    }
+
+    /// Probe session `id`'s lock without touching any file: a non-blocking
+    /// `flock` on the existing sibling. `Ok(Some(guard))` means the lock is
+    /// now held by *this* call (release it by dropping the guard);
+    /// `Ok(None)` means there is no sibling to fence — the open is WITHOUT
+    /// `create`, exactly [`SessionStore::abandon`]'s probe shape, so the
+    /// probe never manufactures the file it was told not to touch. A held
+    /// lock is `session-locked` naming the holder from the sibling's own
+    /// pid record (written by the holder's [`FileLock::acquire`]); a record
+    /// unreadable mid-call names `?`. Any other open fault is `io-error`
+    /// naming the errno — a fault is never reported as absence.
+    ///
+    /// The open is separate from the `flock` (not [`FileLock::acquire`],
+    /// which opens with `create`): a stat in front of a creating open is a
+    /// TOCTOU that manufactures residue, and a creating open is a TOCTOU in
+    /// the victim's arms.
+    ///
+    /// The CLI's `sessions rm` decides its orphan-sibling fall-through under
+    /// this fence, not a bare `exists()` stat: a stat cannot see a holder,
+    /// and flock is per-open-file-description, so even a same-process holder
+    /// would sail past a stat into an unlink under a live writer.
+    pub fn probe_lock(&self, id: u64) -> Result<Option<FileLock>, SessionError> {
+        let path = self.path(id);
+        let lock_path = lock_sibling(&path);
+        // Opening WITHOUT `create`, and READ-ONLY: no sibling means no
+        // holder to fence, and a sibling that vanishes between here and
+        // the flock below was simply never ours to hold. Read access is
+        // all `flock` needs — a write open would turn mode residue the
+        // verb could otherwise fence (a 0444 sibling) into an errno
+        // before the fence is even consulted.
+        let file = match std::fs::OpenOptions::new().read(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(SessionError::new(
+                    "io-error",
+                    format!("opening lock file {}: {e}", lock_path.display()),
+                ))
+            }
+        };
+        // SAFETY: `file` is a valid open descriptor for the duration.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(lock_error(id, &lock_path, std::io::Error::last_os_error()));
+        }
+        Ok(Some(FileLock { _file: file }))
     }
 
     /// Create a brand-new session file: `O_EXCL` on the session file (an
@@ -648,19 +729,22 @@ impl SessionStore {
                         .unwrap_or(0)
                 })
                 .unwrap_or(0);
-            let (event_count, first_prompt, corrupt) = match self.load_tolerant(id) {
+            let (event_count, first_prompt, corrupt, forked_from) = match self.load_tolerant(id) {
                 Ok(Some(report)) => {
                     let first = first_prompt_of(&report.records);
-                    (Some(report.records.len()), first, false)
+                    // #79 §2: the header this already parsed rides the row —
+                    // a field copy, never a re-read, never a resolution.
+                    let forked = report.header.map(|h| h.forked_from);
+                    (Some(report.records.len()), first, false, forked)
                 }
                 // An absent file cannot appear in a directory listing; the
                 // arm exists only because `load_tolerant` speaks in Options.
-                Ok(None) => (None, None, true),
+                Ok(None) => (None, None, true, None),
                 // #71 §3: a corrupt file is shown, never refused. An io
                 // error (unreadable, EIO) is displayed as corrupt too — the
                 // table's job is "this file's facts are unavailable", and
                 // the two are indistinguishable to a shell reader.
-                Err(_) => (None, None, true),
+                Err(_) => (None, None, true, None),
             };
             out.push(SessionMeta {
                 id,
@@ -668,6 +752,7 @@ impl SessionStore {
                 event_count,
                 first_prompt,
                 corrupt,
+                forked_from,
             });
         }
         out.sort_by(|a, b| b.mtime_secs.cmp(&a.mtime_secs).then(b.id.cmp(&a.id)));

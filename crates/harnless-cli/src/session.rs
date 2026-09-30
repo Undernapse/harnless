@@ -22,7 +22,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use harnless_seams::SessionId;
-use harnless_storage_jsonl::{Header, SessionError, SessionMeta, SessionStore, SessionWriter};
+use harnless_storage_jsonl::{
+    lock_sibling, Header, SessionError, SessionMeta, SessionStore, SessionWriter,
+};
 
 use crate::boot::{BootComposer, MountSeed, Mounted};
 use crate::CliError;
@@ -266,7 +268,7 @@ fn unwind_created(
     let result = match classified {
         Ok(()) => match writer {
             Some(writer) => writer.abandon(),
-            None => store.abandon(id),
+            None => store.abandon(id, None),
         },
         Err(e) => Err(e),
     };
@@ -337,6 +339,223 @@ pub fn render_list(rows: &[SessionMeta]) -> String {
         ));
     }
     out
+}
+
+/// Remove a batch of sessions by id — the `sessions rm` verb's engine
+/// (#77 §2/§5, #80 §3). Pure per-id loop, no printing: the caller (the
+/// binary) owns the stderr lines and the exit code.
+///
+/// Ids are deduped silently (one line one delete, #77 §1), then each
+/// deduped id is attempted in input order:
+///
+/// * [`SessionStore::probe_lock`] fences the id first — the same
+///   non-blocking flock `abandon` takes, so a held session answers
+///   `session-locked` verbatim (holder pid included) before anything is
+///   considered, and the decision never rests on a bare `exists()` stat
+///   that cannot see a holder.
+/// * With the fence clear, stat `<dir>/<id>.jsonl`: a missing session
+///   file is `session-not-found` naming the id (an absent store dir
+///   falls out of the same per-id stat — the dir gate below refuses
+///   only a dir the kernel would not answer at all; no mkdir ever).
+///   The store primitive stays idempotent; the CLI-level "you named
+///   something that is not there" refusal lives here (#77 §5). The one
+///   exception is the orphaned lock
+///   sibling — a crash between the `O_EXCL` create and the lock release
+///   leaves `<id>.jsonl.lock` with no session file, a shape `list()`
+///   never shows and nothing else ever names. #78 §2's "residue deletable
+///   manually" makes this verb the manual tool, so a *free* sibling
+///   (one the fence could take) still falls through to `abandon`, which
+///   removes file-or-sibling-alone shapes; a named id with neither file
+///   still answers `session-not-found`. A sibling that is *held* is
+///   never residue — the fence answers `session-locked` before this
+///   stat is ever reached.
+/// * [`SessionStore::abandon`] does the deletion: its lock-first fence
+///   answers a held session with `session-locked` verbatim (holder pid
+///   included), and a corrupt, torn, or zero-byte file deletes like any
+///   other — the unlink is content-blind (#77 §3/§4).
+///
+/// Nothing here ever creates a directory, a lock sibling, or a partial
+/// pair: the stats never touch, `abandon`'s probe never creates, and a
+/// refusal leaves both files byte-identical.
+///
+/// A store dir that cannot be answered at all (an `Err` stat — the
+/// kernel refusing, not reporting) fails the whole batch once as
+/// `io-error`; a batch never answers from stats it could not take.
+/// With the dir answered — present or absent — the per-target stats
+/// carry the decision, and `session-not-found` means the kernel said
+/// `ENOENT` about the target.
+pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), CliError>)> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    // The dir's own stat gates the batch: `try_exists` maps any ENOENT
+    // — including a missing *component* — to `Ok(false)`, so a dir the
+    // kernel refuses to answer (`Err`) poisons every read under it.
+    // That fault is named once for the whole batch; an answered dir —
+    // present or absent — proceeds. The gate covers the dir's state at
+    // the batch's start; a dir that *becomes* unanswerable mid-batch
+    // (mode changed by another process) surfaces as the per-target
+    // `io-error` naming the stat fault below, which is the same
+    // honest posture — the fault gets named, never absence.
+    if let Err(e) = store.dir().try_exists() {
+        let msg = format!("checking session store {}: {e}", store.dir().display());
+        let mut faulted = Vec::new();
+        for &id in ids {
+            if seen.insert(id) {
+                faulted.push((id, Err(CliError::new("io-error", msg.clone()))));
+            }
+        }
+        return faulted;
+    }
+    for &id in ids {
+        if !seen.insert(id) {
+            continue;
+        }
+        let path = store.session_path(id);
+        // The orphan-sibling fall-through (doc above), decided under the
+        // same create-free fence `abandon` itself takes: a non-blocking
+        // flock on the *existing* sibling — never a bare `exists()` stat
+        // (a stat cannot see a holder, and flock is
+        // per-open-file-description, so a same-process holder would sail
+        // past it into an unlink under a live writer) and never a
+        // creating open (the fence must not manufacture the residue it
+        // guards). Held ⇒ `session-locked` rides back verbatim; an open
+        // fault is `io-error` naming the errno — never absence.
+        let result = match store.probe_lock(id) {
+            Err(err) => Err(session_cli_error(err)),
+            Ok(guard) => {
+                // The fence is continuous: `guard` is not dropped here
+                // but MOVED into `abandon` on the delete arm (every
+                // other arm ends without it, which is the release).
+                // flock is per-open-file-description, so a guard merely
+                // alive in this frame would read as someone else's hold
+                // to `abandon`'s own probe — handing it in keeps the
+                // window between decision and unlink shut, where a
+                // concurrent mount-failure cleanup (close-the-mirror,
+                // then remove_pair) could otherwise unlink the pair
+                // first and this rm report `removed` for a deletion it
+                // did not perform.
+                //
+                // Decided from the two stats, but only after the fence
+                // cleared. A sibling that appears *after* the fence
+                // belongs to a live creator (`create_new` creates the
+                // file before it locks), and `abandon`'s own probe then
+                // refuses it — so neither trigger can race a creator
+                // into an unlink. The residue shape stays reachable: a
+                // free sibling passes the fence, and `abandon` removes
+                // file-or-sibling-alone shapes.
+                //
+                // `try_exists`, not `exists()`: a stat that cannot
+                // answer (EACCES/ENOTDIR) must not be read as absence —
+                // `exists()` is false on a fault, which would mislabel
+                // an unreadable store `session-not-found`, the one code
+                // that asserts the file is not there. Faults bind the
+                // errno directly: no catch-all `unwrap_err` whose
+                // panic-freedom depends on arm ordering.
+                let sibling = lock_sibling(&path);
+                let file_there = path.try_exists();
+                let sibling_there = sibling.try_exists();
+                match (file_there, sibling_there) {
+                    // Anything present deletes — through `abandon`'s
+                    // own fence, which the held probe guard already
+                    // satisfies (same descriptor, held-by-us) and which
+                    // refuses a session HELD by anyone else before
+                    // unlinking either file. What no check here can
+                    // promise is the reverse — a sibling the probe
+                    // could open may still be un-unlinkable (unlink is
+                    // a permission on the *directory*, independent of
+                    // the file's own access bits). `SessionStore::
+                    // abandon`'s order is sibling-then-file, so such a
+                    // fault refuses before the session file goes; the
+                    // mirror-shaped `SessionWriter::abandon` unlinks
+                    // file-first (it holds the flock outright — the
+                    // next creator is fenced by the lock, not the
+                    // file), so that path's fault residue is the
+                    // sibling, named in its io-error.
+                    (Ok(true), _) | (Ok(false), Ok(true)) => {
+                        // The guard moves in, so the fence is one
+                        // uninterrupted hold from probe to unlink —
+                        // against a *live holder*. It is not a claim
+                        // of exclusivity over the pair: unlink is a
+                        // permission on the directory, so an
+                        // in-process mount-failure unwind that reaches
+                        // `abandon(id, None)` on a fresh descriptor
+                        // can still race the unlink (its NotFound-
+                        // is-success arm then reports success on a
+                        // deletion this rm did not perform). Closing
+                        // that shape needs a different fence (O_EXCL
+                        // tombstone or rename-then-unlink), not a
+                        // longer flock.
+                        store.abandon(id, guard).map_err(session_cli_error)
+                    }
+                    // Both answered absent: the kernel said ENOENT
+                    // about both targets, which is exactly what
+                    // `session-not-found` claims (#77 §5). The dir's
+                    // state above already refused the batch if the
+                    // reads could not be trusted.
+                    (Ok(false), Ok(false)) => Err(CliError::new(
+                        "session-not-found",
+                        format!("no session {id} in {}", store.dir().display()),
+                    )),
+                    // A stat that cannot answer names the fault:
+                    // `session-not-found` would claim absence the
+                    // kernel never confirmed.
+                    (Err(e), _) | (Ok(_), Err(e)) => Err(CliError::new(
+                        "io-error",
+                        format!("checking session {id}: {e}"),
+                    )),
+                }
+            }
+        };
+        out.push((id, result));
+    }
+    out
+}
+
+/// Render `sessions list --json` (#79 §2): a bare JSON array of row
+/// objects, input order (mtime-desc from [`SessionStore::list`]).
+///
+/// The row shape is the pinned one — six fields, add-only ratchet (#79 §3):
+/// `id` (decimal number), `modified` (epoch seconds), `events` (number,
+/// `null` exactly when `corrupt`), `firstPrompt` (string, full text — the
+/// 40-char cut is the human table's, never the machine's), `corrupt`
+/// (boolean), and `forkedFrom` (number, **absent** for non-forks, exposed
+/// raw — a dangling source is never resolved or annotated).
+///
+/// Pure over the rows the store already produced: no lock, no create, no
+/// mkdir, no I/O at all (#72 T3 verbatim — `--json` adds nothing to the
+/// list route's purity). An empty row set renders exactly `[]`.
+pub fn render_json(rows: &[SessionMeta]) -> String {
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("id".into(), serde_json::json!(row.id));
+            obj.insert("modified".into(), serde_json::json!(row.mtime_secs));
+            obj.insert(
+                "events".into(),
+                match row.event_count {
+                    Some(n) => serde_json::json!(n),
+                    None => serde_json::Value::Null,
+                },
+            );
+            obj.insert(
+                "firstPrompt".into(),
+                match &row.first_prompt {
+                    Some(p) => serde_json::json!(p),
+                    None => serde_json::Value::Null,
+                },
+            );
+            obj.insert("corrupt".into(), serde_json::json!(row.corrupt));
+            // Absent-for-non-forks, raw for forks (#79 §2): the field is
+            // *not written* when there is no header, never emitted null.
+            if let Some(src) = row.forked_from {
+                obj.insert("forkedFrom".into(), serde_json::json!(src));
+            }
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+    // Serializing a built `Value` cannot fail.
+    serde_json::to_string(&serde_json::Value::Array(items)).expect("built JSON serializes")
 }
 
 /// `YYYY-MM-DD HH:MM` local from epoch seconds (#71 §3), civil-from-days.

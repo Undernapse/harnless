@@ -23,9 +23,9 @@ use harnless_agent::events::{
 use harnless_agent::session::SessionLog;
 use harnless_cli::boot::DefaultComposer;
 use harnless_cli::run::drive_turn;
-use harnless_cli::session::{mint_with, open_session, SessionMount};
+use harnless_cli::session::{mint_with, open_session, remove_ids, SessionMount};
 use harnless_seams::{CallId, ErrorCode, MessageId};
-use harnless_storage_jsonl::{FileLock, Header, SessionError, SessionStore};
+use harnless_storage_jsonl::{FileLock, Header, SessionError, SessionMeta, SessionStore};
 use support::{failing_recording, text_recording, write_corpus};
 
 /// A fresh temp store dir, collision authority `tempfile` (the workspace's
@@ -107,6 +107,50 @@ fn file_fixture_lines() -> String {
         .iter()
         .map(|r| format!("{}\n", serde_json::to_string(r).unwrap()))
         .collect()
+}
+
+/// A one-record file carrying a user prompt — the `firstPrompt` fixture
+/// source (#80's `--json` rows need a real first prompt, not a bracket).
+fn prompt_fixture_lines(prompt: &str) -> String {
+    let r = fixture_record(
+        0,
+        SessionEvent::UserMessage(MessageRecord {
+            id: MessageId(1),
+            blocks: vec![ContentBlock::Text {
+                text: prompt.to_string(),
+            }],
+            provider: None,
+            model: None,
+        }),
+    );
+    format!("{}\n", serde_json::to_string(&r).unwrap())
+}
+
+/// A fork file's lines: the header line naming `source` + one prompt record.
+fn fork_fixture_lines(source: u64, prompt: &str) -> String {
+    format!(
+        "{{\"header\":{{\"forked_from\":\"{source}\"}}}}\n{}",
+        prompt_fixture_lines(prompt)
+    )
+}
+
+/// The dir's entry names, sorted — the residue assertion's shape.
+fn dir_names(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Fix a fixture file's mtime to an exact epoch second (#80's mtime-ordering
+/// rule: ≥1s-spaced fixture utimes, never the wall clock, never a sleep).
+fn set_mtime(path: &std::path::Path, secs: u64) {
+    let times = std::fs::FileTimes::new()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_times(times).unwrap();
 }
 
 /// The derived projection's node texts — the #64 oracle shape.
@@ -785,7 +829,10 @@ fn failed_fresh_mount_abandons_the_mint() {
         Some(&dir),
     );
     let opened = open_session(&DefaultComposer, &doc, None, None, None);
-    assert!(matches!(opened, Err(_)), "the missing script refuses the mount");
+    assert!(
+        matches!(opened, Err(_)),
+        "the missing script refuses the mount"
+    );
     // The reference composer's classification hands the *unconsumed
     // writer* back, and `unwind_created` abandons through it — the
     // writer-shaped arm removes both the file and its lock sibling, so
@@ -1124,7 +1171,9 @@ fn panic_after_spine_mount_abandons_a_created_file() {
     )
     .unwrap();
     let composer = std::sync::Arc::new(harnless_cli::config_boot::ConfigComposer::new(
-        std::sync::Arc::new(harnless_cli::config_boot::LayeredStore::new(Some(cfg.clone()))),
+        std::sync::Arc::new(harnless_cli::config_boot::LayeredStore::new(Some(
+            cfg.clone(),
+        ))),
         harnless_cli::config_boot::config::subst::Subst::new(),
     ));
     let doc = composer.compose("p", None).expect("profile composes");
@@ -1363,4 +1412,302 @@ fn config_route_pre_spine_failure_abandons_the_created_file() {
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&cfg);
+}
+
+// ── The sessions-lifecycle seam (#80's file-A contract) ──────────────────
+//
+// The store-level invariants the `sessions rm` / `--json` verbs lean on,
+// pinned in-process: the abandon primitive's idempotence, the batch loop's
+// well-defined partial-failure residue, `list()`'s fork-header field copy,
+// the zero-byte phantom's removability, and `render_json`'s row shapes.
+// Zero network, zero flake: every locked target is the single-process
+// lock-file fixture (#72's rule), every ordering is a fixture utime.
+
+#[test]
+fn remove_pair_is_idempotent() {
+    // The primitive/verb split #77 §5 leans on: `abandon` is
+    // success-on-missing at every shape, and its lock probe never
+    // manufactures a sibling.
+    let dir = temp_store("rmidempotent");
+    let store = SessionStore::new(&dir);
+
+    // A clean created session: abandon removes the pair.
+    let (id, writer) = mint_with(|id| store.create_new(id)).expect("mint");
+    drop(writer);
+    assert!(store.session_path(id).exists());
+    store.abandon(id, None).expect("abandon removes the pair");
+    assert!(dir_names(&dir).is_empty(), "the pair must be gone");
+
+    // The same id again: success-on-missing, not an error.
+    store.abandon(id, None).expect("abandon is idempotent");
+
+    // A lock sibling with no session file: abandon answers Ok and the
+    // probe itself never creates one (the bulk-friendly shape #76 found —
+    // `acquire` would manufacture residue here, the probe does not).
+    let holder = FileLock::hold(&dir, 999).expect("hold creates the sibling");
+    drop(holder);
+    assert_eq!(dir_names(&dir), vec!["999.jsonl.lock".to_string()]);
+    store
+        .abandon(999, None)
+        .expect("a sibling alone is removable");
+    assert!(dir_names(&dir).is_empty(), "no residue manufactured");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn rm_fall_through_fences_a_same_process_holder() {
+    // The fence the orphan-sibling fall-through must never skip: flock is
+    // per-open-file-description, so a *bare stat* of the sibling cannot
+    // see a holder from this same process — a second open+flock succeeds
+    // while the first holder is live. `remove_ids` therefore decides
+    // under `probe_lock` (the same acquire every holder uses), and a
+    // live in-process holder must answer `session-locked` with the pair
+    // intact, not unlink under the holder's feet.
+    let dir = temp_store("rmfence");
+    let store = SessionStore::new(&dir);
+    let id = 4242u64;
+    let holder = FileLock::hold(&dir, id).expect("the test holds the lock");
+    // The crash shape: sibling held, no session file.
+    let results = remove_ids(&store, &[id]);
+    let (_, res) = &results[0];
+    let err = res.as_ref().err().expect("a held sibling fences the rm");
+    assert_eq!(err.code, "session-locked", "not not-found: {err}");
+    assert!(
+        dir_names(&dir) == vec![format!("{id}.jsonl.lock")],
+        "the held sibling survives the refused rm"
+    );
+    drop(holder);
+    // Once the holder is gone, the same verb removes the residue.
+    remove_ids(&store, &[id])
+        .into_iter()
+        .next()
+        .and_then(|(_, r)| r.ok())
+        .expect("the residue removes by id once free");
+    assert!(dir_names(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn partial_batch_residue_is_well_defined() {
+    // The batch posture's store half (#77 §2): every id is attempted, and
+    // the end state is exactly {locked pair} — no half-deleted pair, no
+    // touched locked bytes, missing ids are no-ops at this level.
+    let dir = temp_store("rmpartial");
+    let store = SessionStore::new(&dir);
+
+    let clean = 101u64;
+    let locked = 102u64;
+    let missing = 103u64;
+    std::fs::write(store.session_path(clean), file_fixture_lines()).unwrap();
+    std::fs::write(store.session_path(locked), file_fixture_lines()).unwrap();
+    // The single-process lock-file fixture (#72's rule, never a spawn
+    // race): a held flock on the sibling refuses the abandon.
+    let holder = FileLock::hold(&dir, locked).expect("the test holds the lock");
+    let locked_bytes = std::fs::read(store.session_path(locked)).unwrap();
+    let lock_path = format!("{}.lock", store.session_path(locked).display());
+    let lock_bytes = std::fs::read(&lock_path).unwrap();
+
+    // Drive the same per-id loop the CLI's verb uses (stat + abandon).
+    let results = remove_ids(&store, &[clean, locked, missing]);
+    let codes: Vec<_> = results
+        .iter()
+        .map(|(id, r)| (*id, r.as_ref().err().map(|e| e.code)))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            (clean, None),
+            (locked, Some("session-locked")),
+            (missing, Some("session-not-found")),
+        ],
+        "every deduped id attempted, in order, with its own outcome"
+    );
+
+    // The clean pair is gone; the locked pair is byte-identical and still
+    // locked; the dir holds exactly the locked pair.
+    assert!(!store.session_path(clean).exists());
+    assert_eq!(
+        std::fs::read(store.session_path(locked)).unwrap(),
+        locked_bytes,
+        "a refused rm leaves the session bytes untouched"
+    );
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        lock_bytes,
+        "a refused rm leaves the lock sibling untouched"
+    );
+    assert_eq!(
+        dir_names(&dir),
+        vec![format!("{locked}.jsonl"), format!("{locked}.jsonl.lock")],
+        "partial failure leaves exactly the locked pair"
+    );
+    match FileLock::hold(&dir, locked) {
+        Ok(_) => panic!("the fixture's lock must still be held"),
+        Err(e) => assert_eq!(e.code, "session-locked"),
+    }
+    drop(holder);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn list_rows_carry_forked_from() {
+    // #79 §2's field copy: the header `list()` already parses rides the
+    // row — Some for forks (dangling included, raw), None otherwise.
+    let dir = temp_store("rmforked");
+    let store = SessionStore::new(&dir);
+
+    // Four files, mtimes fixed ≥1s apart (never the wall clock): the
+    // expected mtime-desc order is 203, 202, 201, 200.
+    let plain = 200u64;
+    let fork = 201u64;
+    let fork_of_fork = 202u64;
+    let dangling = 203u64;
+    std::fs::write(store.session_path(plain), prompt_fixture_lines("plain")).unwrap();
+    set_mtime(&store.session_path(plain), 1000);
+    std::fs::write(
+        store.session_path(fork),
+        fork_fixture_lines(plain, "branch"),
+    )
+    .unwrap();
+    set_mtime(&store.session_path(fork), 2000);
+    std::fs::write(
+        store.session_path(fork_of_fork),
+        fork_fixture_lines(fork, "branch-of-branch"),
+    )
+    .unwrap();
+    set_mtime(&store.session_path(fork_of_fork), 3000);
+    std::fs::write(
+        store.session_path(dangling),
+        fork_fixture_lines(999_999, "orphan"),
+    )
+    .unwrap();
+    set_mtime(&store.session_path(dangling), 4000);
+
+    let rows = store.list();
+    let carried: Vec<(u64, Option<u64>)> = rows.iter().map(|r| (r.id, r.forked_from)).collect();
+    assert_eq!(
+        carried,
+        vec![
+            (dangling, Some(999_999)),
+            (fork_of_fork, Some(fork)),
+            (fork, Some(plain)),
+            (plain, None),
+        ],
+        "mtime-desc order, forked_from Some/None exactly, dangling raw"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn zero_byte_phantom_is_removable() {
+    // The skip/delete asymmetry's store half (#77 §4): the tolerant
+    // `list` skips a zero-byte file, and the same abandon path removes it.
+    let dir = temp_store("rmphantom");
+    let store = SessionStore::new(&dir);
+    let (id, writer) = mint_with(|id| store.create_new(id)).expect("mint");
+    drop(writer); // zero bytes written: the phantom shape.
+    assert_eq!(std::fs::metadata(store.session_path(id)).unwrap().len(), 0);
+    assert!(store.list().is_empty(), "list skips the phantom");
+
+    store.abandon(id, None).expect("the phantom's pair removes");
+    assert!(dir_names(&dir).is_empty(), "file and sibling both gone");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn render_json_golden_row_shapes() {
+    // The pinned row shape (#79 §2): exact field names, JSON types, null
+    // discipline (`events: null` exactly when corrupt), absent discipline
+    // (`forkedFrom` not-written for non-forks), input order preserved.
+    // Byte-exactness is asserted ONLY for the empty case (#80 §5).
+    let long_prompt = "x".repeat(60);
+    let rows = vec![
+        SessionMeta {
+            id: 300,
+            mtime_secs: 4000,
+            event_count: Some(4),
+            first_prompt: Some("hello world".to_string()),
+            corrupt: false,
+            forked_from: None,
+        },
+        SessionMeta {
+            id: 200,
+            mtime_secs: 3000,
+            event_count: Some(2),
+            first_prompt: Some(long_prompt.clone()),
+            corrupt: false,
+            forked_from: Some(300),
+        },
+        SessionMeta {
+            id: 100,
+            mtime_secs: 2000,
+            event_count: None,
+            first_prompt: None,
+            corrupt: true,
+            forked_from: None,
+        },
+        SessionMeta {
+            id: 50,
+            mtime_secs: 1000,
+            event_count: Some(1),
+            first_prompt: Some("orphan".to_string()),
+            corrupt: false,
+            forked_from: Some(999_999),
+        },
+    ];
+    let text = harnless_cli::session::render_json(&rows);
+    let v: Vec<serde_json::Value> = serde_json::from_str(&text).expect("rows are a JSON array");
+    assert_eq!(v.len(), 4, "input order, one row per meta");
+
+    // Exact field-name sets: the fork row carries forkedFrom, the plain
+    // row's key is ABSENT (not null).
+    let mut plain_keys: Vec<_> = v[0]
+        .as_object()
+        .expect("row is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    plain_keys.sort();
+    assert_eq!(
+        plain_keys,
+        vec!["corrupt", "events", "firstPrompt", "id", "modified"]
+    );
+    let mut fork_keys: Vec<_> = v[1]
+        .as_object()
+        .expect("row is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fork_keys.sort();
+    assert_eq!(
+        fork_keys,
+        vec![
+            "corrupt",
+            "events",
+            "firstPrompt",
+            "forkedFrom",
+            "id",
+            "modified"
+        ]
+    );
+
+    // Types and values.
+    assert_eq!(v[0]["id"], serde_json::json!(300u64));
+    assert_eq!(v[0]["modified"], serde_json::json!(4000u64));
+    assert_eq!(v[0]["events"], serde_json::json!(4));
+    assert_eq!(v[0]["firstPrompt"], serde_json::json!("hello world"));
+    assert_eq!(v[0]["corrupt"], serde_json::json!(false));
+    // Full text, never the table's 40-char cut.
+    assert_eq!(v[1]["firstPrompt"], serde_json::json!(long_prompt));
+    assert_eq!(v[1]["forkedFrom"], serde_json::json!(300u64));
+    // Null discipline: `events`/`firstPrompt` are null exactly on corrupt.
+    assert_eq!(v[2]["events"], serde_json::Value::Null);
+    assert_eq!(v[2]["firstPrompt"], serde_json::Value::Null);
+    assert_eq!(v[2]["corrupt"], serde_json::json!(true));
+    // Dangling forkedFrom is exposed raw.
+    assert_eq!(v[3]["forkedFrom"], serde_json::json!(999_999u64));
+
+    // The one byte-exact assertion: the empty render.
+    assert_eq!(harnless_cli::session::render_json(&[]), "[]");
 }
