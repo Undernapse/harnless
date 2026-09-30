@@ -589,7 +589,12 @@ fn rm_held_lock_refuses_intact() {
     let id: u64 = mint(&home, "hello").parse().unwrap();
     let dir = home.join(".harnless/sessions");
     // The single-process lock-file fixture (#72's rule): the test's own
-    // flock refuses the child's abandon.
+    // flock refuses the child's abandon. The bytes are captured *after*
+    // `hold` — acquisition rewrites the sibling with the holder pid, so
+    // the post-hold bytes are the state the refused rm must leave
+    // byte-identical (a child that rewrote or unlinked the sibling
+    // fails the comparison; capturing pre-hold bytes would compare
+    // against a state the fixture itself had already replaced).
     let holder = harnless_storage_jsonl::FileLock::hold(&dir, id).expect("test holds first");
     let before = (
         std::fs::read(dir.join(format!("{id}.jsonl"))).unwrap(),
@@ -829,6 +834,10 @@ fn no_prune_guard() {
     )
     .unwrap();
     write_fork(&dir, 33, 31, "child");
+    // A stale crash-shape sibling beside 33: the guard's mtime-spacing
+    // must handle `<id>.jsonl.lock` names (the one-shot strip's whole
+    // point), and `list`/`rm` must leave it untouched until named.
+    std::fs::write(dir.join("33.jsonl.lock"), b"stale\n").unwrap();
     // The planted names, captured at planting time: the guard's
     // fixture/boot split is exact-name membership, never a prefix a
     // minted id could one day share (the mint scheme's leading digits
