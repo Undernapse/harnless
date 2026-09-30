@@ -407,27 +407,27 @@ pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), Cli
                 // free sibling passes the fence, and `abandon` removes
                 // file-or-sibling-alone shapes.
                 //
-                // `symlink_metadata`, not `exists()`: a stat that
-                // cannot answer (EACCES/ENOTDIR) must not be read as
-                // absence — `exists()` is false on a fault, which would
-                // mislabel an unreadable store `session-not-found`, the
-                // one code that asserts the file is not there.
+                // `try_exists`, not `exists()`: a stat that cannot
+                // answer (EACCES/ENOTDIR) must not be read as absence —
+                // `exists()` is false on a fault, which would mislabel
+                // an unreadable store `session-not-found`, the one code
+                // that asserts the file is not there. The fault arms
+                // bind the errno directly: no catch-all `unwrap_err`
+                // whose panic-freedom depends on arm ordering.
                 let sibling = lock_sibling(&path);
-                let file_there = path.try_exists();
-                let sibling_there = sibling.try_exists();
-                match (file_there.as_ref(), sibling_there.as_ref()) {
-                    (Ok(true), _) | (Ok(false), Ok(true)) | (Err(_), Ok(true)) => {
-                        store.abandon(id).map_err(session_cli_error)
-                    }
+                match (path.try_exists(), sibling.try_exists()) {
+                    (Ok(true), _) => store.abandon(id).map_err(session_cli_error),
+                    (Ok(false), Ok(true)) => store.abandon(id).map_err(session_cli_error),
                     (Ok(false), Ok(false)) => Err(CliError::new(
                         "session-not-found",
                         format!("no session {id} in {}", store.dir().display()),
                     )),
-                    // A stat that cannot answer (EACCES/ENOTDIR on the
-                    // path) names the fault instead of claiming absence.
-                    (fault, _) => Err(CliError::new(
+                    // A stat that cannot answer names the fault:
+                    // `session-not-found` would claim absence the
+                    // kernel never confirmed.
+                    (Err(e), _) | (Ok(false), Err(e)) => Err(CliError::new(
                         "io-error",
-                        format!("checking session {id}: {}", fault.unwrap_err()),
+                        format!("checking session {id}: {e}"),
                     )),
                 }
             }
