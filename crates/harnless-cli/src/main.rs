@@ -140,20 +140,56 @@ fn parse_session_id(s: &str) -> Result<u64, String> {
         .map_err(|_| format!("session ids are decimal numbers, not {s:?}"))
 }
 
+/// Whether `main` prints this error to stderr. The rm batch's failure
+/// signal is its exit code alone: the per-id lines already printed every
+/// code verbatim, and a synthetic batch code would be the sixth code
+/// #71 §4 forbids — so dispatch's batch failure rides back as the
+/// empty-code sentinel, and this predicate is the one place that decides
+/// it prints nothing. (Pinned by `the_batch_sentinel_prints_nothing…`.)
+fn prints_to_stderr(err: &CliError) -> bool {
+    !err.code.is_empty()
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match dispatch(&cli) {
         Ok(()) => ExitCode::SUCCESS,
-        // The rm batch's failure signal is its exit code alone: the
-        // per-id stderr lines already printed every code verbatim, and
-        // a synthetic batch code would be the sixth code #71 §4 forbids.
-        // A bare `""` error therefore prints nothing extra.
         Err(err) => {
-            if !err.code.is_empty() {
+            if prints_to_stderr(&err) {
                 eprintln!("{err}");
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The rm batch's failure signal is the exit code alone (#71 §4's
+    /// table has exactly five codes; the batch adds no sixth). That
+    /// contract lives across two sites — dispatch's `Rm` arm constructs
+    /// the empty-code sentinel, `main` must never print it — so the
+    /// convention is pinned here, at the printer: the sentinel renders
+    /// as nothing, and every real code still renders `code: message`.
+    #[test]
+    fn the_batch_sentinel_prints_nothing_and_real_codes_print() {
+        use crate::{prints_to_stderr, CliError};
+        // The sentinel is silent; every table code still prints
+        // `code: message` (the shape every existing stderr golden pins).
+        assert!(
+            !prints_to_stderr(&CliError {
+                code: "",
+                message: String::new(),
+            }),
+            "the empty-code sentinel must print nothing"
+        );
+        assert!(
+            prints_to_stderr(&CliError::new(
+                "session-locked",
+                "session 1 is locked by process 2"
+            )),
+            "a table code prints"
+        );
     }
 }
 

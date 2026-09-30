@@ -457,9 +457,10 @@ fn sessions_list_never_mutates_the_store() {
 // are the in-process `FileLock::hold` fixture (#72's two-process rule);
 // ordering is fixture utimes; the corpus is the built-in replay model.
 
-/// A fixture store dir under a temp `HOME` (the shipped default profile's
-/// store dir), pre-created.
-fn sessions_dir(home: &std::path::Path) -> std::path::PathBuf {
+/// *Create* the fixture store dir under a temp `HOME` (the shipped default
+/// profile's store dir) and return its path. The name says mkdir: the
+/// purity-sensitive tests name their own creations.
+fn make_sessions_dir(home: &std::path::Path) -> std::path::PathBuf {
     let dir = home.join(".harnless/sessions");
     std::fs::create_dir_all(&dir).expect("fixture store dir");
     dir
@@ -633,7 +634,7 @@ fn rm_missing_id_is_session_not_found() {
         "rm never mkdirs the store it refused to find in"
     );
     // A present dir with no such file: same code, dir untouched.
-    let dir = sessions_dir(&home);
+    let dir = make_sessions_dir(&home);
     let out = hrls_at(&home, &["sessions", "rm", "42"], &[]);
     assert!(!out.status.success());
     assert!(stderr(&out).starts_with("session-not-found:"));
@@ -681,7 +682,7 @@ fn rm_sessionless_is_storage_not_mounted() {
 #[test]
 fn rm_batch_skip_with_warning() {
     let home = temp_home();
-    let dir = sessions_dir(&home);
+    let dir = make_sessions_dir(&home);
     let clean1 = 11u64;
     let locked = 12u64;
     let missing = 13u64;
@@ -745,7 +746,7 @@ fn rm_batch_skip_with_warning() {
 #[test]
 fn rm_bad_id_is_clap_usage_error() {
     let home = temp_home();
-    let dir = sessions_dir(&home);
+    let dir = make_sessions_dir(&home);
     let before = dir_snapshot(&dir);
     for bad in ["abc", "18446744073709551616"] {
         let out = hrls_at(&home, &["sessions", "rm", bad], &[]);
@@ -764,7 +765,7 @@ fn rm_bad_id_is_clap_usage_error() {
 #[test]
 fn rm_deletes_corrupt_and_zero_byte() {
     let home = temp_home();
-    let dir = sessions_dir(&home);
+    let dir = make_sessions_dir(&home);
     // Corrupt mid-file: a good first line, then garbage (a first-line
     // refusal is the torn/unparseable-head class, not the shown-corrupt
     // class — #70 §3). Its mtime is fixed so the phantom (mtime 1000,
@@ -796,7 +797,7 @@ fn rm_deletes_corrupt_and_zero_byte() {
 #[test]
 fn rm_dedupes_silently() {
     let home = temp_home();
-    let dir = sessions_dir(&home);
+    let dir = make_sessions_dir(&home);
     write_session(&dir, 42, "answer");
     let out = hrls_at(&home, &["sessions", "rm", "42", "42"], &[]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
@@ -818,7 +819,7 @@ fn no_prune_guard() {
     // #78 §1's claim executed, not described: no invocation mutates what
     // it wasn't told to touch. One guard test, four invocations.
     let home = temp_home();
-    let dir = sessions_dir(&home);
+    let dir = make_sessions_dir(&home);
     write_session(&dir, 31, "normal");
     // Mid-file corrupt: good first line, then garbage (#70 §3's shown-
     // corrupt class, not the unparseable-head class).
@@ -828,25 +829,36 @@ fn no_prune_guard() {
     )
     .unwrap();
     write_fork(&dir, 33, 31, "child");
+    // The planted names, captured at planting time: the guard's
+    // fixture/boot split is exact-name membership, never a prefix a
+    // minted id could one day share (the mint scheme's leading digits
+    // are clock-dependent — #57's zero-flake rule forbids the accident).
+    let planted: Vec<String> = dir_snapshot(&dir)
+        .iter()
+        .map(|(n, _, _)| n.clone())
+        .collect();
     for f in dir_snapshot(&dir) {
-        // The stem (or stem sibling) fixes the mtime; the id-ordered
-        // spacing only needs to be monotone.
-        let stem = f.0.trim_end_matches(".lock").trim_end_matches(".jsonl");
+        // One-shot suffix strip: a chained trim_end_matches would also
+        // eat the `.jsonl` of `<id>.jsonl.lock`, spacing the sibling off
+        // a stem its name never carries.
+        let stem =
+            f.0.strip_suffix(".lock")
+                .unwrap_or(&f.0)
+                .trim_end_matches(".jsonl");
         set_fixture_mtime(&dir.join(&f.0), 5000 + stem.parse::<u64>().unwrap_or(0));
     }
-    // The fixture's ids are 31/32/33; anything else in the dir belongs to
-    // the invocation's own mint (a boot's named creation, never residue
-    // the guard forbids). `fixture` keeps the three planted files;
-    // `boot` keeps only the invocation's own.
+    // `fixture` keeps exactly the planted files; `boot` keeps everything
+    // else — the invocation's own mint (a named creation, never residue
+    // the guard forbids).
     let fixture = |v: &[(String, Vec<u8>, u64)]| -> Vec<(String, Vec<u8>, u64)> {
         v.iter()
-            .filter(|(n, _, _)| n.starts_with("3"))
+            .filter(|(n, _, _)| planted.contains(n))
             .cloned()
             .collect()
     };
     let boot = |v: &[(String, Vec<u8>, u64)]| -> Vec<(String, Vec<u8>, u64)> {
         v.iter()
-            .filter(|(n, _, _)| !n.starts_with("3"))
+            .filter(|(n, _, _)| !planted.contains(n))
             .cloned()
             .collect()
     };
@@ -916,7 +928,7 @@ fn no_prune_guard() {
         after,
         before
             .into_iter()
-            .filter(|(n, _, _)| !n.starts_with("32"))
+            .filter(|(n, _, _)| n != "32.jsonl")
             .collect::<Vec<_>>(),
         "rm removed exactly its named target"
     );
@@ -926,7 +938,7 @@ fn no_prune_guard() {
 #[test]
 fn sessions_list_json_golden() {
     let home = temp_home();
-    let dir = sessions_dir(&home);
+    let dir = make_sessions_dir(&home);
     // The rich fixture (#80 test 15): normal, fork, fork-of-fork, corrupt,
     // zero-byte phantom, non-u64 stem. mtimes fixed ≥1s apart.
     let long_prompt = "y".repeat(60);
@@ -1070,7 +1082,7 @@ fn sessions_list_json_golden() {
     );
     // `[]` byte-exit on empty and absent dirs, exit 0.
     let empty_home = temp_home();
-    sessions_dir(&empty_home);
+    make_sessions_dir(&empty_home);
     let out = hrls_at(&empty_home, &["sessions", "list", "--json"], &[]);
     assert!(out.status.success());
     assert_eq!(stdout(&out), "[]\n");
