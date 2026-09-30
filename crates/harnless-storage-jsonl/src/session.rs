@@ -392,15 +392,16 @@ impl SessionStore {
         result
     }
 
-    /// Probe session `id`'s lock without touching any file: a
-    /// non-blocking `flock` on the existing sibling. `Ok(Some(guard))` means
-    /// the lock is now held by *this* call (release it by dropping the
-    /// guard); `Ok(None)` means there is no sibling to fence — the open is
-    /// WITHOUT `create`, exactly [`SessionStore::abandon`]'s probe shape, so
-    /// the probe never manufactures the file it was told not to touch. A
-    /// held lock is `session-locked` verbatim; a would-block on a sibling
-    /// that vanished mid-call still names the holder from the guard's own
-    /// record.
+    /// Probe session `id`'s lock without touching any file: a non-blocking
+    /// `flock` on the existing sibling. `Ok(Some(guard))` means the lock is
+    /// now held by *this* call (release it by dropping the guard);
+    /// `Ok(None)` means there is no sibling to fence — the open is WITHOUT
+    /// `create`, exactly [`SessionStore::abandon`]'s probe shape, so the
+    /// probe never manufactures the file it was told not to touch. A held
+    /// lock is `session-locked` naming the holder from the sibling's own
+    /// pid record (written by the holder's [`FileLock::acquire`]); a record
+    /// unreadable mid-call names `?`. Any other open fault is `io-error`
+    /// naming the errno — a fault is never reported as absence.
     ///
     /// The open is separate from the `flock` (not [`FileLock::acquire`],
     /// which opens with `create`): a stat in front of a creating open is a

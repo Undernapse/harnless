@@ -390,28 +390,45 @@ pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), Cli
         // per-open-file-description, so a same-process holder would sail
         // past it into an unlink under a live writer) and never a
         // creating open (the fence must not manufacture the residue it
-        // guards). Held ⇒ `session-locked` rides back verbatim.
+        // guards). Held ⇒ `session-locked` rides back verbatim; an open
+        // fault is `io-error` naming the errno — never absence.
         let result = match store.probe_lock(id) {
             Err(err) => Err(session_cli_error(err)),
             Ok(guard) => {
                 // Free (or absent): the guard — if any — is dropped
                 // before `abandon` re-acquires under its own fence.
                 drop(guard);
-                // Decided from the session file only. A sibling that
-                // appears *after* the fence belongs to a live creator
-                // (`create_new` creates the file before it locks), and
-                // `abandon`'s own probe then refuses it — so the file
-                // stat is the only trigger that cannot race a creator.
-                // The residue shape stays reachable: a free sibling
-                // passes the fence, and `abandon` removes
+                // Decided from the two stats, but only after the fence
+                // cleared. A sibling that appears *after* the fence
+                // belongs to a live creator (`create_new` creates the
+                // file before it locks), and `abandon`'s own probe then
+                // refuses it — so neither trigger can race a creator
+                // into an unlink. The residue shape stays reachable: a
+                // free sibling passes the fence, and `abandon` removes
                 // file-or-sibling-alone shapes.
-                if path.exists() || lock_sibling(&path).exists() {
-                    store.abandon(id).map_err(session_cli_error)
-                } else {
-                    Err(CliError::new(
+                //
+                // `symlink_metadata`, not `exists()`: a stat that
+                // cannot answer (EACCES/ENOTDIR) must not be read as
+                // absence — `exists()` is false on a fault, which would
+                // mislabel an unreadable store `session-not-found`, the
+                // one code that asserts the file is not there.
+                let sibling = lock_sibling(&path);
+                let file_there = path.try_exists();
+                let sibling_there = sibling.try_exists();
+                match (file_there.as_ref(), sibling_there.as_ref()) {
+                    (Ok(true), _) | (Ok(false), Ok(true)) | (Err(_), Ok(true)) => {
+                        store.abandon(id).map_err(session_cli_error)
+                    }
+                    (Ok(false), Ok(false)) => Err(CliError::new(
                         "session-not-found",
                         format!("no session {id} in {}", store.dir().display()),
-                    ))
+                    )),
+                    // A stat that cannot answer (EACCES/ENOTDIR on the
+                    // path) names the fault instead of claiming absence.
+                    (fault, _) => Err(CliError::new(
+                        "io-error",
+                        format!("checking session {id}: {}", fault.unwrap_err()),
+                    )),
                 }
             }
         };
