@@ -375,9 +375,46 @@ pub fn render_list(rows: &[SessionMeta]) -> String {
 /// Nothing here ever creates a directory, a lock sibling, or a partial
 /// pair: the stats never touch, `abandon`'s probe never creates, and a
 /// refusal leaves both files byte-identical.
+///
+/// A store dir that cannot be answered at all (an `Err` stat — the
+/// kernel refusing, not reporting) fails the whole batch once as
+/// `io-error`; a batch never answers from stats it could not take.
+/// With the dir answered — present or absent — the per-target stats
+/// carry the decision, and `session-not-found` means the kernel said
+/// `ENOENT` about the target.
+///
+/// [`DirState`] is [`remove_ids`]'s private three-way read of the store
+/// dir: present, absent, or faulted.
+#[derive(Debug)]
+enum DirState {
+    Present,
+    Absent,
+    Fault(std::io::Error),
+}
+
 pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), CliError>)> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
+    // The dir's own stat gates the batch: `try_exists` maps any ENOENT
+    // — including a missing *component* — to `Ok(false)`, so a dir the
+    // kernel refuses to answer (`Err`) poisons every read under it.
+    // That fault is named once for the whole batch; present/absent
+    // dirs answer normally.
+    let dir_state = match store.dir().try_exists() {
+        Ok(true) => DirState::Present,
+        Ok(false) => DirState::Absent,
+        Err(e) => DirState::Fault(e),
+    };
+    if let DirState::Fault(e) = &dir_state {
+        let msg = format!("checking session store {}: {e}", store.dir().display());
+        let mut faulted = Vec::new();
+        for &id in ids {
+            if seen.insert(id) {
+                faulted.push((id, Err(CliError::new("io-error", msg.clone()))));
+            }
+        }
+        return faulted;
+    }
     for &id in ids {
         if !seen.insert(id) {
             continue;
@@ -411,13 +448,29 @@ pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), Cli
                 // answer (EACCES/ENOTDIR) must not be read as absence —
                 // `exists()` is false on a fault, which would mislabel
                 // an unreadable store `session-not-found`, the one code
-                // that asserts the file is not there. The fault arms
-                // bind the errno directly: no catch-all `unwrap_err`
-                // whose panic-freedom depends on arm ordering.
+                // that asserts the file is not there. Faults bind the
+                // errno directly: no catch-all `unwrap_err` whose
+                // panic-freedom depends on arm ordering.
                 let sibling = lock_sibling(&path);
-                match (path.try_exists(), sibling.try_exists()) {
-                    (Ok(true), _) => store.abandon(id).map_err(session_cli_error),
-                    (Ok(false), Ok(true)) => store.abandon(id).map_err(session_cli_error),
+                let file_there = path.try_exists();
+                let sibling_there = sibling.try_exists();
+                match (file_there, sibling_there) {
+                    // Anything present deletes — through `abandon`'s
+                    // own fence, which re-probes the lock (create-free)
+                    // and refuses a held session before unlinking
+                    // either file. The half-delete shape — file
+                    // present, sibling present-but-unopenable — is
+                    // refused up front by `probe_lock` (an open fault
+                    // is Err above, never Ok(None)), so `abandon` never
+                    // runs with a sibling it cannot unlink.
+                    (Ok(true), _) | (Ok(false), Ok(true)) => {
+                        store.abandon(id).map_err(session_cli_error)
+                    }
+                    // Both answered absent: the kernel said ENOENT
+                    // about both targets, which is exactly what
+                    // `session-not-found` claims (#77 §5). The dir's
+                    // state above already refused the batch if the
+                    // reads could not be trusted.
                     (Ok(false), Ok(false)) => Err(CliError::new(
                         "session-not-found",
                         format!("no session {id} in {}", store.dir().display()),
@@ -425,7 +478,7 @@ pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), Cli
                     // A stat that cannot answer names the fault:
                     // `session-not-found` would claim absence the
                     // kernel never confirmed.
-                    (Err(e), _) | (Ok(false), Err(e)) => Err(CliError::new(
+                    (Err(e), _) | (Ok(_), Err(e)) => Err(CliError::new(
                         "io-error",
                         format!("checking session {id}: {e}"),
                     )),
