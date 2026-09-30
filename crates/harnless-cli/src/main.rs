@@ -310,7 +310,8 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                 // list route uses.
                 let store = harnless_cli::session::store_handle(&doc, None)?;
                 let mut any_failed = false;
-                for (id, result) in harnless_cli::session::remove_ids(&store, ids) {
+                let results = harnless_cli::session::remove_ids(&store, ids);
+                for (id, result) in results {
                     match result {
                         Ok(()) => eprintln!("session: removed {id}"),
                         Err(err) => {
@@ -323,7 +324,12 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                     // The per-id lines above already carried every code
                     // verbatim (#71 §4's table — no sixth code exists).
                     // The batch's exit is the only extra signal: a bare
-                    // nonzero, never a synthetic code line.
+                    // nonzero, never a synthetic code line. The sentinel
+                    // is silent *because* a line printed: `any_failed`
+                    // is set only inside the loop that just emitted the
+                    // error's `code: message` line, so an exit-1 batch
+                    // always has at least one stderr line — the silent
+                    // sentinel never abandons a failure unexplained.
                     return Err(CliError {
                         code: "",
                         message: String::new(),

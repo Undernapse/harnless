@@ -698,6 +698,14 @@ fn rm_removes_a_read_only_lock_sibling() {
         stderr(&out)
     );
     assert!(dir_snapshot(&dir).is_empty(), "the residue is gone");
+    // Hermetic even on the failure path: if a regression ever leaves
+    // the 0444 sibling behind, restore write permission before cleanup
+    // so the temp dir is never leaked unreadable.
+    if let Ok(meta) = std::fs::metadata(dir.join("88.jsonl.lock")) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(dir.join("88.jsonl.lock"), perms).ok();
+    }
     let _ = std::fs::remove_dir_all(&home);
 }
 
