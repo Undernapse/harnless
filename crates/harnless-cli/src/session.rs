@@ -339,6 +339,92 @@ pub fn render_list(rows: &[SessionMeta]) -> String {
     out
 }
 
+/// Remove a batch of sessions by id — the `sessions rm` verb's engine
+/// (#77 §2/§5, #80 §3). Pure per-id loop, no printing: the caller (the
+/// binary) owns the stderr lines and the exit code.
+///
+/// Ids are deduped silently (one line one delete, #77 §1), then each
+/// deduped id is attempted in input order:
+///
+/// * stat `<dir>/<id>.jsonl` first — a missing file (or an absent store
+///   dir: the same stat fails) is `session-not-found` naming the id. The
+///   store primitive stays idempotent; the CLI-level "you named something
+///   that is not there" refusal lives here (#77 §5).
+/// * [`SessionStore::abandon`] does the deletion: its lock-first fence
+///   answers a held session with `session-locked` verbatim (holder pid
+///   included), and a corrupt, torn, or zero-byte file deletes like any
+///   other — the unlink is content-blind (#77 §3/§4).
+///
+/// Nothing here ever creates a directory, a lock sibling, or a partial
+/// pair: the stat never touches, `abandon`'s probe never creates, and a
+/// refusal leaves both files byte-identical.
+pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), CliError>)> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for &id in ids {
+        if !seen.insert(id) {
+            continue;
+        }
+        let result = if !store.session_path(id).exists() {
+            Err(CliError::new(
+                "session-not-found",
+                format!("no session {id} in {}", store.dir().display()),
+            ))
+        } else {
+            store.abandon(id).map_err(session_cli_error)
+        };
+        out.push((id, result));
+    }
+    out
+}
+
+/// Render `sessions list --json` (#79 §2): a bare JSON array of row
+/// objects, input order (mtime-desc from [`SessionStore::list`]).
+///
+/// The row shape is the pinned one — six fields, add-only ratchet (#79 §3):
+/// `id` (decimal number), `modified` (epoch seconds), `events` (number,
+/// `null` exactly when `corrupt`), `firstPrompt` (string, full text — the
+/// 40-char cut is the human table's, never the machine's), `corrupt`
+/// (boolean), and `forkedFrom` (number, **absent** for non-forks, exposed
+/// raw — a dangling source is never resolved or annotated).
+///
+/// Pure over the rows the store already produced: no lock, no create, no
+/// mkdir, no I/O at all (#72 T3 verbatim — `--json` adds nothing to the
+/// list route's purity). An empty row set renders exactly `[]`.
+pub fn render_json(rows: &[SessionMeta]) -> String {
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("id".into(), serde_json::json!(row.id));
+            obj.insert("modified".into(), serde_json::json!(row.mtime_secs));
+            obj.insert(
+                "events".into(),
+                match row.event_count {
+                    Some(n) => serde_json::json!(n),
+                    None => serde_json::Value::Null,
+                },
+            );
+            obj.insert(
+                "firstPrompt".into(),
+                match &row.first_prompt {
+                    Some(p) => serde_json::json!(p),
+                    None => serde_json::Value::Null,
+                },
+            );
+            obj.insert("corrupt".into(), serde_json::json!(row.corrupt));
+            // Absent-for-non-forks, raw for forks (#79 §2): the field is
+            // *not written* when there is no header, never emitted null.
+            if let Some(src) = row.forked_from {
+                obj.insert("forkedFrom".into(), serde_json::json!(src));
+            }
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+    // Serializing a built `Value` cannot fail.
+    serde_json::to_string(&serde_json::Value::Array(items)).expect("built JSON serializes")
+}
+
 /// `YYYY-MM-DD HH:MM` local from epoch seconds (#71 §3), civil-from-days.
 fn format_mtime(secs: u64) -> String {
     // Days/time split, then the civil calendar (Howard Hinnant's algorithm).

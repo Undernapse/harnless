@@ -120,6 +120,11 @@ pub struct SessionMeta {
     pub first_prompt: Option<String>,
     /// Mid-file corruption: the file is shown, resume refuses.
     pub corrupt: bool,
+    /// The fork header's source id, carried raw (#79 §2): a field copy of
+    /// the header `list` already parses and discards — zero extra I/O.
+    /// `None` for a non-fork or a file whose header never parsed. A dangling
+    /// source is exposed as-is; nothing resolves or annotates it.
+    pub forked_from: Option<u64>,
 }
 
 /// A tolerant load result: the good prefix, plus whether a torn tail was
@@ -648,19 +653,22 @@ impl SessionStore {
                         .unwrap_or(0)
                 })
                 .unwrap_or(0);
-            let (event_count, first_prompt, corrupt) = match self.load_tolerant(id) {
+            let (event_count, first_prompt, corrupt, forked_from) = match self.load_tolerant(id) {
                 Ok(Some(report)) => {
                     let first = first_prompt_of(&report.records);
-                    (Some(report.records.len()), first, false)
+                    // #79 §2: the header this already parsed rides the row —
+                    // a field copy, never a re-read, never a resolution.
+                    let forked = report.header.map(|h| h.forked_from);
+                    (Some(report.records.len()), first, false, forked)
                 }
                 // An absent file cannot appear in a directory listing; the
                 // arm exists only because `load_tolerant` speaks in Options.
-                Ok(None) => (None, None, true),
+                Ok(None) => (None, None, true, None),
                 // #71 §3: a corrupt file is shown, never refused. An io
                 // error (unreadable, EIO) is displayed as corrupt too — the
                 // table's job is "this file's facts are unavailable", and
                 // the two are indistinguishable to a shell reader.
-                Err(_) => (None, None, true),
+                Err(_) => (None, None, true, None),
             };
             out.push(SessionMeta {
                 id,
@@ -668,6 +676,7 @@ impl SessionStore {
                 event_count,
                 first_prompt,
                 corrupt,
+                forked_from,
             });
         }
         out.sort_by(|a, b| b.mtime_secs.cmp(&a.mtime_secs).then(b.id.cmp(&a.id)));
