@@ -510,9 +510,23 @@ fn abandon_accepts_the_callers_held_guard() {
         .probe_lock(21)
         .expect("probe answers")
         .expect("the sibling exists");
+    // A second descriptor on the same sibling must not take the lock
+    // while the guard is alive: that is the hold the unlinks run
+    // under. (The in-file `lock_held_second_open_refuses_*` test
+    // covers the same refusal for `FileLock::hold`; this pins it for
+    // the guard `abandon` consumes.)
+    let second = FileLock::hold(&dir, 21);
+    match second {
+        Err(e) => assert_eq!(e.code, "session-locked", "the guard fences a second open"),
+        Ok(_) => panic!("the guard's hold must fence a second open"),
+    }
     store
         .abandon(21, Some(guard))
         .expect("the handed-in guard IS the fence, not a refusal");
+    // And the hold is continuous through both unlinks: the sibling's
+    // inode is gone, so a fresh creator's lock is a fresh inode —
+    // nothing here could have locked the old sibling in a
+    // released-between-unlinks window.
     assert!(!dir.join("21.jsonl").exists(), "the file goes");
     assert!(
         !dir.join("21.jsonl.lock").exists(),
