@@ -8,6 +8,9 @@
 
 use std::process::{Command, Output};
 
+#[path = "support/mod.rs"]
+mod support;
+
 /// Run the binary with `args`, never inheriting the test harness's stdin.
 ///
 /// `HOME` is redirected to a per-test temp dir: the shipped default profile
@@ -466,33 +469,15 @@ fn make_sessions_dir(home: &std::path::Path) -> std::path::PathBuf {
     dir
 }
 
-/// A committed-record line for a fixture file: `UserMessage` carrying
-/// `prompt` (the `firstPrompt` source). Serialized through the agent's own
-/// event types — the store's own encoder — so the tolerant reader parses
-/// it (`SessionEvent` is `#[serde(tag = "type")]`; hand-rolled JSON drifts).
-fn fixture_line(prompt: &str) -> String {
-    use harnless_agent::events::{CommittedRecord, ContentBlock, MessageRecord, SessionEvent};
-    use harnless_seams::MessageId;
-    let record = CommittedRecord {
-        position: 0,
-        time_ms: 1000,
-        event: SessionEvent::UserMessage(MessageRecord {
-            id: MessageId(1),
-            blocks: vec![ContentBlock::Text {
-                text: prompt.to_string(),
-            }],
-            provider: None,
-            model: None,
-        }),
-    };
-    serde_json::to_string(&record).expect("fixture record serializes")
-}
+// The fixture byte shapes and the mtime rule live in `support` (shared
+// with durability_seam.rs); these two are this binary's dir-writing
+// wrappers over them.
 
 /// Write a plain fixture session.
 fn write_session(dir: &std::path::Path, id: u64, prompt: &str) {
     std::fs::write(
         dir.join(format!("{id}.jsonl")),
-        format!("{}\n", fixture_line(prompt)),
+        support::prompt_fixture_lines(prompt),
     )
     .expect("write fixture session");
 }
@@ -501,24 +486,9 @@ fn write_session(dir: &std::path::Path, id: u64, prompt: &str) {
 fn write_fork(dir: &std::path::Path, id: u64, source: u64, prompt: &str) {
     std::fs::write(
         dir.join(format!("{id}.jsonl")),
-        format!(
-            "{{\"header\":{{\"forked_from\":\"{source}\"}}}}\n{}\n",
-            fixture_line(prompt)
-        ),
+        support::fork_fixture_lines(source, prompt),
     )
     .expect("write fork fixture");
-}
-
-/// Fix a fixture file's mtime to an exact epoch second (#80's rule:
-/// ≥1s-spaced fixture utimes, never the wall clock, never a sleep).
-fn set_fixture_mtime(path: &std::path::Path, secs: u64) {
-    let times = std::fs::FileTimes::new()
-        .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("open for utime");
-    file.set_times(times).expect("set fixture mtime");
 }
 
 /// A full snapshot of a dir: name → (bytes, mtime-secs) for every entry,
@@ -554,8 +524,9 @@ fn rm_removes_the_pair_and_list_forgets_it() {
     let home = temp_home();
     let id: u64 = mint(&home, "hello").parse().unwrap();
     let dir = home.join(".harnless/sessions");
-    // The mint left a lock sibling behind (the crash-shape residue a rm
-    // must also clear): plant one so "the pair" is a real assertion.
+    // Plant a sibling beside the live session file: `abandon` removes
+    // the pair (file + sibling) together, so "the pair is gone" below
+    // is a real assertion, not a name match.
     std::fs::write(dir.join(format!("{id}.jsonl.lock")), b"stale\n").unwrap();
     let out = hrls_at(&home, &["sessions", "rm", &id.to_string()], &[]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
@@ -649,38 +620,42 @@ fn rm_missing_id_is_session_not_found() {
 }
 
 #[test]
-fn rm_removes_an_orphaned_lock_sibling() {
-    // #78 §2's "residue deletable manually" at the verb surface: a crash
-    // between the O_EXCL create and the lock release leaves
-    // `<id>.jsonl.lock` with no session file — a shape `list()` never
-    // shows and nothing else ever names. The named id still removes it;
-    // an id with neither file stays `session-not-found`.
+fn rm_a_sibling_alone_is_session_not_found() {
+    // #80 §3's stat target is the session file. A crash between the
+    // O_EXCL create and the lock release leaves `<id>.jsonl.lock` with
+    // no session file; that residue is NOT a session and this verb
+    // never names it (#78 §2's "manually" is the user's own rm on the
+    // dir, which that answer leaves unmanaged). The refusal is the
+    // plain not-found, and the sibling stays byte-identical.
     let home = temp_home();
     let dir = make_sessions_dir(&home);
     std::fs::write(dir.join("77.jsonl.lock"), b"stale\n").unwrap();
+    let before = dir_snapshot(&dir);
     let out = hrls_at(&home, &["sessions", "rm", "77"], &[]);
-    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(!out.status.success(), "a sibling alone is not a session");
     assert!(
-        stderr(&out).contains("session: removed 77"),
+        stderr(&out).starts_with("session-not-found:"),
         "{}",
         stderr(&out)
     );
-    assert!(dir_snapshot(&dir).is_empty(), "the residue is gone");
-    // The same id with neither file: the refusal returns.
-    let out = hrls_at(&home, &["sessions", "rm", "77"], &[]);
-    assert!(!out.status.success());
-    assert!(stderr(&out).starts_with("session-not-found:"));
+    assert_eq!(
+        dir_snapshot(&dir),
+        before,
+        "the refusal leaves the residue untouched"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
-fn rm_removes_a_read_only_lock_sibling() {
-    // The fence must not decide from its own access rights: `flock`
-    // needs no write access, so a 0444 sibling — residue a root process
-    // or an odd umask left behind — is ordinary removable residue, not
-    // an errno. A write-mode probe open would answer
-    // `io-error: Permission denied` for a target the verb can fence,
-    // stat, and unlink (unlink is a directory permission).
+fn rm_a_read_only_sibling_still_gets_the_honest_answer() {
+    // Posture-level guard for the residue shape: a 0444 lock sibling
+    // with no session file is `session-not-found`, full stop — the
+    // verb's own access rights (the fence's open mode, the stat) must
+    // never surface as `io-error: Permission denied` on the honest
+    // refusal. The open-mode mechanics that make this true are pinned
+    // where they are load-bearing: `probe_fence_needs_no_write_access`
+    // in the store crate, whose delete path actually consults the
+    // fence on a 0444 sibling.
     let home = temp_home();
     let dir = make_sessions_dir(&home);
     std::fs::write(dir.join("88.jsonl.lock"), b"stale\n").unwrap();
@@ -700,13 +675,12 @@ fn rm_removes_a_read_only_lock_sibling() {
         perms.set_mode(0o644);
         std::fs::set_permissions(dir.join("88.jsonl.lock"), perms).ok();
     }
-    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("session: removed 88"),
-        "{}",
+        stderr(&out).starts_with("session-not-found:"),
+        "the fence's own access rights must not reach the user: {}",
         stderr(&out)
     );
-    assert!(dir_snapshot(&dir).is_empty(), "the residue is gone");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -807,6 +781,14 @@ fn rm_batch_skip_with_warning() {
         vec![format!("{locked}.jsonl"), format!("{locked}.jsonl.lock")],
         "skip-with-warning leaves exactly the locked pair"
     );
+    // The silent sentinel's boundary contract (#71 §4's no-sixth-code
+    // rule is what forces the sentinel; this is what keeps the sentinel
+    // honest): an exit-1 batch always carries at least one stderr line.
+    // The per-id lines above are the batch's whole error surface, so
+    // "exit 1 ⇒ non-empty stderr" is the CLI-boundary half of the
+    // two-site convention `prints_to_stderr`'s unit test pins in
+    // isolation.
+    assert!(!err.is_empty(), "exit 1 never exits in silence");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -843,13 +825,16 @@ fn rm_deletes_corrupt_and_zero_byte() {
     // below it) can never displace it in the mtime-desc table.
     std::fs::write(
         dir.join("21.jsonl"),
-        format!("{}\nnot json at all\n", fixture_line("readable first")),
+        format!(
+            "{}\nnot json at all\n",
+            support::prompt_line("readable first")
+        ),
     )
     .unwrap();
-    set_fixture_mtime(&dir.join("21.jsonl"), 2000);
+    support::set_fixture_mtime(&dir.join("21.jsonl"), 2000);
     // Zero-byte phantom: absent from `list` rows, removable by id.
     std::fs::write(dir.join("22.jsonl"), b"").unwrap();
-    set_fixture_mtime(&dir.join("22.jsonl"), 1000);
+    support::set_fixture_mtime(&dir.join("22.jsonl"), 1000);
     let out = hrls_at(&home, &["sessions", "list"], &[]);
     let table = stdout(&out);
     assert!(table.contains("21"), "the corrupt file is listed: {table}");
@@ -896,7 +881,7 @@ fn no_prune_guard() {
     // corrupt class, not the unparseable-head class).
     std::fs::write(
         dir.join("32.jsonl"),
-        format!("{}\ncorrupt line\n", fixture_line("readable first")),
+        format!("{}\ncorrupt line\n", support::prompt_line("readable first")),
     )
     .unwrap();
     write_fork(&dir, 33, 31, "child");
@@ -920,7 +905,7 @@ fn no_prune_guard() {
             f.0.strip_suffix(".lock")
                 .unwrap_or(&f.0)
                 .trim_end_matches(".jsonl");
-        set_fixture_mtime(&dir.join(&f.0), 5000 + stem.parse::<u64>().unwrap_or(0));
+        support::set_fixture_mtime(&dir.join(&f.0), 5000 + stem.parse::<u64>().unwrap_or(0));
     }
     // `fixture` keeps exactly the planted files; `boot` keeps everything
     // else — the invocation's own mint (a named creation, never residue
@@ -1021,24 +1006,24 @@ fn sessions_list_json_golden() {
     // zero-byte phantom, non-u64 stem. mtimes fixed ≥1s apart.
     let long_prompt = "y".repeat(60);
     write_session(&dir, 100, &long_prompt);
-    set_fixture_mtime(&dir.join("100.jsonl"), 1000);
+    support::set_fixture_mtime(&dir.join("100.jsonl"), 1000);
     write_fork(&dir, 101, 100, "branch");
-    set_fixture_mtime(&dir.join("101.jsonl"), 2000);
+    support::set_fixture_mtime(&dir.join("101.jsonl"), 2000);
     write_fork(&dir, 102, 101, "branch-of-branch");
-    set_fixture_mtime(&dir.join("102.jsonl"), 3000);
+    support::set_fixture_mtime(&dir.join("102.jsonl"), 3000);
     // Corrupt *mid-file*: a good first line, then garbage — a first-line
     // refusal would be `torn_tail`/unparseable-line-one, not the shown-as
     // corrupt case the table's `?` row pins (#70 §3's distinction).
     std::fs::write(
         dir.join("103.jsonl"),
-        format!("{}\ngarbage\n", fixture_line("readable first")),
+        format!("{}\ngarbage\n", support::prompt_line("readable first")),
     )
     .unwrap();
-    set_fixture_mtime(&dir.join("103.jsonl"), 4000);
+    support::set_fixture_mtime(&dir.join("103.jsonl"), 4000);
     std::fs::write(dir.join("104.jsonl"), b"").unwrap();
-    set_fixture_mtime(&dir.join("104.jsonl"), 5000);
-    std::fs::write(dir.join("notanid.jsonl"), fixture_line("stray")).unwrap();
-    set_fixture_mtime(&dir.join("notanid.jsonl"), 6000);
+    support::set_fixture_mtime(&dir.join("104.jsonl"), 5000);
+    std::fs::write(dir.join("notanid.jsonl"), support::prompt_line("stray")).unwrap();
+    support::set_fixture_mtime(&dir.join("notanid.jsonl"), 6000);
 
     let out = hrls_at(&home, &["sessions", "list", "--json"], &[]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));

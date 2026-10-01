@@ -489,3 +489,85 @@ fn list_marks_corrupt_files_and_lock_holder_pid_is_recorded() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn abandon_accepts_the_callers_held_guard() {
+    // The delete arm `sessions rm` actually drives: the caller's
+    // `probe_lock` guard is handed in, and `abandon` must REUSE its
+    // descriptor as the fence — re-flocking a held-by-us descriptor is
+    // a no-op, while a fresh open would answer `session-locked`
+    // against the caller's own hold (flock is
+    // per-open-file-description). A regression that drops the guard
+    // arm to a fresh probe turns every rm delete into a self-deadlock
+    // with the CLI suite still green, because the CLI only ever
+    // observes the success line.
+    let dir = fixture("abandon-held");
+    let store = SessionStore::new(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("21.jsonl"), "").unwrap();
+    std::fs::write(dir.join("21.jsonl.lock"), "").unwrap();
+    let guard = store
+        .probe_lock(21)
+        .expect("probe answers")
+        .expect("the sibling exists");
+    // A second descriptor on the same sibling must not take the lock
+    // while the guard is alive: that is the hold the unlinks run
+    // under. (The in-file `lock_held_second_open_refuses_*` test
+    // covers the same refusal for `FileLock::hold`; this pins it for
+    // the guard `abandon` consumes.)
+    let second = FileLock::hold(&dir, 21);
+    match second {
+        Err(e) => assert_eq!(e.code, "session-locked", "the guard fences a second open"),
+        Ok(_) => panic!("the guard's hold must fence a second open"),
+    }
+    store
+        .abandon(21, Some(guard))
+        .expect("the handed-in guard IS the fence, not a refusal");
+    // And the hold is continuous through both unlinks: the sibling's
+    // inode is gone, so a fresh creator's lock is a fresh inode —
+    // nothing here could have locked the old sibling in a
+    // released-between-unlinks window.
+    assert!(!dir.join("21.jsonl").exists(), "the file goes");
+    assert!(
+        !dir.join("21.jsonl.lock").exists(),
+        "the sibling goes with it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn probe_fence_needs_no_write_access() {
+    // The fence must not decide from its own access rights: flock
+    // needs no write access, so a 0444 sibling — residue a root
+    // process or an odd umask left behind — is fenced and removed
+    // like any other. A write-mode probe open would answer
+    // `io-error: Permission denied` before the fence is consulted,
+    // for a shape that is neither removable nor lock-refusing.
+    // (Store-side on purpose: the CLI's sibling-alone path answers
+    // session-not-found from the stat before any unlink, so only
+    // here is the open mode load-bearing.)
+    let dir = fixture("probe-mode");
+    let store = SessionStore::new(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("31.jsonl"), "").unwrap();
+    std::fs::write(dir.join("31.jsonl.lock"), "").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        dir.join("31.jsonl.lock"),
+        std::fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    let guard = store
+        .probe_lock(31)
+        .expect("the fence opens a 0444 sibling")
+        .expect("the sibling exists");
+    store
+        .abandon(31, Some(guard))
+        .expect("the residue removes under the fence");
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(leftovers.is_empty(), "the pair is gone: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

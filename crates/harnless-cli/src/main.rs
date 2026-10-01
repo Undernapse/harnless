@@ -170,21 +170,19 @@ fn main() -> ExitCode {
 mod tests {
     /// The rm batch's failure signal is the exit code alone (#71 §4's
     /// table has exactly five codes; the batch adds no sixth). That
-    /// contract lives across two sites — dispatch's `Rm` arm constructs
-    /// the empty-code sentinel, `main` must never print it — so the
-    /// convention is pinned here, at the printer: the sentinel renders
-    /// as nothing, and every real code still renders `code: message`.
+    /// contract lives across two sites — dispatch's `Rm` arm returns
+    /// `CliError::batch_failure()`, `main` must never print it — so
+    /// the convention is pinned here, at the printer: the named
+    /// sentinel renders as nothing, and every other error still
+    /// renders `code: message`.
     #[test]
     fn the_batch_sentinel_prints_nothing_and_real_codes_print() {
         use crate::{prints_to_stderr, CliError};
-        // The sentinel is silent; every table code still prints
+        // The named sentinel is silent; every table code still prints
         // `code: message` (the shape every existing stderr golden pins).
         assert!(
-            !prints_to_stderr(&CliError {
-                code: "",
-                message: String::new(),
-            }),
-            "the empty-code sentinel must print nothing"
+            !prints_to_stderr(&CliError::batch_failure()),
+            "the named sentinel must print nothing"
         );
         assert!(
             prints_to_stderr(&CliError::new(
@@ -322,18 +320,16 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                 }
                 if any_failed {
                     // The per-id lines above already carried every code
-                    // verbatim (#71 §4's table — no sixth code exists).
-                    // The batch's exit is the only extra signal: a bare
-                    // nonzero, never a synthetic code line. The sentinel
-                    // is silent *because* a line printed: `any_failed`
-                    // is set only inside the loop that just emitted the
-                    // error's `code: message` line, so an exit-1 batch
-                    // always has at least one stderr line — the silent
-                    // sentinel never abandons a failure unexplained.
-                    return Err(CliError {
-                        code: "",
-                        message: String::new(),
-                    });
+                    // verbatim (#71 §4's table — no sixth code exists),
+                    // so the batch's extra signal is the exit code
+                    // alone: `CliError::batch_failure`, the named
+                    // sentinel whose silence `main`'s printer
+                    // recognises. `any_failed` is set only inside the
+                    // loop that just emitted the error's
+                    // `code: message` line, so an exit-1 batch always
+                    // has at least one stderr line — the sentinel
+                    // never abandons a failure unexplained.
+                    return Err(CliError::batch_failure());
                 }
                 Ok(())
             }
