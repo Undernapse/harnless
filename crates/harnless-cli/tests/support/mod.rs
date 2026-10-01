@@ -406,3 +406,56 @@ pub fn derived_ids(mounted: &Mounted) -> Vec<u64> {
     }
     history.nodes().iter().map(|n| n.message_id.0).collect()
 }
+
+// --- session-file fixtures (shared: cli.rs spawn tests, durability_seam.rs) ---
+//
+// The two byte shapes every store fixture needs, built through the real
+// serde types (`SessionEvent` is `#[serde(tag = "type")]`; hand-rolled
+// JSON drifts) and the one mtime rule (#80's: >=1s-spaced fixture utimes,
+// never the wall clock, never a sleep).
+
+/// One committed user-prompt record, serialized — the fixture line both
+/// test binaries write.
+pub fn prompt_line(prompt: &str) -> String {
+    use harnless_agent::events::{CommittedRecord, ContentBlock, MessageRecord, SessionEvent};
+    use harnless_seams::MessageId;
+    let record = CommittedRecord {
+        position: 0,
+        time_ms: 1000,
+        event: SessionEvent::UserMessage(MessageRecord {
+            id: MessageId(1),
+            blocks: vec![ContentBlock::Text {
+                text: prompt.to_string(),
+            }],
+            provider: None,
+            model: None,
+        }),
+    };
+    serde_json::to_string(&record).expect("fixture record serializes")
+}
+
+/// A one-record file's content carrying `prompt` (the `firstPrompt`
+/// fixture source; #80's `--json` rows need a real first prompt).
+pub fn prompt_fixture_lines(prompt: &str) -> String {
+    format!("{}\n", prompt_line(prompt))
+}
+
+/// A fork file's content: the header line naming `source` + one prompt
+/// record.
+pub fn fork_fixture_lines(source: u64, prompt: &str) -> String {
+    format!(
+        "{{\"header\":{{\"forked_from\":\"{source}\"}}}}\n{}",
+        prompt_fixture_lines(prompt)
+    )
+}
+
+/// Fix a fixture file's mtime to an exact epoch second.
+pub fn set_fixture_mtime(path: &std::path::Path, secs: u64) {
+    let times = std::fs::FileTimes::new()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for utime");
+    file.set_times(times).expect("set fixture mtime");
+}

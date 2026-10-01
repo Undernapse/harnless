@@ -109,30 +109,9 @@ fn file_fixture_lines() -> String {
         .collect()
 }
 
-/// A one-record file carrying a user prompt — the `firstPrompt` fixture
-/// source (#80's `--json` rows need a real first prompt, not a bracket).
-fn prompt_fixture_lines(prompt: &str) -> String {
-    let r = fixture_record(
-        0,
-        SessionEvent::UserMessage(MessageRecord {
-            id: MessageId(1),
-            blocks: vec![ContentBlock::Text {
-                text: prompt.to_string(),
-            }],
-            provider: None,
-            model: None,
-        }),
-    );
-    format!("{}\n", serde_json::to_string(&r).unwrap())
-}
-
-/// A fork file's lines: the header line naming `source` + one prompt record.
-fn fork_fixture_lines(source: u64, prompt: &str) -> String {
-    format!(
-        "{{\"header\":{{\"forked_from\":\"{source}\"}}}}\n{}",
-        prompt_fixture_lines(prompt)
-    )
-}
+// The prompt/fork byte shapes and the mtime rule moved to `support`
+// (shared with cli.rs's spawn tests); `file_fixture_lines` stays here —
+// the bracket pair is this binary's seam shape.
 
 /// The dir's entry names, sorted — the residue assertion's shape.
 fn dir_names(dir: &std::path::Path) -> Vec<String> {
@@ -142,15 +121,6 @@ fn dir_names(dir: &std::path::Path) -> Vec<String> {
         .collect();
     v.sort();
     v
-}
-
-/// Fix a fixture file's mtime to an exact epoch second (#80's mtime-ordering
-/// rule: ≥1s-spaced fixture utimes, never the wall clock, never a sleep).
-fn set_mtime(path: &std::path::Path, secs: u64) {
-    let times = std::fs::FileTimes::new()
-        .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
-    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-    file.set_times(times).unwrap();
 }
 
 /// The derived projection's node texts — the #64 oracle shape.
@@ -1456,19 +1426,21 @@ fn remove_pair_is_idempotent() {
 }
 
 #[test]
-fn rm_fall_through_fences_a_same_process_holder() {
-    // The fence the orphan-sibling fall-through must never skip: flock is
+fn rm_fences_a_same_process_holder() {
+    // The fence `remove_ids` must never skip: flock is
     // per-open-file-description, so a *bare stat* of the sibling cannot
-    // see a holder from this same process — a second open+flock succeeds
-    // while the first holder is live. `remove_ids` therefore decides
-    // under `probe_lock` (the same acquire every holder uses), and a
-    // live in-process holder must answer `session-locked` with the pair
-    // intact, not unlink under the holder's feet.
+    // see a holder from this same process — a second open+flock
+    // succeeds while the first holder is live. `remove_ids` therefore
+    // decides under `probe_lock` (the same acquire every holder uses),
+    // and a live in-process holder must answer `session-locked` with
+    // the pair intact, not unlink under the holder's feet. The shape
+    // is a HELD sibling with no session file: the fence answers before
+    // the session-file stat is ever consulted, so `session-locked` —
+    // not `session-not-found` — is what a live holder reports.
     let dir = temp_store("rmfence");
     let store = SessionStore::new(&dir);
     let id = 4242u64;
     let holder = FileLock::hold(&dir, id).expect("the test holds the lock");
-    // The crash shape: sibling held, no session file.
     let results = remove_ids(&store, &[id]);
     let (_, res) = &results[0];
     let err = res.as_ref().err().expect("a held sibling fences the rm");
@@ -1478,13 +1450,18 @@ fn rm_fall_through_fences_a_same_process_holder() {
         "the held sibling survives the refused rm"
     );
     drop(holder);
-    // Once the holder is gone, the same verb removes the residue.
-    remove_ids(&store, &[id])
-        .into_iter()
-        .next()
-        .and_then(|(_, r)| r.ok())
-        .expect("the residue removes by id once free");
-    assert!(dir_names(&dir).is_empty());
+    // Once the holder is gone, the sibling alone is out of this verb's
+    // scope (#80 §3's target is the session file): the plain refusal.
+    let (_, res) = &remove_ids(&store, &[id])[0];
+    let err = res
+        .as_ref()
+        .err()
+        .expect("a sibling alone is not a session");
+    assert_eq!(err.code, "session-not-found", "{err}");
+    assert!(
+        dir_names(&dir) == vec![format!("{id}.jsonl.lock")],
+        "the residue stays the user's to delete"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1563,26 +1540,30 @@ fn list_rows_carry_forked_from() {
     let fork = 201u64;
     let fork_of_fork = 202u64;
     let dangling = 203u64;
-    std::fs::write(store.session_path(plain), prompt_fixture_lines("plain")).unwrap();
-    set_mtime(&store.session_path(plain), 1000);
+    std::fs::write(
+        store.session_path(plain),
+        support::prompt_fixture_lines("plain"),
+    )
+    .unwrap();
+    support::set_fixture_mtime(&store.session_path(plain), 1000);
     std::fs::write(
         store.session_path(fork),
-        fork_fixture_lines(plain, "branch"),
+        support::fork_fixture_lines(plain, "branch"),
     )
     .unwrap();
-    set_mtime(&store.session_path(fork), 2000);
+    support::set_fixture_mtime(&store.session_path(fork), 2000);
     std::fs::write(
         store.session_path(fork_of_fork),
-        fork_fixture_lines(fork, "branch-of-branch"),
+        support::fork_fixture_lines(fork, "branch-of-branch"),
     )
     .unwrap();
-    set_mtime(&store.session_path(fork_of_fork), 3000);
+    support::set_fixture_mtime(&store.session_path(fork_of_fork), 3000);
     std::fs::write(
         store.session_path(dangling),
-        fork_fixture_lines(999_999, "orphan"),
+        support::fork_fixture_lines(999_999, "orphan"),
     )
     .unwrap();
-    set_mtime(&store.session_path(dangling), 4000);
+    support::set_fixture_mtime(&store.session_path(dangling), 4000);
 
     let rows = store.list();
     let carried: Vec<(u64, Option<u64>)> = rows.iter().map(|r| (r.id, r.forked_from)).collect();

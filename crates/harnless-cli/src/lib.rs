@@ -42,6 +42,24 @@ impl CliError {
             message: message.into(),
         }
     }
+
+    /// The rm batch's failure sentinel: a nonzero exit whose error
+    /// surface is entirely the per-id lines the caller already printed.
+    /// #71 §4's table has exactly five codes and the batch adds no
+    /// sixth, so the batch's extra signal is the exit code alone —
+    /// which means it must ride back as *this* shape, never a
+    /// hand-built empty struct. `main`'s printer recognises exactly
+    /// the empty-code-and-empty-message pair and prints nothing; any
+    /// other error, codeless or not, prints its message. Constructing
+    /// the sentinel through here keeps the convention one named thing
+    /// instead of a literal that any future empty `CliError` would
+    /// silently inherit.
+    pub fn batch_failure() -> Self {
+        Self {
+            code: "",
+            message: String::new(),
+        }
+    }
 }
 
 impl fmt::Display for CliError {

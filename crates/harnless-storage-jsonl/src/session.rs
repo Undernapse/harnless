@@ -153,10 +153,12 @@ pub struct FileLock {
 }
 
 impl FileLock {
-    /// The held descriptor, for a caller handing the guard to
-    /// [`SessionStore::abandon`] as its fence.
-    fn into_file(self) -> File {
-        self._file
+    /// The held descriptor, kept *inside* the guard: `abandon` flocks
+    /// it through a borrow, so the type's invariant — "I own a
+    /// descriptor that currently holds the flock" — is never carried
+    /// by a bare `File` outside the type.
+    fn as_file(&self) -> &File {
+        &self._file
     }
 
     /// Hold session `id`'s lock from `dir` (`<dir>/<id>.jsonl.lock`) in this
@@ -393,32 +395,37 @@ impl SessionStore {
         // no sibling has no holder to fence, and manufacturing the file
         // here would leave residue the no-orphan rule forbids.
         let lock_path = lock_sibling(&path);
-        // The caller's guard (if any) IS the fence — its descriptor was
-        // opened create-free by probe_lock and already holds the flock.
-        // Otherwise open WITHOUT `create`: no sibling means no holder to
-        // fence.
-        let probe: Option<File> = match held {
-            Some(guard) => Some(guard.into_file()),
-            // Read-only for the same reason as probe_lock: flock needs
-            // no write access, and a write open would answer an errno
-            // for mode residue before the fence is consulted.
+        // The fence is one of two descriptors, both create-free opens:
+        // the caller's guard — whose descriptor already holds the
+        // flock, borrowed so the guard's invariant never leaves the
+        // type — or a fresh read-only probe (flock needs no write
+        // access; a write open would answer an errno for mode residue
+        // before the fence is consulted). No sibling means no holder
+        // to fence, and no probe.
+        let fresh: Option<File> = match held.as_ref() {
+            Some(_) => None,
             None => std::fs::OpenOptions::new().read(true).open(&lock_path).ok(),
         };
-        if let Some(probe) = probe.as_ref() {
-            // SAFETY: `probe` is a live owned file; the flock is released
-            // when it drops — after both unlinks below. A guard the
-            // caller handed in already holds the lock; re-flocking its
-            // descriptor is a held-by-us no-op.
-            if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let fence: Option<&File> = match held.as_ref() {
+            Some(guard) => Some(guard.as_file()),
+            None => fresh.as_ref(),
+        };
+        if let Some(fence) = fence {
+            // SAFETY: `fence` is a live owned file; the flock is
+            // released when its owner drops — after both unlinks
+            // below. A guard the caller handed in already holds the
+            // lock; re-flocking its descriptor is a held-by-us no-op.
+            if unsafe { libc::flock(fence.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 return Err(lock_error(id, &lock_path, std::io::Error::last_os_error()));
             }
         }
-        // Sibling first, then the session file — both under the held lock
-        // (see the doc: the file's unlink fences the next creator). The
-        // probe (if any) outlives the unlinks: it drops after the call's
-        // last statement.
+        // Sibling first, then the session file — both under the held
+        // lock (see the doc: the file's unlink fences the next
+        // creator). Both fence owners outlive the unlinks: `held` and
+        // `fresh` drop after the call's last statement.
         let result = remove_pair(id, [lock_path.as_path(), path.as_path()]);
-        drop(probe);
+        drop(fresh);
+        drop(held);
         result
     }
 
@@ -729,34 +736,54 @@ impl SessionStore {
                         .unwrap_or(0)
                 })
                 .unwrap_or(0);
-            let (event_count, first_prompt, corrupt, forked_from) = match self.load_tolerant(id) {
+            // Each arm builds its `SessionMeta` directly: the row's
+            // fields are named at every arm, so a new field is one
+            // arm-local edit, not a positional tuple grown in three
+            // places.
+            let row = match self.load_tolerant(id) {
                 Ok(Some(report)) => {
                     let first = first_prompt_of(&report.records);
-                    // #79 §2: the header this already parsed rides the row —
-                    // a field copy, never a re-read, never a resolution.
-                    let forked = report.header.map(|h| h.forked_from);
-                    (Some(report.records.len()), first, false, forked)
+                    // #79 §2: the header this already parsed rides the
+                    // row — a field copy, never a re-read, never a
+                    // resolution.
+                    SessionMeta {
+                        id,
+                        mtime_secs,
+                        event_count: Some(report.records.len()),
+                        first_prompt: first,
+                        corrupt: false,
+                        forked_from: report.header.map(|h| h.forked_from),
+                    }
                 }
-                // An absent file cannot appear in a directory listing; the
-                // arm exists only because `load_tolerant` speaks in Options.
-                Ok(None) => (None, None, true, None),
+                // An absent file cannot appear in a directory listing;
+                // the arm exists only because `load_tolerant` speaks in
+                // Options.
+                Ok(None) => corrupt_row(id, mtime_secs),
                 // #71 §3: a corrupt file is shown, never refused. An io
-                // error (unreadable, EIO) is displayed as corrupt too — the
-                // table's job is "this file's facts are unavailable", and
-                // the two are indistinguishable to a shell reader.
-                Err(_) => (None, None, true, None),
+                // error (unreadable, EIO) is displayed as corrupt too —
+                // the table's job is "this file's facts are
+                // unavailable", and the two are indistinguishable to a
+                // shell reader.
+                Err(_) => corrupt_row(id, mtime_secs),
             };
-            out.push(SessionMeta {
-                id,
-                mtime_secs,
-                event_count,
-                first_prompt,
-                corrupt,
-                forked_from,
-            });
+            out.push(row);
         }
         out.sort_by(|a, b| b.mtime_secs.cmp(&a.mtime_secs).then(b.id.cmp(&a.id)));
         out
+    }
+}
+
+/// The row shape for a file whose facts are unavailable (#71 §3): every
+/// content field absent, `corrupt` true, no fork lineage a discarded
+/// header could have named.
+fn corrupt_row(id: u64, mtime_secs: u64) -> SessionMeta {
+    SessionMeta {
+        id,
+        mtime_secs,
+        event_count: None,
+        first_prompt: None,
+        corrupt: true,
+        forked_from: None,
     }
 }
 
