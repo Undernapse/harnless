@@ -406,7 +406,15 @@ pub fn remove_ids(store: &SessionStore, ids: &[u64]) -> Vec<(u64, Result<(), Cli
         // handed to `abandon` as the fence, keeping the hold
         // uninterrupted from decision to unlink (why handing it in is
         // required, not stylistic: `abandon`'s doc). Every other arm
-        // ends without the guard, which is the release.
+        // ends without the guard, which is the release. The fence is
+        // against live holders only: it is a DECLINED limitation that
+        // an in-process mount-failure unwind reaching
+        // `abandon(id, None)` on a fresh descriptor can still race the
+        // unlink (flock is per-open-file-description; its
+        // success-on-missing arm would let rm report `removed` for a
+        // deletion it did not perform). Closing that needs a
+        // different fence — O_EXCL tombstone or rename-then-unlink —
+        // not a longer flock.
         let result = match store.probe_lock(id) {
             Err(err) => Err(session_cli_error(err)),
             Ok(guard) => {

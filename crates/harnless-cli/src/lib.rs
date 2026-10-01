@@ -69,3 +69,22 @@ impl fmt::Display for CliError {
 }
 
 impl std::error::Error for CliError {}
+
+#[cfg(test)]
+mod tests {
+    use super::CliError;
+
+    /// The producer half of the batch-sentinel contract, pinned in the
+    /// library that exports it: `batch_failure` is exactly the
+    /// empty-code-and-empty-message shape the bin's printer recognises
+    /// as silence. (The printer half — that shape prints nothing and
+    /// every other error prints — is pinned at `main`'s
+    /// `prints_to_stderr`.) A change giving the sentinel a real code
+    /// breaks this assert, not a downstream consumer.
+    #[test]
+    fn the_batch_sentinel_is_the_silence_shape() {
+        let err = CliError::batch_failure();
+        assert!(err.code.is_empty(), "the sentinel carries no code");
+        assert!(err.message.is_empty(), "the sentinel carries no message");
+    }
+}
