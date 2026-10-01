@@ -156,7 +156,11 @@ impl FileLock {
     /// The held descriptor, kept *inside* the guard: `abandon` flocks
     /// it through a borrow, so the type's invariant — "I own a
     /// descriptor that currently holds the flock" — is never carried
-    /// by a bare `File` outside the type.
+    /// by a bare `File` outside the type. The delete path that needs
+    /// the caller's hold reuses it through `abandon`'s fence
+    /// selection; `abandon_accepts_the_callers_held_guard` pins the
+    /// reuse (a fresh descriptor would answer `session-locked` against
+    /// the caller's own hold).
     fn as_file(&self) -> &File {
         &self._file
     }

@@ -489,3 +489,34 @@ fn list_marks_corrupt_files_and_lock_holder_pid_is_recorded() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn abandon_accepts_the_callers_held_guard() {
+    // The delete arm `sessions rm` actually drives: the caller's
+    // `probe_lock` guard is handed in, and `abandon` must REUSE its
+    // descriptor as the fence — re-flocking a held-by-us descriptor is
+    // a no-op, while a fresh open would answer `session-locked`
+    // against the caller's own hold (flock is
+    // per-open-file-description). A regression that drops the guard
+    // arm to a fresh probe turns every rm delete into a self-deadlock
+    // with the CLI suite still green, because the CLI only ever
+    // observes the success line.
+    let dir = fixture("abandon-held");
+    let store = SessionStore::new(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("21.jsonl"), "").unwrap();
+    std::fs::write(dir.join("21.jsonl.lock"), "").unwrap();
+    let guard = store
+        .probe_lock(21)
+        .expect("probe answers")
+        .expect("the sibling exists");
+    store
+        .abandon(21, Some(guard))
+        .expect("the handed-in guard IS the fence, not a refusal");
+    assert!(!dir.join("21.jsonl").exists(), "the file goes");
+    assert!(
+        !dir.join("21.jsonl.lock").exists(),
+        "the sibling goes with it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

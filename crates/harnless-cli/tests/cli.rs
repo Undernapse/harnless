@@ -524,8 +524,9 @@ fn rm_removes_the_pair_and_list_forgets_it() {
     let home = temp_home();
     let id: u64 = mint(&home, "hello").parse().unwrap();
     let dir = home.join(".harnless/sessions");
-    // The mint left a lock sibling behind (the crash-shape residue a rm
-    // must also clear): plant one so "the pair" is a real assertion.
+    // Plant a sibling beside the live session file: `abandon` removes
+    // the pair (file + sibling) together, so "the pair is gone" below
+    // is a real assertion, not a name match.
     std::fs::write(dir.join(format!("{id}.jsonl.lock")), b"stale\n").unwrap();
     let out = hrls_at(&home, &["sessions", "rm", &id.to_string()], &[]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
