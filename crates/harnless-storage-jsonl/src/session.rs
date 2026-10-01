@@ -781,10 +781,11 @@ impl SessionStore {
 }
 
 /// The row shape this helper builds for a file whose facts are
-/// unavailable (#71 §3): every content field absent, `corrupt` true —
-/// and with the header discarded, no lineage to name. (A row that
-/// *keeps* a parsed header carries its `forked_from` through `list()`'s
-/// healthy arm; this helper never sees one.)
+/// unavailable (#71 §3): every content field absent, `corrupt` true.
+/// When the whole load failed there was no report to keep a header
+/// from — a mid-file `session-corrupt` discards even a header the
+/// file still carries, and `list()` shows no lineage it cannot
+/// vouch for.
 fn corrupt_row(id: u64, mtime_secs: u64) -> SessionMeta {
     SessionMeta {
         id,

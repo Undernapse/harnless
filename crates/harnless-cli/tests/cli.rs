@@ -647,13 +647,15 @@ fn rm_a_sibling_alone_is_session_not_found() {
 }
 
 #[test]
-fn rm_a_read_only_sibling_does_not_leak_an_errno() {
-    // The fence must not decide from its own access rights: `flock`
-    // needs no write access, so a 0444 sibling — residue a root
-    // process or an odd umask left behind — must not turn the honest
-    // `session-not-found` into `io-error: Permission denied`. A
-    // write-mode probe open would fail the open before the decision
-    // is ever consulted.
+fn rm_a_read_only_sibling_still_gets_the_honest_answer() {
+    // Posture-level guard for the residue shape: a 0444 lock sibling
+    // with no session file is `session-not-found`, full stop — the
+    // verb's own access rights (the fence's open mode, the stat) must
+    // never surface as `io-error: Permission denied` on the honest
+    // refusal. The open-mode mechanics that make this true are pinned
+    // where they are load-bearing: `probe_fence_needs_no_write_access`
+    // in the store crate, whose delete path actually consults the
+    // fence on a 0444 sibling.
     let home = temp_home();
     let dir = make_sessions_dir(&home);
     std::fs::write(dir.join("88.jsonl.lock"), b"stale\n").unwrap();
