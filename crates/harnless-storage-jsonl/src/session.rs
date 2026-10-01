@@ -445,10 +445,13 @@ impl SessionStore {
     /// TOCTOU that manufactures residue, and a creating open is a TOCTOU in
     /// the victim's arms.
     ///
-    /// The CLI's `sessions rm` decides its orphan-sibling fall-through under
-    /// this fence, not a bare `exists()` stat: a stat cannot see a holder,
-    /// and flock is per-open-file-description, so even a same-process holder
-    /// would sail past a stat into an unlink under a live writer.
+    /// The CLI's `sessions rm` fences every id under this call before it
+    /// stats or deletes anything: a bare `exists()` stat cannot see a
+    /// holder, and flock is per-open-file-description, so even a
+    /// same-process holder would sail past a stat into an unlink under
+    /// a live writer. The returned guard may be handed to
+    /// [`SessionStore::abandon`] so the hold stays continuous from
+    /// decision to unlink.
     pub fn probe_lock(&self, id: u64) -> Result<Option<FileLock>, SessionError> {
         let path = self.path(id);
         let lock_path = lock_sibling(&path);
